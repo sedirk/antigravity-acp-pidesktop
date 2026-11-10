@@ -17,6 +17,9 @@ OpenAI 兼容本地网关。
 - **图片输入**（0.4.0 起）：`image_url` / `input_image` 的 `data:` URL 与 `http(s)` 链接都会转成 ACP 的
   `image` 内容块随同一条 prompt 发出；模型没图时会直说收不到，所以「答非所问」不会再被误判为配额问题
 - 图片输入需要宿主端把该模型标成支持图片（vision）：PI-Desktop 只在模型带 vision 能力时才会把附件放进请求体
+- **PDF / 文档输入**（0.5.0 起）：`input_file`、`file`、`document` 三种写法都接。字节先落到会话工作区的
+  `.attachments\`（按内容哈希去重、7 天后自动清理），再以 `resource_link`（`file://` URI）发给运行时——
+  实测内联 blob 的 `resource` 块运行时不认，只有 `resource_link` 能读出来。宿主侧同理需要勾上「PDF」能力
 
 ## 安装与配置
 
@@ -61,6 +64,7 @@ ACP 的 `session/prompt` 只接受内容块，**没有任何采样参数位**；
 | `reasoning_effort` | ✅ 生效 | `low`/`minimal`→`-low`，`high`/`xhigh`/`max`→`-high`，缺省或其它→`-medium`；日志会打印 `chat gemini-3.8-flash → gemini-3.8-flash-low（effort=low）` |
 | 模型 ID 带档位后缀 | ✅ 生效 | 例如直接写 `gemini-3.8-flash-high`，按后缀选 |
 | `image_url` / `input_image` | ✅ 生效 | `data:` URL 与 `http(s)` 链接都转成 ACP 的 `image` 块（0.4.0 起） |
+| `input_file` / `file` / `document`（PDF 等） | ✅ 生效（0.5.0 起） | 落盘到工作区 `.attachments\` 后以 `resource_link` 发出；`file_id` 形式取不到，会在 prompt 里留一句说明 |
 | `stream` | ✅ 生效 | SSE 流式 |
 | `temperature`、`top_p`、`top_k`、`max_tokens`、`max_completion_tokens`、`stop`、`seed`、`presence_penalty`、`frequency_penalty`、`logprobs`、`top_logprobs`、`logit_bias`、`response_format`、`text.format`、`verbosity` | ❌ 被忽略 | 实测 `max_tokens=8` 仍输出 229 字；发给运行时也不报错，属于静默丢弃，网关会在日志里打印一行「运行时忽略 …」 |
 | `tools`、`tool_choice`、`parallel_tool_calls` | ❌ 未映射 | ACP 的 `tool_call` 事件目前不处理；`session/set_mode`（default/auto_edit/yolo）存在但网关未暴露 |

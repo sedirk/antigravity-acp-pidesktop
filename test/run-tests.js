@@ -192,6 +192,39 @@ async function main() {
     assert.strictEqual(inputImage[0].images.length, 1, 'Responses 的 input_image 也要收集');
   });
 
+  await suite('documents: input_file / file / document → resource_link', async () => {
+    const { collectDocuments, documentBlock, buildPromptBlocks } = require(path.join(root, 'lib/server.js'));
+    const dir = tempDir('attach');
+    const bytes = Buffer.from('%PDF-1.4\nfake pdf for tests\n');
+    const dataUrl = `data:application/pdf;base64,${bytes.toString('base64')}`;
+
+    const chatDoc = collectDocuments([{ type: 'file', file: { filename: 'a.pdf', file_data: dataUrl } }]);
+    assert.strictEqual(chatDoc.length, 1);
+    assert.strictEqual(chatDoc[0].name, 'a.pdf');
+    const respDoc = collectDocuments([{ type: 'input_file', filename: 'b.pdf', file_data: dataUrl }]);
+    assert.strictEqual(respDoc.length, 1);
+    assert.strictEqual(respDoc[0].name, 'b.pdf');
+    const claudeDoc = collectDocuments([{ type: 'document', name: 'c.pdf', source: { type: 'base64', media_type: 'application/pdf', data: bytes.toString('base64') } }]);
+    assert.strictEqual(claudeDoc.length, 1);
+    assert.strictEqual(claudeDoc[0].name, 'c.pdf');
+    assert.deepStrictEqual(collectDocuments([{ type: 'file', file: { filename: 'x.pdf', file_id: 'file-123' } }])[0].unsupported, 'file_id');
+
+    const { block } = await documentBlock(chatDoc[0], dir);
+    assert.strictEqual(block.type, 'resource_link');
+    assert.strictEqual(block.mimeType, 'application/pdf');
+    assert.strictEqual(block.name, 'a.pdf');
+    assert.ok(block.uri.startsWith('file:///'), '必须是 file:// URI，运行时只认这个');
+    const saved = fs.readdirSync(dir).filter((name) => name.endsWith('.pdf'));
+    assert.strictEqual(saved.length, 1, '附件应落盘为一个 PDF');
+    assert.strictEqual(fs.statSync(path.join(dir, saved[0])).size, bytes.length);
+
+    const blocks = await buildPromptBlocks('看附件', [], chatDoc, dir);
+    assert.strictEqual(blocks[0].type, 'text');
+    assert.strictEqual(blocks[1].type, 'resource_link');
+    const textDoc = await buildPromptBlocks('看附件', [], [{ name: 'note.txt', inlineText: 'hello' }], dir);
+    assert.ok(textDoc[1].text.includes('hello'), '纯文本文档应内联成文本');
+  });
+
   await suite('usage: token 估算与「运行时不支持」参数识别', async () => {
     const { countTokens, usageFor, ignoredParams } = require(path.join(root, 'lib/server.js'));
     assert.strictEqual(countTokens('hello world'), 3);
