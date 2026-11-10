@@ -248,6 +248,10 @@
         '运行时 ' + (snap.runtimeReady ? '就绪' : '未启动') + (snap.pid ? ' (pid ' + snap.pid + ')' : ''),
         '虚拟模型 ' + snap.models + ' 个',
         '并发 ' + (limit.limit > 0 ? limit.limit + '（进行 ' + limit.active + '，排队 ' + limit.queued + '）' : '不限'),
+           '工具权限 ' + (snap.toolPolicy || 'search'),
+           snap.lastRequest
+             ? '最近一轮 ' + snap.lastRequest.ms + ' ms · 上下文 ' + snap.lastRequest.contextUsed + '/' + snap.lastRequest.contextSize
+             : '还没有请求记录',
         '代理 ' + (snap.proxy || '直连'),
       ].join('\n'), 'ok');
     } catch (error) { show('查询失败：' + (error && error.message ? error.message : error), 'err'); }

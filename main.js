@@ -422,6 +422,8 @@ async function onPanelInvoke(channel, payload) {
       pid: status.pid,
       models: status.models,
       limiter: status.limiter,
+      toolPolicy: config.toolPolicy,
+      lastRequest: status.lastRequest,
       proxy: resolvedProxy,
       runtime: runtimeStatus(),
     };

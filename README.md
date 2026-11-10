@@ -20,6 +20,19 @@
 - **可选并发限制**（默认关闭）：设成 1 即串行，其余请求排队，带排队超时与队满拒绝
 - 面板一键下载官方运行时并做 SHA256 校验
 
+## 兼容性
+
+- 宿主：PI-Desktop ≥ 0.9.0（模块入口、`pluginBridge.invoke`、`ui.openPanel`）
+- 运行时：官方 `agy_acp_server` 1.3.0（面板下载的就是这一版，SHA256 校验）
+- 系统：Windows 10/11；macOS/Linux 需手动放置运行时并填 `bin`
+- 协议：ACP 1（`initialize` / `session/new` / `set_model` / `prompt` / `cancel`（通知）/
+  `close` / `resume` / `request_permission`），OpenAI 兼容 `/v1/chat/completions` 与 `/v1/responses`
+
+## 版本与后续
+
+- 变更记录见 [CHANGELOG.md](CHANGELOG.md)
+- 刻意没做的（额度、客户端执行工具、工具进度可视化）见 [TODO.md](TODO.md)
+
 ## 安装与配置
 
 1. 插件页安装后打开命令「Antigravity: 打开配置面板」
