@@ -68,8 +68,11 @@ ACP 的 `session/prompt` 只接受内容块，**没有任何采样参数位**；
 | `usage` | ✅ 估算值 | ACP 不返回 token 数，按「CJK 每字 1 token、其余 4 字符 1 token」估算，并带 `estimated: true` |
 
 `GET /v1/models` 会顺带声明能力：`modalities.input = [text, image]`、`capabilities = [text, image, reasoning]`、
-`supports_reasoning_effort = true`、`reasoning_efforts = [low, medium, high]`，
-方便宿主判断「能不能发图」「要不要发 reasoning_effort」。
+`supports_reasoning_effort = true`、`reasoning_efforts = [low, medium, high]`、`context_length`。
+这些字段对标准 OpenAI 客户端无害，但**PI-Desktop 目前不读它们**：它的模型发现只从服务端的模型行里取
+`contextWindow` / `maxTokens`，图文能力一律取自它内置的 models.dev 目录（命中不到就按纯文本处理），
+用户可在「设置 → AI 服务 → 该服务 → 模型」里用 `supportsImages` 覆盖。所以能不能发图最终由宿主侧决定，
+插件这边只保证「宿主发来的图不丢」。
 
 ## 已知边界
 
