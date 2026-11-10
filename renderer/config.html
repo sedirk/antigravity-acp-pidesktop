@@ -56,9 +56,17 @@
       <span class="hint">PI-Desktop 里填 http://127.0.0.1:端口/v1</span>
     </div>
     <div class="field">
-      <label for="proxy">子进程代理（留空=直连）</label>
+      <label for="proxyMode">代理模式</label>
+      <select id="proxyMode">
+        <option value="auto">自动（跟随系统代理）</option>
+        <option value="manual">手动（用下面填的地址）</option>
+        <option value="direct">直连（不使用代理）</option>
+      </select>
+      <span class="hint" id="proxyHint"></span>
+    </div>
+    <div class="field">
+      <label for="proxy">手动代理地址（仅手动模式生效）</label>
       <input id="proxy" type="text" placeholder="http://127.0.0.1:10808">
-      <span class="hint">注入给 ACP 运行时，不影响系统代理</span>
     </div>
 
     <div class="field wide">
@@ -131,7 +139,7 @@
 <script>
 (function () {
   const bridge = window.pluginBridge;
-  const ids = ['port', 'proxy', 'bin', 'defaultModel', 'modelCacheMinutes', 'virtualModels',
+  const ids = ['port', 'proxyMode', 'proxy', 'bin', 'defaultModel', 'modelCacheMinutes', 'virtualModels',
     'exposeVariantModels', 'concurrency', 'queueTimeoutMinutes', 'promptTimeoutMinutes', 'cwd'];
   const $ = (id) => document.getElementById(id);
   const msg = $('msg');
@@ -255,6 +263,9 @@
     }
     $('install').disabled = rt.busy === true;
     $('cleanup').disabled = rt.busy === true || !(rt.dirBytes > 0);
+    if (rt.proxy) {
+      $('proxyHint').textContent = (rt.proxy.url || '直连') + '（来源 ' + rt.proxy.source + '：' + rt.proxy.note + '）';
+    }
   }
 
   async function refreshRuntime() {

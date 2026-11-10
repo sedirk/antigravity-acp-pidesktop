@@ -102,6 +102,30 @@ async function main() {
     assert.strictEqual(timeout.stats().active, 0);
   });
 
+  await suite('proxy: 系统代理解析与三档模式', async () => {
+    const proxyLib = require(path.join(root, 'lib/proxy.js'));
+    assert.strictEqual(proxyLib.parseProxyServer('127.0.0.1:10808'), 'http://127.0.0.1:10808');
+    assert.strictEqual(proxyLib.parseProxyServer('http=127.0.0.1:8080;https=127.0.0.1:8443'), 'http://127.0.0.1:8443');
+    assert.strictEqual(proxyLib.parseProxyServer('socks=127.0.0.1:1080'), 'http://127.0.0.1:1080');
+    assert.strictEqual(proxyLib.parseProxyServer(''), '');
+    assert.strictEqual(proxyLib.parseProxyServer('nonsense'), '');
+
+    const sysOn = { enabled: true, server: '127.0.0.1:10808', pac: '' };
+    assert.deepStrictEqual(proxyLib.resolveProxy({ proxyMode: 'auto' }, sysOn).source, 'system');
+    assert.strictEqual(proxyLib.resolveProxy({ proxyMode: 'auto' }, sysOn).url, 'http://127.0.0.1:10808');
+
+    const sysOff = { enabled: false, server: '', pac: '' };
+    assert.strictEqual(proxyLib.resolveProxy({ proxyMode: 'auto' }, sysOff).url, '');
+    assert.strictEqual(proxyLib.resolveProxy({ proxyMode: 'direct' }, sysOn).url, '', 'direct 必须无视系统代理');
+    assert.strictEqual(proxyLib.resolveProxy({ proxyMode: 'manual', proxy: 'http://10.0.0.2:3128' }, sysOn).url, 'http://10.0.0.2:3128');
+    assert.strictEqual(proxyLib.resolveProxy({ proxyMode: 'manual', proxy: '' }, sysOn).url, '');
+
+    const pacOnly = { enabled: true, server: '', pac: 'http://x/proxy.pac' };
+    const pacResult = proxyLib.resolveProxy({ proxyMode: 'auto' }, pacOnly);
+    assert.strictEqual(pacResult.url, '');
+    assert.ok(pacResult.note.includes('PAC'));
+  });
+
   await suite('limiter: 队满直接拒绝', async () => {
     const limiter = createLimiter({ limit: 1, maxQueue: 1, queueTimeoutMs: 5000 });
     const first = limiter.run(() => sleep(80));

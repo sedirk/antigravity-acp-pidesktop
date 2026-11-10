@@ -39,7 +39,8 @@ OpenAI 兼容本地网关。
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |
 | `port` | 41910 | 本地网关端口 |
-| `proxy` | 空 | 注入给 ACP 子进程的代理，如 `http://127.0.0.1:10808` |
+| `proxyMode` | `auto` | `auto` 跟随系统代理 / `manual` 用下面填的地址 / `direct` 直连 |
+| `proxy` | 空 | 手动模式的代理地址，如 `http://127.0.0.1:10808` |
 | `concurrency` | 0 | 0 = 不限制；1 = 串行；2–8 = 并行上限 |
 | `queueTimeoutMs` | 300000 | 排队等待上限 |
 | `virtualModels` | true | 按档位后缀合并模型 |

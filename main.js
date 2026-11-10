@@ -13,6 +13,7 @@ const crypto = require('node:crypto');
 const { execFile, spawn } = require('node:child_process');
 
 const configLib = require('./lib/config');
+const proxyLib = require('./lib/proxy');
 const { AcpRuntime, createLimiter } = require('./lib/core');
 const { createGateway } = require('./lib/server');
 
@@ -41,6 +42,15 @@ let acp = null;
 let limiter = null;
 let gateway = null;
 let log = () => {};
+let resolvedProxy = { url: '', source: 'none', note: '尚未解析' };
+
+/** 解析当前生效的代理：auto 跟随系统代理，manual 用面板值，direct 直连。 */
+function refreshProxy() {
+  resolvedProxy = proxyLib.resolveProxy(config || {});
+  const shown = resolvedProxy.url || '直连';
+  log(`代理：${shown}（${resolvedProxy.source}：${resolvedProxy.note}）`);
+  return resolvedProxy;
+}
 
 /** 下载/安装状态，供面板轮询；install 本身是后台任务，不阻塞面板调用。 */
 let installState = { phase: 'idle', received: 0, total: RUNTIME.archiveBytes, startedAt: 0, error: '', bytes: 0 };
@@ -90,8 +100,9 @@ function buildLimiter() {
 async function startService({ log: providedLog } = {}) {
   if (typeof providedLog === 'function') log = (message) => { providedLog(message); writeLogLine(message); };
   reloadConfig();
+  refreshProxy();
   limiter = buildLimiter();
-  acp = new AcpRuntime({ getConfig: () => config, log });
+  acp = new AcpRuntime({ getConfig: () => config, getProxy: () => resolvedProxy.url, log });
   gateway = createGateway({ acp, limiter, getConfig: () => config, log });
   const base = config.port;
   const port = await gateway.listen([base, base + 1, base + 2, base + 3]);
@@ -145,9 +156,10 @@ async function download(zip) {
   const partial = `${zip}.part`;
   try { if (fs.existsSync(partial)) fs.unlinkSync(partial); } catch { /* ignore */ }
   const args = ['-L', '--fail', '--connect-timeout', '20', '--retry', '2', '-o', partial, RUNTIME.url];
-  if (config.proxy) args.unshift('--proxy', config.proxy);
+  const proxyUrl = resolvedProxy.url;
+  if (proxyUrl) args.unshift('--proxy', proxyUrl);
   setInstall({ phase: 'downloading', received: 0, total: RUNTIME.archiveBytes, startedAt: Date.now(), error: '' });
-  log(`下载运行时：${RUNTIME.url}${config.proxy ? `（代理 ${config.proxy}）` : '（直连）'}`);
+  log(`下载运行时：${RUNTIME.url}${resolvedProxy.url ? `（代理 ${resolvedProxy.url}）` : '（直连）'}`);
 
   const child = spawn('curl.exe', args, { windowsHide: true });
   const timer = setInterval(() => {
@@ -199,6 +211,7 @@ async function runInstall() {
   const saved = configLib.savePanel(ctx(), { bin }, null);
   if (!saved.ok) throw new Error(`运行时已下载，但写入配置失败：${(saved.errors || []).join('；')}`);
   reloadConfig();
+  refreshProxy();
   const bytes = fs.statSync(bin).size;
   setInstall({ phase: 'done', bytes, bin });
   await restartService();
@@ -223,6 +236,7 @@ function cleanupRuntime() {
   stopService();
   fs.rmSync(dir, { recursive: true, force: true });
   reloadConfig();
+  refreshProxy();
   setInstall({ phase: 'idle', received: 0, bytes: 0, error: '' });
   log(`已清理运行时：释放 ${Math.round(before / 1048576)} MB`);
   return { ok: true, freedBytes: before, dir };
@@ -324,6 +338,7 @@ function runtimeStatus() {
     expectedBytes: RUNTIME.archiveBytes,
     version: RUNTIME.version,
     sha256: RUNTIME.sha256,
+    proxy: resolvedProxy,
   };
 }
 
@@ -335,6 +350,7 @@ async function onPanelInvoke(channel, payload) {
     const result = configLib.savePanel(ctx(), payload || {}, null);
     if (!result.ok) return result;
     reloadConfig();
+    refreshProxy();
     if (!gateway) return { ...result, restarted: false };
     try {
       const started = await restartService();
@@ -354,7 +370,7 @@ async function onPanelInvoke(channel, payload) {
       pid: status.pid,
       models: status.models,
       limiter: status.limiter,
-      proxy: config.proxy,
+      proxy: resolvedProxy,
       runtime: runtimeStatus(),
     };
   }
@@ -393,6 +409,7 @@ module.exports = {
     } catch { dataPath = ''; }
 
     reloadConfig();
+    refreshProxy();
     pi.services.register({
       id: SERVICE_ID,
       start: (context) => startService(context),
