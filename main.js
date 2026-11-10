@@ -10,7 +10,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { execFile } = require('node:child_process');
+const { execFile, spawn } = require('node:child_process');
 
 const configLib = require('./lib/config');
 const { AcpRuntime, createLimiter } = require('./lib/core');
@@ -22,12 +22,14 @@ const COMMANDS = {
   status: 'antigravity.status',
   models: 'antigravity.models',
   install: 'antigravity.install-runtime',
+  cleanup: 'antigravity.cleanup-runtime',
 };
 
 const RUNTIME = {
   version: '1.3.0',
   url: 'https://dl.google.com/agy-extensions/releases/windows/agy-acp-server-1.3.0-windows-x86_64.zip',
   sha256: '65215E0688681FA3116E048A9EAB27EF53AF1BBD6F3DA3F1C52BD4911D8B17F9',
+  archiveBytes: 124509787,
   files: ['agy_acp_server.exe', 'localharness_external.exe'],
 };
 
@@ -39,7 +41,16 @@ let acp = null;
 let limiter = null;
 let gateway = null;
 let log = () => {};
-let installing = null;
+
+/** 下载/安装状态，供面板轮询；install 本身是后台任务，不阻塞面板调用。 */
+let installState = { phase: 'idle', received: 0, total: RUNTIME.archiveBytes, startedAt: 0, error: '', bytes: 0 };
+
+function setInstall(patch) {
+  installState = { ...installState, ...patch };
+  if (patch.phase) log(`runtime: ${patch.phase}${patch.error ? ` — ${patch.error}` : ''}`);
+}
+
+const INSTALL_BUSY = new Set(['downloading', 'verifying', 'extracting']);
 
 function writeLogLine(message) {
   const line = `[${new Date().toISOString()}] ${message}`;
@@ -103,52 +114,118 @@ async function restartService() {
 
 // ---------------------------------------------------------------- 运行时安装
 
+function runtimeDir() {
+  return path.join(dataPath || packageRoot, 'runtime');
+}
+
+function dirSize(dir) {
+  let total = 0;
+  let entries = [];
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return 0; }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    try {
+      total += entry.isDirectory() ? dirSize(full) : fs.statSync(full).size;
+    } catch { /* ignore */ }
+  }
+  return total;
+}
+
 function run(file, args, options = {}) {
   return new Promise((resolve, reject) => {
-    execFile(file, args, { windowsHide: true, timeout: options.timeout || 30 * 60 * 1000, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
+    execFile(file, args, { windowsHide: true, timeout: options.timeout || 30 * 60 * 1000, maxBuffer: 4 * 1024 * 1024 }, (error, stdout, stderr) => {
       if (error) reject(Object.assign(error, { stdout, stderr }));
       else resolve({ stdout, stderr });
     });
   });
 }
 
-function hashFile(file) {
-  return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex').toUpperCase();
+/** 用 curl 下载并轮询文件大小，进度写进 installState。 */
+async function download(zip) {
+  const partial = `${zip}.part`;
+  try { if (fs.existsSync(partial)) fs.unlinkSync(partial); } catch { /* ignore */ }
+  const args = ['-L', '--fail', '--connect-timeout', '20', '--retry', '2', '-o', partial, RUNTIME.url];
+  if (config.proxy) args.unshift('--proxy', config.proxy);
+  setInstall({ phase: 'downloading', received: 0, total: RUNTIME.archiveBytes, startedAt: Date.now(), error: '' });
+  log(`下载运行时：${RUNTIME.url}${config.proxy ? `（代理 ${config.proxy}）` : '（直连）'}`);
+
+  const child = spawn('curl.exe', args, { windowsHide: true });
+  const timer = setInterval(() => {
+    try {
+      const size = fs.statSync(partial).size;
+      setInstall({ received: size });
+    } catch { /* 还没建文件 */ }
+  }, 500);
+
+  try {
+    await new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('exit', (code) => (code === 0 ? resolve() : reject(new Error(`curl 退出码 ${code}`))));
+    });
+  } finally {
+    clearInterval(timer);
+  }
+  const size = fs.statSync(partial).size;
+  setInstall({ received: size, total: size });
+  if (fs.existsSync(zip)) fs.unlinkSync(zip);
+  fs.renameSync(partial, zip);
+  return size;
 }
 
-/**
- * 下载官方运行时（仅 Windows）。走 curl.exe，优先使用配置里的代理，
- * 因为多数国内网络直连 dl.google.com 会超时。
- */
-async function installRuntime() {
-  if (installing) return installing;
-  installing = (async () => {
-    if (process.platform !== 'win32') throw new Error('自动安装目前只支持 Windows，请手动放置 agy_acp_server.exe');
-    const dir = path.join(dataPath || packageRoot, 'runtime');
-    fs.mkdirSync(dir, { recursive: true });
-    const zip = path.join(dir, `agy-acp-${RUNTIME.version}.zip`);
-    const args = ['-L', '--fail', '--connect-timeout', '20', '--retry', '2', '-o', zip, RUNTIME.url];
-    if (config.proxy) args.unshift('--proxy', config.proxy);
-    log(`下载运行时：${RUNTIME.url}${config.proxy ? `（代理 ${config.proxy}）` : '（直连）'}`);
-    await run('curl.exe', args);
-    const digest = hashFile(zip);
-    if (digest !== RUNTIME.sha256) {
-      try { fs.unlinkSync(zip); } catch { /* ignore */ }
-      throw new Error(`运行时校验失败：期望 ${RUNTIME.sha256.slice(0, 16)}…，实际 ${digest.slice(0, 16)}…`);
-    }
-    await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `Expand-Archive -LiteralPath '${zip}' -DestinationPath '${dir}' -Force`]);
-    const bin = path.join(dir, 'agy_acp_server.exe');
-    for (const name of RUNTIME.files) {
-      if (!fs.existsSync(path.join(dir, name))) throw new Error(`解压后缺少 ${name}`);
-    }
-    // 落到配置里，后续启动直接用
-    const saved = configLib.savePanel(ctx(), { bin }, null);
-    if (!saved.ok) throw new Error(`运行时已下载，但写入配置失败：${(saved.errors || []).join('；')}`);
-    reloadConfig();
-    log(`运行时安装完成：${bin}`);
-    return { bin, sha256: digest, bytes: fs.statSync(bin).size };
-  })().finally(() => { installing = null; });
-  return installing;
+/** 后台任务：下载 → 校验 → 解压 → 写配置。面板通过 runtime:status 观察。 */
+async function runInstall() {
+  if (process.platform !== 'win32') throw new Error('自动安装目前只支持 Windows，请手动放置 agy_acp_server.exe');
+  const dir = runtimeDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const zip = path.join(dir, `agy-acp-${RUNTIME.version}.zip`);
+
+  await download(zip);
+
+  setInstall({ phase: 'verifying' });
+  const digest = crypto.createHash('sha256').update(fs.readFileSync(zip)).digest('hex').toUpperCase();
+  if (digest !== RUNTIME.sha256) {
+    try { fs.unlinkSync(zip); } catch { /* ignore */ }
+    throw new Error(`运行时校验失败：期望 ${RUNTIME.sha256.slice(0, 16)}…，实际 ${digest.slice(0, 16)}…`);
+  }
+
+  setInstall({ phase: 'extracting' });
+  await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `Expand-Archive -LiteralPath '${zip}' -DestinationPath '${dir}' -Force`]);
+  try { fs.unlinkSync(zip); } catch { /* ignore */ }
+  const bin = path.join(dir, 'agy_acp_server.exe');
+  for (const name of RUNTIME.files) {
+    if (!fs.existsSync(path.join(dir, name))) throw new Error(`解压后缺少 ${name}`);
+  }
+
+  const saved = configLib.savePanel(ctx(), { bin }, null);
+  if (!saved.ok) throw new Error(`运行时已下载，但写入配置失败：${(saved.errors || []).join('；')}`);
+  reloadConfig();
+  const bytes = fs.statSync(bin).size;
+  setInstall({ phase: 'done', bytes, bin });
+  await restartService();
+  await toast(`Antigravity 运行时已就绪（${Math.round(bytes / 1048576)} MB，SHA256 已校验）`, 'info');
+}
+
+function startInstall() {
+  if (INSTALL_BUSY.has(installState.phase)) return { ok: true, started: false, phase: installState.phase };
+  setInstall({ phase: 'downloading', received: 0, startedAt: Date.now(), error: '', bytes: 0 });
+  runInstall().catch((error) => {
+    setInstall({ phase: 'error', error: String(error.message || error).slice(0, 300) });
+    void toast(`运行时安装失败：${String(error.message).slice(0, 200)}`, 'warning');
+  });
+  return { ok: true, started: true };
+}
+
+/** 删掉 runtime 目录，返回释放的字节数（卸载插件不会自动清理，需要这一步）。 */
+function cleanupRuntime() {
+  const dir = runtimeDir();
+  const before = dirSize(dir);
+  if (!fs.existsSync(dir)) return { ok: true, freedBytes: 0, dir };
+  stopService();
+  fs.rmSync(dir, { recursive: true, force: true });
+  reloadConfig();
+  setInstall({ phase: 'idle', received: 0, bytes: 0, error: '' });
+  log(`已清理运行时：释放 ${Math.round(before / 1048576)} MB`);
+  return { ok: true, freedBytes: before, dir };
 }
 
 // ---------------------------------------------------------------- 命令
@@ -173,12 +250,12 @@ function registerCommands() {
     run: async () => {
       if (!gateway) { await toast('网关未启动', 'warning'); return; }
       const status = gateway.status();
-      const limiterInfo = status.limiter || {};
+      const info = status.limiter || {};
       await toast([
         `网关 http://127.0.0.1:${status.port}/v1`,
         `运行时 ${status.running ? '就绪' : '未启动'}${status.pid ? ` (pid ${status.pid})` : ''}`,
         `虚拟模型 ${status.models} 个`,
-        `并发 ${limiterInfo.limit > 0 ? `${limiterInfo.limit}（进行 ${limiterInfo.active}，排队 ${limiterInfo.queued}）` : '不限'}`,
+        `并发 ${info.limit > 0 ? `${info.limit}（进行 ${info.active}，排队 ${info.queued}）` : '不限'}`,
         config.proxy ? `代理 ${config.proxy}` : '代理 直连',
       ].join('\n'), status.running ? 'info' : 'warning');
     },
@@ -206,15 +283,22 @@ function registerCommands() {
     category: 'AI',
     keywords: ['antigravity', 'agy', '运行时', 'runtime', '下载'],
     run: async () => {
-      await toast('正在下载官方 ACP 运行时（约 120 MB），请稍候…', 'info');
-      try {
-        const result = await installRuntime();
-        await restartService();
-        await toast(`运行时已就绪：${result.bin}\nSHA256 已验证`, 'info');
-      } catch (error) {
-        log(`运行时安装失败：${error.message}`);
-        await toast(`安装失败：${String(error.message).slice(0, 240)}`, 'warning');
-      }
+      const result = startInstall();
+      if (!result.started) { await toast(`已在下载中（${result.phase}），看面板进度即可`, 'info'); return; }
+      await toast('开始下载官方 ACP 运行时（约 120 MB），进度见配置面板', 'info');
+    },
+  });
+
+  pi.commands.register({
+    id: COMMANDS.cleanup,
+    title: 'Antigravity: 清理已下载的运行时',
+    category: 'AI',
+    keywords: ['antigravity', 'agy', '清理', '卸载', 'cleanup', '空间'],
+    run: async () => {
+      const result = cleanupRuntime();
+      await toast(result.freedBytes > 0
+        ? `已删除运行时，释放 ${(result.freedBytes / 1048576).toFixed(0)} MB`
+        : '没有可清理的运行时', 'info');
     },
   });
 }
@@ -226,6 +310,22 @@ function unregisterCommands() {
 }
 
 // ---------------------------------------------------------------- 面板
+
+function runtimeStatus() {
+  const bin = config ? config.bin : configLib.defaultBin(ctx());
+  const dir = runtimeDir();
+  return {
+    ...installState,
+    busy: INSTALL_BUSY.has(installState.phase),
+    bin: bin || '',
+    binExists: Boolean(bin) && fs.existsSync(bin),
+    dir,
+    dirBytes: dirSize(dir),
+    expectedBytes: RUNTIME.archiveBytes,
+    version: RUNTIME.version,
+    sha256: RUNTIME.sha256,
+  };
+}
 
 async function onPanelInvoke(channel, payload) {
   if (channel === 'config:read') {
@@ -245,7 +345,7 @@ async function onPanelInvoke(channel, payload) {
     }
   }
   if (channel === 'gateway:status') {
-    if (!gateway) return { running: false };
+    if (!gateway) return { running: false, runtime: runtimeStatus() };
     const status = gateway.status();
     return {
       running: true,
@@ -255,7 +355,7 @@ async function onPanelInvoke(channel, payload) {
       models: status.models,
       limiter: status.limiter,
       proxy: config.proxy,
-      stderr: status.stderr,
+      runtime: runtimeStatus(),
     };
   }
   if (channel === 'models:list') {
@@ -267,14 +367,10 @@ async function onPanelInvoke(channel, payload) {
       return { ok: false, error: String(error.message).slice(0, 300) };
     }
   }
-  if (channel === 'runtime:install') {
-    try {
-      const result = await installRuntime();
-      await restartService();
-      return { ok: true, ...result };
-    } catch (error) {
-      return { ok: false, error: String(error.message).slice(0, 400) };
-    }
+  if (channel === 'runtime:status') return runtimeStatus();
+  if (channel === 'runtime:install') return startInstall();
+  if (channel === 'runtime:cleanup') {
+    try { return cleanupRuntime(); } catch (error) { return { ok: false, error: String(error.message).slice(0, 300) }; }
   }
   throw Object.assign(new Error(`未知的面板通道: ${channel}`), { code: 'UNSUPPORTED' });
 }
@@ -304,6 +400,13 @@ module.exports = {
     });
     registerCommands();
     log(`loaded · config=${config.source} · port=${config.port} · concurrency=${config.concurrency || 'unlimited'}`);
+
+    // 首次使用引导：缺少运行时时主动提示，不依赖用户先读 README
+    if (!config.bin || !fs.existsSync(config.bin)) {
+      setTimeout(() => {
+        void toast('Antigravity 插件还没安装运行时。打开「Antigravity: 打开配置面板」→ 点「下载官方运行时」（约 120 MB）。', 'warning');
+      }, 1500);
+    }
   },
 
   async onUnload() {
@@ -316,13 +419,16 @@ module.exports = {
     get acp() { return acp; },
     get gateway() { return gateway; },
     get limiter() { return limiter; },
+    get installState() { return installState; },
     setDataPath: (value) => { dataPath = value; },
     setConfig: (value) => { config = value; },
     reloadConfig,
     startService,
     stopService,
     restartService,
-    installRuntime,
+    startInstall,
+    cleanupRuntime,
+    runtimeStatus,
     registerCommands,
     unregisterCommands,
     RUNTIME,

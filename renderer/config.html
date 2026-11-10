@@ -37,6 +37,10 @@
   .status { margin-top: 14px; font-size: 12px; white-space: pre-wrap; }
   .status.ok { color: #6bd48a; }
   .status.err { color: #ff8a80; }
+  .bar { height: 8px; background: #2a2a2f; border-radius: 4px; overflow: hidden; margin: 8px 0 4px; }
+  .bar > i { display: block; height: 100%; width: 0; background: #2f6bff; transition: width .3s ease; }
+  .bar.done > i { background: #3aa76d; }
+  .bar.fail > i { background: #c9483d; }
   .path { margin-top: 16px; padding-top: 12px; border-top: 1px solid #2c2c31; font-size: 11px; color: #7c7c84; }
   code { background: #232326; padding: 2px 6px; border-radius: 4px; color: #b9b9c0; word-break: break-all; }
 </style>
@@ -115,7 +119,11 @@
     <button id="reload" type="button">重新读取</button>
     <button id="status" type="button">查看状态</button>
     <button id="models" type="button">列出模型</button>
+    <button id="cleanup" type="button">清理运行时</button>
   </div>
+
+  <div class="bar" id="bar"><i id="barFill"></i></div>
+  <div class="hint" id="progress"></div>
 
   <div class="status" id="msg"></div>
   <div class="path">配置文件：<code id="file">（读取中）</code></div>
@@ -149,6 +157,7 @@
       $('binHint').textContent = view.binExists ? '运行时已就绪' : '尚未安装运行时';
       const warn = (view.warnings || []).filter(Boolean);
       show(warn.length ? '已读取。\n' + warn.join('\n') : '已读取配置。', warn.length ? '' : 'ok');
+      await refreshRuntime();
     } catch (error) {
       show('读取失败：' + (error && error.message ? error.message : error), 'err');
     }
@@ -211,17 +220,85 @@
     } catch (error) { show('获取失败：' + (error && error.message ? error.message : error), 'err'); }
   }
 
+  function mb(n) { return (Number(n || 0) / 1048576).toFixed(1) + ' MB'; }
+  let pollTimer = null;
+
+  function renderRuntime(rt) {
+    if (!rt) return;
+    const bar = $('bar');
+    const fill = $('barFill');
+    const label = $('progress');
+    const total = rt.total || rt.expectedBytes || 1;
+    const pct = Math.max(0, Math.min(100, Math.round(((rt.received || 0) / total) * 100)));
+    const elapsed = rt.startedAt ? (Date.now() - rt.startedAt) / 1000 : 0;
+    const speed = elapsed > 1 && rt.received > 0 ? rt.received / elapsed : 0;
+    bar.className = 'bar' + (rt.phase === 'done' ? ' done' : rt.phase === 'error' ? ' fail' : '');
+    if (rt.phase === 'downloading') {
+      fill.style.width = pct + '%';
+      label.textContent = '下载中 ' + pct + '% · ' + mb(rt.received) + ' / ' + mb(total) + (speed > 0 ? ' · ' + mb(speed) + '/s' : '');
+    } else if (rt.phase === 'verifying') {
+      fill.style.width = '100%';
+      label.textContent = '下载完成，正在校验 SHA256…';
+    } else if (rt.phase === 'extracting') {
+      fill.style.width = '100%';
+      label.textContent = '校验通过，正在解压…';
+    } else if (rt.phase === 'done') {
+      fill.style.width = '100%';
+      label.textContent = '已就绪 · ' + mb(rt.bytes || rt.dirBytes) + ' · SHA256 校验通过';
+    } else if (rt.phase === 'error') {
+      label.textContent = '安装失败：' + (rt.error || '未知错误');
+    } else {
+      fill.style.width = rt.binExists ? '100%' : '0%';
+      label.textContent = rt.binExists
+        ? '已安装 · ' + mb(rt.dirBytes) + ' · 卸载插件不会自动删除这些文件'
+        : '尚未安装运行时（约 120 MB）';
+    }
+    $('install').disabled = rt.busy === true;
+    $('cleanup').disabled = rt.busy === true || !(rt.dirBytes > 0);
+  }
+
+  async function refreshRuntime() {
+    try {
+      const rt = await call('runtime:status');
+      renderRuntime(rt);
+      if (rt.busy) startPoll();
+    } catch (error) { /* 忽略 */ }
+  }
+
+  function startPoll() {
+    if (pollTimer) return;
+    pollTimer = setInterval(async function () {
+      try {
+        const rt = await call('runtime:status');
+        renderRuntime(rt);
+        if (!rt.busy) {
+          clearInterval(pollTimer);
+          pollTimer = null;
+          if (rt.phase === 'done') await load().catch(function () {});
+        }
+      } catch (error) { /* 继续轮询 */ }
+    }, 800);
+  }
+
   async function install() {
-    const button = $('install');
-    button.disabled = true;
-    show('正在下载官方运行时（约 120 MB），可能需要几分钟…');
+    show('已开始下载，进度见下方进度条…');
     try {
       const result = await call('runtime:install');
-      if (!result || result.ok !== true) { show('下载失败：' + ((result && result.error) || '未知错误'), 'err'); return; }
-      show('运行时已就绪：\n' + result.bin + '\nSHA256 已校验', 'ok');
+      if (!result || result.ok !== true) { show('启动下载失败：' + ((result && result.error) || '未知错误'), 'err'); return; }
+      startPoll();
+      await refreshRuntime();
+    } catch (error) { show('启动下载失败：' + (error && error.message ? error.message : error), 'err'); }
+  }
+
+  async function cleanup() {
+    show('正在清理…');
+    try {
+      const result = await call('runtime:cleanup');
+      if (!result || result.ok !== true) { show('清理失败：' + ((result && result.error) || '未知错误'), 'err'); return; }
+      show(result.freedBytes > 0 ? '已释放 ' + mb(result.freedBytes) + '，卸载插件前建议点一次' : '没有可清理的文件', 'ok');
+      await refreshRuntime();
       await load().catch(function () {});
-    } catch (error) { show('下载失败：' + (error && error.message ? error.message : error), 'err'); }
-    finally { button.disabled = false; }
+    } catch (error) { show('清理失败：' + (error && error.message ? error.message : error), 'err'); }
   }
 
   $('save').addEventListener('click', save);
@@ -229,6 +306,7 @@
   $('status').addEventListener('click', status);
   $('models').addEventListener('click', models);
   $('install').addEventListener('click', install);
+  $('cleanup').addEventListener('click', cleanup);
   load();
 })();
 </script>

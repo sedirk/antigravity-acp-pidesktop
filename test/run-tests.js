@@ -163,6 +163,33 @@ async function main() {
     assert.strictEqual(JSON.parse(fs.readFileSync(path.join(dataDir, 'config.json'), 'utf8')).port, 43001);
   });
 
+  await suite('runtime: 清理运行时释放空间并回到 idle', async () => {
+    const dir = tempDir('rt');
+    const plugin = require(path.join(root, 'main.js'));
+    globalThis.pi = {
+      commands: { register() {}, unregister() {} },
+      services: { register() {} },
+      ui: { showToast: async () => {} },
+      plugin: { getDataPath: async () => dir },
+    };
+    plugin._internals.setDataPath(dir);
+    plugin._internals.reloadConfig();
+
+    fs.mkdirSync(path.join(dir, 'runtime'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'runtime', 'agy_acp_server.exe'), Buffer.alloc(1024 * 1024));
+
+    const before = plugin._internals.runtimeStatus();
+    assert.ok(before.dirBytes >= 1024 * 1024, '应统计出已占用空间');
+    assert.strictEqual(before.binExists, true, '数据目录里的运行时应被自动探测到');
+    assert.strictEqual(before.busy, false);
+
+    const result = plugin._internals.cleanupRuntime();
+    assert.strictEqual(result.ok, true);
+    assert.ok(result.freedBytes >= 1024 * 1024, '应报告释放的字节数');
+    assert.strictEqual(plugin._internals.runtimeStatus().dirBytes, 0);
+    assert.strictEqual(fs.existsSync(path.join(dir, 'runtime')), false);
+  });
+
   const failed = results.filter((r) => !r.ok);
   console.log(`\n结果: ${results.length - failed.length}/${results.length} 通过`);
   if (failed.length > 0) process.exit(1);
