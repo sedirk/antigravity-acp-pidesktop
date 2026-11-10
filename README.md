@@ -75,7 +75,7 @@
 | `exposeVariantModels` | false | 是否同时列出带档位后缀的显式模型 |
 | `promptTimeoutMs` | 600000 | 单轮回答超时 |
 | `bin` | 空 | `agy_acp_server.exe` 路径（面板下载后自动写入） |
-| `cwd` | 空 | 留空 = 跟随 PI-Desktop 当前项目目录（建会话时现问，取不到回退用户主目录）；填了就固定用它 |
+| `cwd` | 空 | 留空 = 跟随 PI-Desktop 当前项目目录（建会话时现问，取不到回退用户主目录）；填了就固定用它。它是文件工具的白名单根，不是命令沙箱 |
 | `modelCacheMs` | 300000 | 模型列表缓存时长 |
 
 ## 参数透传：哪些生效、哪些被运行时忽略
@@ -156,6 +156,7 @@ ACP 的 agent 自带一套工具：`search_web`、`read_url_content`、`view_fil
    越界时 `view_file` 直接报「不在允许访问的工作区目录列表内」。`cwd` 由面板「工作目录」决定：
    **1.2.0 起留空 = 跟随 PI-Desktop 当前项目目录**（每次建会话现问宿主，取不到回退用户主目录）；
    1.1.0 留空是用户主目录；1.0.x 及更早是运行时所在目录——那才是「连 `~/.codex` 都读不到」的原因。
+   ⚠️ 只有**文件工具**受它限制：`run_command`（`kind=execute`）走系统权限，实测在项目话题下仍能读 `cwd` 之外的文件。
 
 实测对照（同一句 prompt：统计 `.codex\config.toml` 行数 + 执行 `echo ACP-OK`），模型 `gemini-4-carbon-high`：
 

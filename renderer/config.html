@@ -154,7 +154,7 @@
       <div class="row">
         <input id="cwd" type="text" placeholder="留空即用当前项目目录（没有项目时用用户主目录）">
       </div>
-      <span class="hint">运行时的 view_file / run_command / write_to_file 都以此为工作区，只有它和 ~/.gemini 能访问。留空后每次建会话都会现问一次宿主，切换项目不用重启网关；要额外覆盖（例如读 D 盘）就在这填上级目录。</span>
+      <span class="hint">运行时的文件工具（view_file / write_to_file）只认这个目录和 ~/.gemini；run_command 走系统权限、不受它限制（实测能读 cwd 之外的路径）。留空 = 每次建会话现问宿主当前项目，切项目不用重启网关。</span>
     </div>
   </form>
 

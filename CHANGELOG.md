@@ -1,5 +1,13 @@
 # 变更记录
 
+## 1.2.1
+
+文档修正（实测发现 `cwd` 只管文件工具，不管命令）：
+
+- 项目话题下实测 `run_command` 仍能读取 `cwd` 之外的路径（`Get-Content C:\Users\sedirk\.codex\config.toml` → 行数=158），
+  所以 `cwd` 是**文件工具的白名单根**，不是命令沙箱；面板与 README 文案改成这一说法
+- 临时话题（宿主没项目）实测 `cwd` 回退主目录，`view_file` 与 `run_command` 都读得到 `~/.codex/config.toml`
+
 ## 1.2.0
 
 工作目录跟随 PI-Desktop 项目：
