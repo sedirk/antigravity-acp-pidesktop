@@ -50,6 +50,27 @@ OpenAI 兼容本地网关。
 | `virtualModels` | true | 按档位后缀合并模型 |
 | `exposeVariantModels` | false | 是否同时列出带档位后缀的显式模型 |
 
+## 参数透传：哪些生效、哪些被运行时忽略
+
+ACP 的 `session/prompt` 只接受内容块，**没有任何采样参数位**；思考档位是编码在模型 ID 后缀里的
+（`-low` / `-medium` / `-high`），所以「思考强度」靠换模型实现，而不是传 `thinking` 对象。
+下表是实测结论（官方运行时 1.3.0，真实请求验证，不是文档推断）：
+
+| 请求字段 | 结果 | 说明 |
+| --- | --- | --- |
+| `reasoning_effort` | ✅ 生效 | `low`/`minimal`→`-low`，`high`/`xhigh`/`max`→`-high`，缺省或其它→`-medium`；日志会打印 `chat gemini-3.8-flash → gemini-3.8-flash-low（effort=low）` |
+| 模型 ID 带档位后缀 | ✅ 生效 | 例如直接写 `gemini-3.8-flash-high`，按后缀选 |
+| `image_url` / `input_image` | ✅ 生效 | `data:` URL 与 `http(s)` 链接都转成 ACP 的 `image` 块（0.4.0 起） |
+| `stream` | ✅ 生效 | SSE 流式 |
+| `temperature`、`top_p`、`top_k`、`max_tokens`、`max_completion_tokens`、`stop`、`seed`、`presence_penalty`、`frequency_penalty`、`logprobs`、`top_logprobs`、`logit_bias`、`response_format`、`text.format`、`verbosity` | ❌ 被忽略 | 实测 `max_tokens=8` 仍输出 229 字；发给运行时也不报错，属于静默丢弃，网关会在日志里打印一行「运行时忽略 …」 |
+| `tools`、`tool_choice`、`parallel_tool_calls` | ❌ 未映射 | ACP 的 `tool_call` 事件目前不处理；`session/set_mode`（default/auto_edit/yolo）存在但网关未暴露 |
+| 思考内容（`agent_thought_chunk`） | ⚠️ 通道已接好，但运行时不发 | 实测 carbon/argon/3.8-flash × low/high 四组，思考块都是 0 字：能改档位，读不到思维过程 |
+| `usage` | ✅ 估算值 | ACP 不返回 token 数，按「CJK 每字 1 token、其余 4 字符 1 token」估算，并带 `estimated: true` |
+
+`GET /v1/models` 会顺带声明能力：`modalities.input = [text, image]`、`capabilities = [text, image, reasoning]`、
+`supports_reasoning_effort = true`、`reasoning_efforts = [low, medium, high]`，
+方便宿主判断「能不能发图」「要不要发 reasoning_effort」。
+
 ## 已知边界
 
 - 只保证 Windows 的自动下载；其他平台请手动放置运行时并填 `bin` 路径

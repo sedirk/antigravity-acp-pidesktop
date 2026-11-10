@@ -192,6 +192,21 @@ async function main() {
     assert.strictEqual(inputImage[0].images.length, 1, 'Responses 的 input_image 也要收集');
   });
 
+  await suite('usage: token 估算与「运行时不支持」参数识别', async () => {
+    const { countTokens, usageFor, ignoredParams } = require(path.join(root, 'lib/server.js'));
+    assert.strictEqual(countTokens('hello world'), 3);
+    assert.strictEqual(countTokens('你好世界'), 4);
+    assert.strictEqual(countTokens(''), 0);
+    const usage = usageFor('你好', '世界', '');
+    assert.strictEqual(usage.prompt_tokens, 2);
+    assert.strictEqual(usage.completion_tokens, 2);
+    assert.strictEqual(usage.total_tokens, 4);
+    assert.strictEqual(usage.estimated, true);
+    assert.deepStrictEqual(ignoredParams({ model: 'm', messages: [], temperature: 0.2, tools: [] }), ['temperature']);
+    assert.deepStrictEqual(ignoredParams({ messages: [], max_tokens: 5, reasoning_effort: 'high' }), ['max_tokens']);
+    assert.deepStrictEqual(ignoredParams({ messages: [], text: { format: { type: 'json_object' } } }), ['text.format']);
+  });
+
   await suite('config: 只认数据目录一份配置，旧文件仅迁移一次', async () => {
     const base = tempDir('single-root');
     const dataDir = tempDir('single-data');
