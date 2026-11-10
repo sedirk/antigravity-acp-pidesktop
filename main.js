@@ -10,11 +10,11 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { execFile, spawn } = require('node:child_process');
+const { execFile, spawn, execFileSync } = require('node:child_process');
 
 const configLib = require('./lib/config');
 const proxyLib = require('./lib/proxy');
-const { AcpRuntime, createLimiter } = require('./lib/core');
+const { AcpRuntime, createLimiter, killTree } = require('./lib/core');
 const { createGateway } = require('./lib/server');
 
 const SERVICE_ID = 'antigravity-acp-gateway';
@@ -97,15 +97,64 @@ function buildLimiter() {
   });
 }
 
+/**
+ * 清理插件自己留下的孤儿运行时。
+ * 旧版本只用 child.kill()，Windows 下不会级联，于是 agy_acp_server.exe 与
+ * localharness_external.exe 会残留；它们共享同一账号的并发额度，导致请求偶发超时。
+ * 只处理「可执行文件在本插件 runtime 目录下、且父进程已不存在」的进程。
+ */
+function listRuntimeServers() {
+  if (process.platform !== 'win32') return [];
+  const script = "Get-CimInstance Win32_Process -Filter \"Name='agy_acp_server.exe'\" | Select-Object ProcessId,ParentProcessId,ExecutablePath | ConvertTo-Json -Compress";
+  try {
+    const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+      windowsHide: true, timeout: 20000, stdio: ['ignore', 'pipe', 'ignore'],
+    }).toString().trim();
+    if (!out) return [];
+    const parsed = JSON.parse(out);
+    return Array.isArray(parsed) ? parsed : [parsed];
+  } catch {
+    return [];
+  }
+}
+
+function pidAlive(pid) {
+  if (!pid) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function reapOrphans() {
+  if (process.platform !== 'win32') return 0;
+  const dir = runtimeDir().toLowerCase();
+  const mine = acp && acp.child ? acp.child.pid : 0;
+  let killed = 0;
+  for (const item of listRuntimeServers()) {
+    const exe = String(item.ExecutablePath || '').toLowerCase();
+    if (!dir || !exe.startsWith(dir)) continue;
+    const pid = Number(item.ProcessId);
+    if (!pid || pid === mine) continue;
+    if (pidAlive(Number(item.ParentProcessId))) continue;
+    killTree(pid);
+    killed += 1;
+  }
+  if (killed > 0) log(`已清理 ${killed} 个残留运行时进程（父进程已退出的孤儿）`);
+  return killed;
+}
+
 async function startService({ log: providedLog } = {}) {
   if (typeof providedLog === 'function') log = (message) => { providedLog(message); writeLogLine(message); };
   reloadConfig();
   refreshProxy();
+  reapOrphans();
   limiter = buildLimiter();
   acp = new AcpRuntime({ getConfig: () => config, getProxy: () => resolvedProxy.url, log });
   gateway = createGateway({ acp, limiter, getConfig: () => config, log });
   const base = config.port;
   const port = await gateway.listen([base, base + 1, base + 2, base + 3]);
+  // 预热：先完成 ACP 握手与模型发现，避免第一条对话撞上运行时初始化的 10–20 秒
+  acp.start()
+    .then(() => acp.discover().catch(() => {}))
+    .catch((error) => log(`预热失败：${String(error.message).slice(0, 160)}`));
   log(`服务已启动 · 配置 ${config.source} · 并发上限 ${config.concurrency > 0 ? config.concurrency : '不限'}`);
   return { port };
 }
@@ -410,6 +459,7 @@ module.exports = {
 
     reloadConfig();
     refreshProxy();
+    reapOrphans();
     pi.services.register({
       id: SERVICE_ID,
       start: (context) => startService(context),

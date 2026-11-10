@@ -51,6 +51,8 @@ OpenAI 兼容本地网关。
 - 只保证 Windows 的自动下载；其他平台请手动放置运行时并填 `bin` 路径
 - **卸载插件不会删除运行时**（约 227 MB）。运行时放在插件数据目录 `plugins\data\local.antigravity-acp\runtime\`，
   卸载前请先执行命令「Antigravity: 清理已下载的运行时」，或在面板点「清理运行时」释放空间
+- 退出时会用 `taskkill /T` 结束整棵进程树；插件启动时还会清掉「父进程已退出」的残留运行时，
+  避免多个 ACP 实例共享同一账号额度导致偶发超时
 - 下载过程中面板会显示百分比、已下载/总量、速度；校验、解压各有独立状态，完成后有提示
 - 只做聊天与文本输入，未映射工具调用（ACP 的 tool_call 事件目前忽略）
 - 思考内容（`agent_thought_chunk`）已接入 `reasoning_content` / `reasoning` item，
