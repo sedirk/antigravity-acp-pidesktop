@@ -157,15 +157,39 @@ async function main() {
   });
 
   await suite('messages: Chat 与 Responses 两种入参归一化', async () => {
+    const pick = (arr) => arr.map(({ role, content }) => ({ role, content }));
     const chat = normalizeMessages({ messages: [{ role: 'user', content: 'hi' }] });
-    assert.deepStrictEqual(chat, [{ role: 'user', content: 'hi' }]);
+    assert.deepStrictEqual(pick(chat), [{ role: 'user', content: 'hi' }]);
     const responses = normalizeMessages({
       instructions: 'be brief',
       input: [{ role: 'user', content: [{ type: 'input_text', text: 'hello' }] }],
     }, { responses: true });
-    assert.deepStrictEqual(responses, [{ role: 'system', content: 'be brief' }, { role: 'user', content: 'hello' }]);
+    assert.deepStrictEqual(pick(responses), [{ role: 'system', content: 'be brief' }, { role: 'user', content: 'hello' }]);
     const flat = normalizeMessages({ input: 'just text' }, { responses: true });
-    assert.deepStrictEqual(flat, [{ role: 'user', content: 'just text' }]);
+    assert.deepStrictEqual(pick(flat), [{ role: 'user', content: 'just text' }]);
+  });
+
+  await suite('images: data URL 透传成 ACP 图片块', async () => {
+    const { buildPromptBlocks, normalizeMessages } = require(path.join(root, 'lib/server.js'));
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+    const messages = normalizeMessages({
+      messages: [{
+        role: 'user',
+        content: [{ type: 'text', text: '这张图什么颜色' }, { type: 'image_url', image_url: { url: `data:image/png;base64,${png}` } }],
+      }],
+    });
+    assert.strictEqual(messages[0].content, '这张图什么颜色');
+    assert.strictEqual(messages[0].images.length, 1, '应收集到图片');
+    const blocks = await buildPromptBlocks(messages[0].content, messages[0].images);
+    assert.strictEqual(blocks[0].type, 'text');
+    assert.strictEqual(blocks[1].type, 'image');
+    assert.strictEqual(blocks[1].mimeType, 'image/png');
+    assert.strictEqual(blocks[1].data, png);
+
+    const inputImage = normalizeMessages({
+      input: [{ role: 'user', content: [{ type: 'input_image', image_url: `data:image/jpeg;base64,${png}` }] }],
+    }, { responses: true });
+    assert.strictEqual(inputImage[0].images.length, 1, 'Responses 的 input_image 也要收集');
   });
 
   await suite('config: 只认数据目录一份配置，旧文件仅迁移一次', async () => {
