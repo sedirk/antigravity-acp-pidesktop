@@ -1,0 +1,171 @@
+'use strict';
+
+/**
+ * 离线自测：node test/run-tests.js
+ * 只覆盖纯逻辑（配置、并发限制、模型分组、消息归一化），不联网、不启动运行时。
+ */
+
+const assert = require('node:assert');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+const root = path.resolve(__dirname, '..');
+const configLib = require(path.join(root, 'lib/config.js'));
+const { createLimiter, levelOfEffort, AcpRuntime } = require(path.join(root, 'lib/core.js'));
+const { normalizeMessages } = require(path.join(root, 'lib/server.js'));
+const manifest = require(path.join(root, 'manifest.json'));
+
+const results = [];
+async function suite(name, fn) {
+  try {
+    await fn();
+    results.push({ name, ok: true });
+    console.log(`  PASS  ${name}`);
+  } catch (error) {
+    results.push({ name, ok: false, error });
+    console.log(`  FAIL  ${name}: ${error.message}`);
+  }
+}
+
+function tempDir(prefix) {
+  const dir = path.join(os.tmpdir(), `agy-test-${prefix}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`);
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function main() {
+  console.log('Antigravity ACP 网关自测');
+
+  await suite('manifest: 基本字段与权限', async () => {
+    assert.strictEqual(manifest.id, 'local.antigravity-acp');
+    assert.ok(manifest.permissions.includes('background.service'));
+    assert.ok(manifest.permissions.includes('ui.panel'));
+    assert.strictEqual(manifest.ui.panel, 'renderer/config.html');
+    assert.ok(fs.existsSync(path.join(root, manifest.ui.panel)));
+    assert.strictEqual(manifest.contributes.services[0].id, 'antigravity-acp-gateway');
+  });
+
+  await suite('config: 默认值、钳制与校验', async () => {
+    const dir = tempDir('cfg');
+    const cfg = configLib.loadConfig({ packageRoot: dir, dataPath: dir });
+    assert.strictEqual(cfg.port, 41910);
+    assert.strictEqual(cfg.concurrency, 0, '并发默认必须关闭');
+    assert.ok(cfg.warnings.length > 0);
+
+    const bad = configLib.validatePatch({ port: 'abc', proxy: 'ftp://x' }, { packageRoot: dir, dataPath: dir });
+    assert.strictEqual(bad.errors.length, 2);
+
+    const good = configLib.savePanel({ packageRoot: dir, dataPath: dir }, { port: '41911', concurrency: '1', proxy: 'http://127.0.0.1:10808' }, null);
+    assert.strictEqual(good.ok, true);
+    const saved = JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf8'));
+    assert.strictEqual(saved.port, 41911);
+    assert.strictEqual(saved.concurrency, 1);
+    assert.strictEqual(saved.proxy, 'http://127.0.0.1:10808');
+
+    const reloaded = configLib.loadConfig({ packageRoot: dir, dataPath: dir });
+    assert.strictEqual(reloaded.port, 41911);
+    assert.strictEqual(reloaded.concurrency, 1);
+  });
+
+  await suite('limiter: 0 = 不限制；1 = 串行；排队超时', async () => {
+    const free = createLimiter({ limit: 0, maxQueue: 4, queueTimeoutMs: 50 });
+    let peak = 0;
+    let active = 0;
+    await Promise.all([1, 2, 3].map(() => free.run(async () => {
+      active += 1; peak = Math.max(peak, active);
+      await sleep(20);
+      active -= 1;
+    })));
+    assert.strictEqual(peak, 3, 'limit=0 时不应被串行');
+
+    const serial = createLimiter({ limit: 1, maxQueue: 4, queueTimeoutMs: 2000 });
+    let running = 0;
+    let maxRunning = 0;
+    const order = [];
+    await Promise.all([1, 2, 3].map((n) => serial.run(async () => {
+      running += 1; maxRunning = Math.max(maxRunning, running);
+      order.push(n);
+      await sleep(15);
+      running -= 1;
+    })));
+    assert.strictEqual(maxRunning, 1, 'limit=1 时必须串行');
+    assert.deepStrictEqual(order, [1, 2, 3], '必须 FIFO');
+
+    const timeout = createLimiter({ limit: 1, maxQueue: 4, queueTimeoutMs: 30 });
+    const blocker = timeout.run(() => sleep(120));
+    const queued = timeout.run(() => sleep(5));
+    await assert.rejects(queued, (error) => error.code === 'QUEUE_TIMEOUT');
+    await blocker;
+    assert.strictEqual(timeout.stats().active, 0);
+  });
+
+  await suite('limiter: 队满直接拒绝', async () => {
+    const limiter = createLimiter({ limit: 1, maxQueue: 1, queueTimeoutMs: 5000 });
+    const first = limiter.run(() => sleep(80));
+    const second = limiter.run(() => sleep(10));
+    await assert.rejects(limiter.run(() => sleep(10)), (error) => error.code === 'QUEUE_FULL');
+    await Promise.all([first, second]);
+  });
+
+  await suite('models: 档位后缀自动分组 + effort 解析', async () => {
+    const acp = new AcpRuntime({ getConfig: () => ({ modelCacheMs: 0, cwd: '.' }), log: () => {} });
+    acp.discovery = {
+      at: Date.now(),
+      raw: [],
+      groups: new Map([
+        ['gemini-4-carbon', { base: 'gemini-4-carbon', names: ['Gemini 4 Carbon (Medium)'], levels: new Map([['low', 'gemini-4-carbon-low'], ['medium', 'gemini-4-carbon-medium'], ['high', 'gemini-4-carbon-high']]) }],
+        ['solo-model', { base: 'solo-model', names: ['Solo'], levels: new Map() }],
+      ]),
+    };
+    assert.strictEqual(acp.resolveModel('gemini-4-carbon', 'low'), 'gemini-4-carbon-low');
+    assert.strictEqual(acp.resolveModel('gemini-4-carbon', 'high'), 'gemini-4-carbon-high');
+    assert.strictEqual(acp.resolveModel('gemini-4-carbon', undefined), 'gemini-4-carbon-medium');
+    assert.strictEqual(acp.resolveModel('solo-model', 'high'), 'solo-model');
+    assert.strictEqual(acp.resolveModel('gemini-4-carbon-low', 'high'), 'gemini-4-carbon-high');
+    assert.strictEqual(levelOfEffort('xhigh'), 'high');
+    assert.strictEqual(levelOfEffort('minimal'), 'low');
+  });
+
+  await suite('messages: Chat 与 Responses 两种入参归一化', async () => {
+    const chat = normalizeMessages({ messages: [{ role: 'user', content: 'hi' }] });
+    assert.deepStrictEqual(chat, [{ role: 'user', content: 'hi' }]);
+    const responses = normalizeMessages({
+      instructions: 'be brief',
+      input: [{ role: 'user', content: [{ type: 'input_text', text: 'hello' }] }],
+    }, { responses: true });
+    assert.deepStrictEqual(responses, [{ role: 'system', content: 'be brief' }, { role: 'user', content: 'hello' }]);
+    const flat = normalizeMessages({ input: 'just text' }, { responses: true });
+    assert.deepStrictEqual(flat, [{ role: 'user', content: 'just text' }]);
+  });
+
+  await suite('config: 只认数据目录一份配置，旧文件仅迁移一次', async () => {
+    const base = tempDir('single-root');
+    const dataDir = tempDir('single-data');
+
+    // 旧版本：只有插件根目录有 config.json → 首次加载迁移到数据目录
+    fs.writeFileSync(path.join(base, 'config.json'), JSON.stringify({ port: 42000 }), 'utf8');
+    const first = configLib.loadConfig({ packageRoot: base, dataPath: dataDir });
+    assert.strictEqual(first.port, 42000);
+    assert.strictEqual(first.migratedFrom, path.join(dataDir, 'config.json'));
+    assert.ok(fs.existsSync(path.join(dataDir, 'config.json')), '迁移后数据目录必须有配置');
+
+    // 迁移之后再改根目录文件，不应再生效（本源只有一处）
+    fs.writeFileSync(path.join(base, 'config.json'), JSON.stringify({ port: 49999 }), 'utf8');
+    assert.strictEqual(configLib.loadConfig({ packageRoot: base, dataPath: dataDir }).port, 42000);
+
+    // 面板保存只写数据目录
+    const saved = configLib.savePanel({ packageRoot: base, dataPath: dataDir }, { port: '43001' }, null);
+    assert.strictEqual(saved.ok, true);
+    assert.strictEqual(saved.file, path.join(dataDir, 'config.json'));
+    assert.strictEqual(JSON.parse(fs.readFileSync(path.join(dataDir, 'config.json'), 'utf8')).port, 43001);
+  });
+
+  const failed = results.filter((r) => !r.ok);
+  console.log(`\n结果: ${results.length - failed.length}/${results.length} 通过`);
+  if (failed.length > 0) process.exit(1);
+}
+
+main();

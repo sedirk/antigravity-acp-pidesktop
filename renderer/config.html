@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="pi-plugin-chrome" content="v2">
+<title>Antigravity ACP · 配置</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: calc(var(--pi-plugin-titlebar-height, 0px) + 18px) 22px 22px;
+    font: 13px/1.55 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    background: #1b1b1d; color: #e6e6e8;
+  }
+  h1 { font-size: 15px; margin: 0 0 2px; font-weight: 600; }
+  .sub { color: #8f8f96; font-size: 12px; margin-bottom: 16px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 16px; }
+  .field { display: flex; flex-direction: column; gap: 5px; }
+  .field.wide { grid-column: 1 / -1; }
+  label { font-size: 12px; color: #a9a9b0; }
+  input, select {
+    background: #232326; border: 1px solid #35353a; border-radius: 7px;
+    color: #e6e6e8; padding: 7px 9px; font: inherit; outline: none;
+  }
+  input:focus, select:focus { border-color: #4c7dff; }
+  .hint { font-size: 11px; color: #7c7c84; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row input { flex: 1; }
+  .actions { display: flex; gap: 8px; align-items: center; margin-top: 18px; flex-wrap: wrap; }
+  button {
+    border: 1px solid #35353a; background: #26262a; color: #e6e6e8;
+    border-radius: 7px; padding: 7px 14px; font: inherit; cursor: pointer;
+  }
+  button.primary { background: #2f6bff; border-color: #2f6bff; color: #fff; font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  .status { margin-top: 14px; font-size: 12px; white-space: pre-wrap; }
+  .status.ok { color: #6bd48a; }
+  .status.err { color: #ff8a80; }
+  .path { margin-top: 16px; padding-top: 12px; border-top: 1px solid #2c2c31; font-size: 11px; color: #7c7c84; }
+  code { background: #232326; padding: 2px 6px; border-radius: 4px; color: #b9b9c0; word-break: break-all; }
+</style>
+</head>
+<body>
+  <h1>Antigravity ACP · 配置</h1>
+  <div class="sub">保存后网关会重启。本插件不保存任何 Google 凭据，登录由官方 ACP 运行时自己完成。</div>
+
+  <form id="form" class="grid" autocomplete="off">
+    <div class="field">
+      <label for="port">网关端口</label>
+      <input id="port" type="number" min="1024" max="65535">
+      <span class="hint">PI-Desktop 里填 http://127.0.0.1:端口/v1</span>
+    </div>
+    <div class="field">
+      <label for="proxy">子进程代理（留空=直连）</label>
+      <input id="proxy" type="text" placeholder="http://127.0.0.1:10808">
+      <span class="hint">注入给 ACP 运行时，不影响系统代理</span>
+    </div>
+
+    <div class="field wide">
+      <label for="bin">ACP 运行时（agy_acp_server.exe）</label>
+      <div class="row">
+        <input id="bin" type="text" placeholder="C:\\...\\agy_acp_server.exe">
+        <button id="install" type="button">下载官方运行时</button>
+      </div>
+      <span class="hint" id="binHint"></span>
+    </div>
+
+    <div class="field">
+      <label for="defaultModel">默认模型</label>
+      <input id="defaultModel" type="text" placeholder="gemini-3.8-flash">
+    </div>
+    <div class="field">
+      <label for="modelCacheMinutes">模型缓存（分钟）</label>
+      <input id="modelCacheMinutes" type="number" min="0" max="60">
+    </div>
+
+    <div class="field">
+      <label for="virtualModels">虚拟模型（按档位后缀自动合并）</label>
+      <select id="virtualModels">
+        <option value="true">开启（推荐）</option>
+        <option value="false">关闭（每个档位单独列出）</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="exposeVariantModels">同时列出显式档位模型</label>
+      <select id="exposeVariantModels">
+        <option value="false">不列出</option>
+        <option value="true">列出 -low/-medium/-high</option>
+      </select>
+    </div>
+
+    <div class="field">
+      <label for="concurrency">最大并发（0 = 不限制，默认关闭）</label>
+      <input id="concurrency" type="number" min="0" max="8">
+      <span class="hint">设为 1 即串行：同一时刻只跑一条 prompt</span>
+    </div>
+    <div class="field">
+      <label for="queueTimeoutMinutes">排队超时（分钟）</label>
+      <input id="queueTimeoutMinutes" type="number" min="1" max="60">
+    </div>
+
+    <div class="field">
+      <label for="promptTimeoutMinutes">单次回答超时（分钟）</label>
+      <input id="promptTimeoutMinutes" type="number" min="1" max="60">
+    </div>
+    <div class="field">
+      <label for="cwd">工作目录（留空=运行时所在目录）</label>
+      <input id="cwd" type="text" placeholder="留空即可">
+    </div>
+  </form>
+
+  <div class="actions">
+    <button class="primary" id="save" type="button">保存并重启网关</button>
+    <button id="reload" type="button">重新读取</button>
+    <button id="status" type="button">查看状态</button>
+    <button id="models" type="button">列出模型</button>
+  </div>
+
+  <div class="status" id="msg"></div>
+  <div class="path">配置文件：<code id="file">（读取中）</code></div>
+
+<script>
+(function () {
+  const bridge = window.pluginBridge;
+  const ids = ['port', 'proxy', 'bin', 'defaultModel', 'modelCacheMinutes', 'virtualModels',
+    'exposeVariantModels', 'concurrency', 'queueTimeoutMinutes', 'promptTimeoutMinutes', 'cwd'];
+  const $ = (id) => document.getElementById(id);
+  const msg = $('msg');
+
+  function show(text, kind) {
+    msg.textContent = text || '';
+    msg.className = 'status' + (kind ? ' ' + kind : '');
+  }
+  function call(channel, payload) {
+    if (!bridge || typeof bridge.invoke !== 'function') return Promise.reject(new Error('当前环境没有 pluginBridge'));
+    return payload === undefined ? bridge.invoke(channel) : bridge.invoke(channel, payload);
+  }
+
+  async function load() {
+    show('正在读取配置…');
+    try {
+      const view = await call('config:read');
+      for (const id of ids) {
+        if (id === 'virtualModels' || id === 'exposeVariantModels') { $(id).value = view[id] ? 'true' : 'false'; continue; }
+        $(id).value = view[id] === undefined || view[id] === null ? '' : view[id];
+      }
+      $('file').textContent = view.file + (view.exists ? '' : '（尚未创建）');
+      $('binHint').textContent = view.binExists ? '运行时已就绪' : '尚未安装运行时';
+      const warn = (view.warnings || []).filter(Boolean);
+      show(warn.length ? '已读取。\n' + warn.join('\n') : '已读取配置。', warn.length ? '' : 'ok');
+    } catch (error) {
+      show('读取失败：' + (error && error.message ? error.message : error), 'err');
+    }
+  }
+
+  function collect() {
+    const payload = {};
+    for (const id of ids) {
+      const el = $(id);
+      if (id === 'virtualModels' || id === 'exposeVariantModels') { payload[id] = el.value === 'true'; continue; }
+      if (el.value === '') continue;
+      payload[id] = el.value;
+    }
+    return payload;
+  }
+
+  async function save() {
+    const button = $('save');
+    button.disabled = true;
+    show('正在保存…');
+    try {
+      const result = await call('config:write', collect());
+      if (!result || result.ok !== true) {
+        show('保存失败：\n' + ((result && result.errors) || ['未知错误']).join('\n'), 'err');
+        return;
+      }
+      const lines = ['已保存到 ' + result.file];
+      if (result.changed && result.changed.length) lines.push('修改项：' + result.changed.join(', '));
+      if (result.port) lines.push('网关已重启，端口 ' + result.port);
+      if (result.restartError) lines.push('重启失败：' + result.restartError);
+      show(lines.join('\n'), result.restartError ? 'err' : 'ok');
+      await load().catch(function () {});
+    } catch (error) {
+      show('保存失败：' + (error && error.message ? error.message : error), 'err');
+    } finally { button.disabled = false; }
+  }
+
+  async function status() {
+    show('正在查询…');
+    try {
+      const snap = await call('gateway:status');
+      if (!snap || snap.running !== true) { show('网关未运行', 'err'); return; }
+      const limit = snap.limiter || {};
+      show([
+        '网关 http://127.0.0.1:' + snap.port + '/v1',
+        '运行时 ' + (snap.runtimeReady ? '就绪' : '未启动') + (snap.pid ? ' (pid ' + snap.pid + ')' : ''),
+        '虚拟模型 ' + snap.models + ' 个',
+        '并发 ' + (limit.limit > 0 ? limit.limit + '（进行 ' + limit.active + '，排队 ' + limit.queued + '）' : '不限'),
+        '代理 ' + (snap.proxy || '直连'),
+      ].join('\n'), 'ok');
+    } catch (error) { show('查询失败：' + (error && error.message ? error.message : error), 'err'); }
+  }
+
+  async function models() {
+    show('正在获取模型…');
+    try {
+      const result = await call('models:list');
+      if (!result || result.ok !== true) { show('获取失败：' + ((result && result.error) || '未知错误'), 'err'); return; }
+      show('可用模型（' + result.models.length + '）：\n' + result.models.map((m) => m.id).join('\n'), 'ok');
+    } catch (error) { show('获取失败：' + (error && error.message ? error.message : error), 'err'); }
+  }
+
+  async function install() {
+    const button = $('install');
+    button.disabled = true;
+    show('正在下载官方运行时（约 120 MB），可能需要几分钟…');
+    try {
+      const result = await call('runtime:install');
+      if (!result || result.ok !== true) { show('下载失败：' + ((result && result.error) || '未知错误'), 'err'); return; }
+      show('运行时已就绪：\n' + result.bin + '\nSHA256 已校验', 'ok');
+      await load().catch(function () {});
+    } catch (error) { show('下载失败：' + (error && error.message ? error.message : error), 'err'); }
+    finally { button.disabled = false; }
+  }
+
+  $('save').addEventListener('click', save);
+  $('reload').addEventListener('click', load);
+  $('status').addEventListener('click', status);
+  $('models').addEventListener('click', models);
+  $('install').addEventListener('click', install);
+  load();
+})();
+</script>
+</body>
+</html>
