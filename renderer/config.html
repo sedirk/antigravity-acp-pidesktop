@@ -69,16 +69,16 @@
       <input id="proxy" type="text" placeholder="http://127.0.0.1:10808">
     </div>
     <div class="field">
-      <label for="toolPolicy">工具权限（联网搜索）</label>
+      <label for="toolPolicy">工具权限（本插件自己的关卡，默认不设防）</label>
       <select id="toolPolicy">
-        <option value="agent">放行只读工具 + 子代理 / 后台任务 / 生图</option>
+        <option value="all">全部放行（默认：不额外拦截，读写 / 执行都交给运行时）</option>
+        <option value="shell">只读 + 执行命令（不许写文件）</option>
+        <option value="agent">只读 + 子代理 / 后台任务 / 生图（不许执行 shell）</option>
         <option value="search">只放行只读工具（联网搜索 / 抓网页 / 读文件）</option>
-        <option value="all">放行全部工具（含执行命令、写文件）</option>
-        <option value="none">全部拒绝</option>
+        <option value="none">全部拒绝（当纯聊天网关用）</option>
       </select>
-      <span class="hint">ACP 的 agent 自带 search_web / read_url_content；设为「全部拒绝」后它只能靠预训练知识回答</span>
+      <span class="hint">这一档只决定本插件怎么回 session/request_permission；真正的文件边界是下面的「工作目录」（运行时只认它和 ~/.gemini）。想更严再往下调，保持默认也能正常读写项目文件。</span>
     </div>
-
     <div class="field wide">
       <label for="bin">ACP 运行时（agy_acp_server.exe）</label>
       <div class="row">
@@ -149,9 +149,12 @@
       <input id="idleSessionMinutes" type="number" min="1" max="240">
       <span class="hint">到点用 session/close 放掉运行时的 worker；下次发言优先 session/resume（不重放历史）</span>
     </div>
-    <div class="field">
-      <label for="cwd">工作目录（留空=运行时所在目录）</label>
-      <input id="cwd" type="text" placeholder="留空即可">
+    <div class="field wide">
+      <label for="cwd">工作目录（运行时允许读写的根，留空 = 用户主目录）</label>
+      <div class="row">
+        <input id="cwd" type="text" placeholder="默认 C:\\Users\\你的用户名">
+      </div>
+      <span class="hint">view_file / write_to_file / run_command 都以它为工作区：只有这个目录和 ~/.gemini 能访问。要读别的盘或项目就填它们的上级目录（例如 D:\\tools）——填得越宽，模型能动的东西越多。</span>
     </div>
   </form>
 
@@ -248,7 +251,7 @@
         '运行时 ' + (snap.runtimeReady ? '就绪' : '未启动') + (snap.pid ? ' (pid ' + snap.pid + ')' : ''),
         '虚拟模型 ' + snap.models + ' 个',
         '并发 ' + (limit.limit > 0 ? limit.limit + '（进行 ' + limit.active + '，排队 ' + limit.queued + '）' : '不限'),
-           '工具权限 ' + (snap.toolPolicy || 'search'),
+      '工具权限 ' + (snap.toolPolicy || 'all'),
            snap.lastRequest
              ? '最近一轮 ' + snap.lastRequest.ms + ' ms · 上下文 ' + snap.lastRequest.contextUsed + '/' + snap.lastRequest.contextSize
              : '还没有请求记录',

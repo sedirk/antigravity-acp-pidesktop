@@ -254,7 +254,7 @@ async function main() {
     const saved = configLib.savePanel(ctx, { toolPolicy: 'none' }, null);
     assert.strictEqual(saved.ok, true);
     assert.strictEqual(configLib.loadConfig(ctx).toolPolicy, 'none');
-    assert.strictEqual(configLib.loadConfig({ packageRoot: root, dataPath: fs.mkdtempSync(path.join(os.tmpdir(), 'agy-policy2-')) }).toolPolicy, 'search');
+    assert.strictEqual(configLib.loadConfig({ packageRoot: root, dataPath: fs.mkdtempSync(path.join(os.tmpdir(), 'agy-policy2-')) }).toolPolicy, 'all', '默认不设防：本插件不再当第三道防火墙');
   });
 
   await suite('session: 单轮对话不能撞到同一个会话 key', async () => {
@@ -275,22 +275,57 @@ async function main() {
     assert.strictEqual(cfg.cancelOnDisconnect, true);
     const saved = configLib.savePanel(ctx, { idleSessionMinutes: 3, cancelOnDisconnect: 'false' }, null);
     assert.strictEqual(saved.ok, true);
-
-  await suite('tools: 请求级工具策略（tool_policy / web_search 声明）', async () => {
-    const { policyForRequest, hasWebSearchTool } = require(path.join(root, 'lib/server.js'));
-    assert.deepStrictEqual(policyForRequest('search', { tool_policy: 'none' }), { policy: 'none', reason: 'request.tool_policy' });
-    assert.deepStrictEqual(policyForRequest('none', {}), { policy: 'none', reason: 'config' });
-    assert.deepStrictEqual(policyForRequest('none', { tools: [{ type: 'web_search' }] }), { policy: 'search', reason: 'request.web_search' });
-    assert.deepStrictEqual(policyForRequest('agent', { tools: [{ type: 'web_search' }] }), { policy: 'agent', reason: 'config' });
-    assert.deepStrictEqual(policyForRequest('bogus', {}), { policy: 'search', reason: 'config' });
-    assert.strictEqual(hasWebSearchTool({ tools: [{ type: 'web_search_preview' }] }), true);
-    assert.strictEqual(hasWebSearchTool({ tools: [{ type: 'function' }] }), false);
-    assert.strictEqual(hasWebSearchTool({}), false);
-  });
     const reloaded = configLib.loadConfig(ctx);
     assert.strictEqual(reloaded.idleSessionMinutes, 3);
     assert.strictEqual(reloaded.cancelOnDisconnect, false);
     assert.ok(configLib.validatePatch({ idleSessionMinutes: 0 }, ctx).errors.some((e) => e.includes('会话空闲回收')));
+  });
+
+  await suite('config: 工作目录默认用户主目录、可改、非法值拒绝', async () => {
+    const ctx = { packageRoot: root, dataPath: fs.mkdtempSync(path.join(os.tmpdir(), 'agy-cwd-')) };
+    assert.strictEqual(configLib.loadConfig(ctx).cwd, os.homedir(), '未配置时工作目录 = 用户主目录');
+    const target = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-cwd-target-'));
+    assert.strictEqual(configLib.savePanel(ctx, { cwd: target }, null).ok, true);
+    assert.strictEqual(configLib.loadConfig(ctx).cwd, target);
+    assert.ok(configLib.validatePatch({ cwd: path.join(target, 'nope') }, ctx).errors.some((e) => e.includes('工作目录')));
+    assert.strictEqual(configLib.validatePatch({ cwd: '' }, ctx).patch.cwd, '');
+    assert.strictEqual(configLib.loadConfig(ctx).cwd, target, '清空只是待保存的补丁，不写盘就不生效');
+  });
+
+  await suite('tools: 请求级工具策略（tool_policy / web_search 声明）', async () => {
+    const { policyForRequest, hasWebSearchTool } = require(path.join(root, 'lib/server.js'));
+    assert.deepStrictEqual(policyForRequest('search', { tool_policy: 'none' }), { policy: 'none', reason: 'request.tool_policy' });
+    assert.deepStrictEqual(policyForRequest('search', { tool_policy: 'shell' }), { policy: 'shell', reason: 'request.tool_policy' });
+    assert.deepStrictEqual(policyForRequest('all', {}), { policy: 'all', reason: 'config' });
+    assert.deepStrictEqual(policyForRequest('none', {}), { policy: 'none', reason: 'config' });
+    assert.deepStrictEqual(policyForRequest('none', { tools: [{ type: 'web_search' }] }), { policy: 'search', reason: 'request.web_search' });
+    assert.deepStrictEqual(policyForRequest('agent', { tools: [{ type: 'web_search' }] }), { policy: 'agent', reason: 'config' });
+    assert.deepStrictEqual(policyForRequest('bogus', {}), { policy: 'all', reason: 'config' });
+    assert.strictEqual(hasWebSearchTool({ tools: [{ type: 'web_search_preview' }] }), true);
+    assert.strictEqual(hasWebSearchTool({ tools: [{ type: 'function' }] }), false);
+    assert.strictEqual(hasWebSearchTool({}), false);
+  });
+
+  await suite('tools: shell 档放行 execute、仍挡住 edit', async () => {
+    const base = {
+      options: [
+        { optionId: 'allow-once', kind: 'allow_once' },
+        { optionId: 'reject', kind: 'reject_once' },
+      ],
+    };
+    const exec = { ...base, toolCall: { kind: 'execute', title: 'Run echo ACP-OK' } };
+    const edit = { ...base, toolCall: { kind: 'edit', title: 'Run write_to_file?' } };
+    const search = { ...base, toolCall: { kind: 'search', title: 'Run search_web?' } };
+    const other = { ...base, toolCall: { kind: 'other', title: 'Run invoke_subagent?' } };
+    assert.strictEqual(permissionOutcome('shell', exec).decision, 'allow');
+    assert.strictEqual(permissionOutcome('shell', search).decision, 'allow');
+    assert.strictEqual(permissionOutcome('shell', other).decision, 'allow');
+    assert.strictEqual(permissionOutcome('shell', edit).decision, 'reject');
+    assert.strictEqual(permissionOutcome('agent', exec).decision, 'reject');
+    assert.strictEqual(permissionOutcome('all', edit).decision, 'allow', 'all 档连写文件也放行');
+    assert.strictEqual(permissionOutcome('none', search).decision, 'reject');
+    const ctx = { packageRoot: root, dataPath: fs.mkdtempSync(path.join(os.tmpdir(), 'agy-shell-')) };
+    assert.strictEqual(configLib.validatePatch({ toolPolicy: 'shell' }, ctx).patch.toolPolicy, 'shell');
   });
 
   await suite('usage: token 估算与「运行时不支持」参数识别', async () => {

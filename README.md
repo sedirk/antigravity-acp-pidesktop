@@ -11,11 +11,12 @@
 - 在本机 `127.0.0.1` 暴露 `POST /v1/chat/completions`、`POST /v1/responses`、`GET /v1/models`
 - **虚拟模型**：把 ACP 的 `xxx-low/-medium/-high` 自动合并成 `xxx`，思考档位由请求里的
   `reasoning_effort` 决定（新模型上线只要还带档位后缀就会自动出现，不用改代码）
-- **[图片输入](https://github.com/sedirk/antigravity-acp-pidesktop)**（0.4.0 起）：`image_url` / `input_image` 的 `data:` URL 与 `http(s)`
+- **图片输入**（0.4.0 起）：`image_url` / `input_image` 的 `data:` URL 与 `http(s)`
   链接都转成 ACP 的 `image` 内容块随同一条 prompt 发出
 - **PDF / 文档输入**（0.5.0 起）：`input_file`、`file`、`document` 三种写法都接；字节先落到会话工作区的
   `.attachments\`（按内容哈希去重、7 天后自动清理），再以 `resource_link`（`file://` URI）发给运行时
-- **联网搜索**（0.6.0 起）：agent 自带 `search_web` / `read_url_content`，由面板「工具权限」放行
+- **联网搜索与工具**（0.6.0 起）：agent 自带 `search_web` / `read_url_content` / `run_command` 等，
+  由面板「工具权限」按档放行；1.1.0 起新增 `shell` 档
 - 给运行时子进程按需注入 `HTTP(S)_PROXY`，不影响系统代理
 - **可选并发限制**（默认关闭）：设成 1 即串行，其余请求排队，带排队超时与队满拒绝
 - 面板一键下载官方运行时并做 SHA256 校验
@@ -64,7 +65,7 @@
 | `port` | 41910 | 本地网关端口 |
 | `proxyMode` | `auto` | `auto` 跟随系统代理 / `manual` 用下面填的地址 / `direct` 直连 |
 | `proxy` | 空 | 手动模式的代理地址，如 `http://127.0.0.1:10808` |
-| `toolPolicy` | `search` | 工具权限：`search` / `agent` / `all` / `none`，见「联网搜索」 |
+| `toolPolicy` | `all` | 工具权限：`all` / `shell` / `agent` / `search` / `none`；**默认不额外拦截**，见「三层权限」 |
 | `cancelOnDisconnect` | true | 客户端断开时发 `session/cancel` 通知；取消后 20 秒未结束才杀运行时 |
 | `idleSessionMinutes` | 10 | 空闲多久 `session/close` 回收 worker；下次优先 `session/resume` |
 | `concurrency` | 0 | 0 = 不限制；1 = 串行；2–8 = 并行上限 |
@@ -74,7 +75,7 @@
 | `exposeVariantModels` | false | 是否同时列出带档位后缀的显式模型 |
 | `promptTimeoutMs` | 600000 | 单轮回答超时 |
 | `bin` | 空 | `agy_acp_server.exe` 路径（面板下载后自动写入） |
-| `cwd` | 空 | 会话工作目录，留空 = 运行时所在目录 |
+| `cwd` | 用户主目录 | 会话工作目录 = 运行时允许读写的根（`view_file` / `run_command` 的边界）；留空即取用户主目录 |
 | `modelCacheMs` | 300000 | 模型列表缓存时长 |
 
 ## 参数透传：哪些生效、哪些被运行时忽略
@@ -103,27 +104,29 @@ ACP 的 `session/prompt` 只接受内容块，**没有任何采样参数位**；
 用户可在「设置 → AI 服务 → 该服务 → 模型」里用 `supportsImages` 覆盖。能不能发附件最终由宿主侧决定，
 插件这边只保证「宿主发来的附件不丢」。
 
-## 联网搜索（0.6.0 起）
+## 联网搜索与工具权限（0.6.0 起；1.1.0 加 `shell` 档并默认不设防）
 
 ACP 的 agent 自带一套工具：`search_web`、`read_url_content`、`view_file`、`run_command`、`write_to_file`、
 `invoke_subagent`、`generate_image`、`schedule` 等。联网能力一直都在，之前用不了是因为网关把 agent 发来的
 `session/request_permission` 一律回成 `null`，运行时判成非法响应，工具直接失败
 （报错原文：`RequestPermissionResponse · input_value=None`）。
 
-现在网关按面板里的「工具权限」回答权限请求：
+现在网关按面板里的「工具权限」回答权限请求。**默认 `all`：本插件不额外设防**——真正的边界是运行时的
+工作区白名单（`cwd`）与宿主自己的审批。想收紧才往下调：
 
 | 策略 | 行为 |
 | --- | --- |
-| `search`（默认） | 只放行只读工具：`search` / `fetch` / `read`（联网搜索、抓网页、读文件） |
-| `agent` | 在 `search` 基础上再放行 `kind=other`：子代理（并行调研）、后台任务、生图、定时；仍然挡住写文件与执行命令 |
-| `all` | 全部放行，包括 `run_command` 与写文件（风险自负） |
-| `none` | 全部拒绝，模型只能靠预训练知识回答 |
+| `all`（默认） | 全部放行：读文件、跑命令、写文件都交给运行时 |
+| `shell` | 放行只读 + `execute`（`run_command` 等）；仍挡住 `edit`（写文件） |
+| `agent` | 只读 + `kind=other`（子代理、后台任务、生图、定时）；挡执行与写文件 |
+| `search` | 只放行只读：`search` / `fetch` / `read`（联网搜索、抓网页、读文件） |
+| `none` | 全部拒绝，当纯聊天网关用 |
 
 ### 请求级调整（0.9.0 起）
 
 除了全局策略，单条请求也能改本轮权限：
 
-- 请求体带 `tool_policy`（自定义字段，`search` / `agent` / `all` / `none`）→ 本轮按它执行；
+- 请求体带 `tool_policy`（自定义字段，`search` / `agent` / `shell` / `all` / `none`）→ 本轮按它执行；
 - 宿主带了联网搜索工具声明（`tools` 里有 `web_search` / `web_search_preview`，PI-Desktop 勾「原生联网搜索」时会发）
   → 即使配置是 `none`，本轮也临时放宽到 `search`（只放行只读工具）。
 
@@ -140,7 +143,35 @@ ACP 的 agent 自带一套工具：`search_web`、`read_url_content`、`view_fil
 
 `/health` 与插件命令「显示网关状态」里的 `lastRequest` 就是最近这一行。
 
-实测（`gemini-4-carbon-high`，默认策略）：问「Antigravity 最新版本号」，agent 依次调用
+## 三层权限：为什么「我在 PI-Desktop 里给了全部权限」还是读不到文件
+
+这条线上有三套互不相干的权限，搞混就会以为「权限被吞了」：
+
+1. **PI-Desktop 的插件权限**（`background.service` / `ui.panel` 等）—— 决定宿主允不允许插件跑服务和开面板，
+   **与 agent 能不能读文件、跑命令无关**。
+2. **本插件的「工具权限」**（`toolPolicy`）—— 决定 agent 的 `session/request_permission` 怎么回答。
+   1.1.0 起默认 `all`，这一层不拦；只有你主动调成 `shell` / `agent` / `search` / `none` 才会拒。
+   被拒时运行时的报错是 `denied by pre-tool hook: Denied by user (*)`，很容易被误认为宿主拒绝。
+3. **运行时的会话工作区** —— 真正的硬边界：只有会话 `cwd` 与 `~/.gemini` 下的路径可访问，
+   越界时 `view_file` 直接报「不在允许访问的工作区目录列表内」。`cwd` 由面板「工作目录」决定，
+   **1.1.0 起默认是用户主目录**；1.0.x 及更早默认是运行时所在目录，所以旧版默认连 `~/.codex` 都读不到。
+
+实测对照（同一句 prompt：统计 `.codex\config.toml` 行数 + 执行 `echo ACP-OK`），模型 `gemini-4-carbon-high`：
+
+| 配置 | 结果 |
+| --- | --- |
+| 1.0.x 默认（`search`，工作目录 = 运行时目录） | 两次都被拒：`工具权限 拒绝：…（kind=execute，策略=search）`；读文件报工作区不允许 |
+| `toolPolicy=all` + 工作目录 = `C:\Users\sedirk` | 通过：`行数=158` + `ACP-OK` |
+
+**1.1.0 的两个默认值就等于第二行**，升级后不必改任何设置。要读别的盘（例如 `D:\tools`）就在面板把
+「工作目录」填成它的上级目录；回答权限请求的是本插件这个客户端，**不需要在 Antigravity 界面里改什么**。
+
+那为什么还是不能像 DeepSeek 原生 API 那样「随便读」？原生 API 的工具调用由 PI-Desktop 进程执行，
+走宿主的审批与沙箱；ACP 是 Google 的二进制在**自己进程里**跑 `view_file` / `run_command`，
+文件访问只能落在它自己认的工作区里。这是协议结构差异，不是插件 bug：把 `cwd` 放宽即可等效，
+代价是模型能动的东西也一起变多。
+
+实测（`gemini-4-carbon-high`，当时默认还是 `search`）：问「Antigravity 最新版本号」，agent 依次调用
 `search_web`（返回「Antigravity App v2.30.0 · 2026-11-09」等真实结果）→ `read_url_content`
 （读取 `antigravity.google/docs/changelog` 与 GitHub Releases）→ 再 `view_file` 读自己生成的步骤文件。
 
@@ -187,7 +218,8 @@ node test/run-tests.js
 ```
 
 覆盖配置单源与迁移、并发限制（不限/串行/超时/队满）、模型分组与 `reasoning_effort` 解析、
-两种请求体归一化、图片与文档块转换、工具权限策略、会话键、usage 估算。测试不联网、不启动运行时。
+两种请求体归一化、图片与文档块转换、工具权限策略（含 `shell` 档与 `all` 默认）、工作目录默认值、会话键、usage 估算。
+测试不联网、不启动运行时。
 
 ## 参考实现
 
