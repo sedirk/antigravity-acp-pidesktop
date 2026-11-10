@@ -1,32 +1,29 @@
 # Antigravity ACP · PI-Desktop 插件
 
-把 **Google 官方 Antigravity ACP 运行时**（`agy_acp_server.exe`）接成 PI-Desktop 里可用的
-OpenAI 兼容本地网关。
+把 Google 官方的 **Antigravity ACP 运行时**（`agy_acp_server.exe`）包装成 OpenAI 兼容的本地网关，
+供 PI-Desktop 作为「自定义端点」使用。
 
-> 它不是 sub2api：本插件**不抓 token、不逆向 Google 私有接口**。凭据由官方二进制自己登录、
-> 自己保管（`~/.gemini/antigravity-acp/`），插件只用 stdio 说 ACP 协议。
+**边界**：只与本机官方二进制用 stdio JSON-RPC 通信；不读取、不转发、不保存任何 Google 凭据
+（凭据由那个二进制自己保管在 `~/.gemini/antigravity-acp/`）；不逆向 Google 私有接口。
 
 ## 它做什么
 
 - 在本机 `127.0.0.1` 暴露 `POST /v1/chat/completions`、`POST /v1/responses`、`GET /v1/models`
 - **虚拟模型**：把 ACP 的 `xxx-low/-medium/-high` 自动合并成 `xxx`，思考档位由请求里的
   `reasoning_effort` 决定（新模型上线只要还带档位后缀就会自动出现，不用改代码）
+- **[图片输入](https://github.com/sedirk/antigravity-acp-pidesktop)**（0.4.0 起）：`image_url` / `input_image` 的 `data:` URL 与 `http(s)`
+  链接都转成 ACP 的 `image` 内容块随同一条 prompt 发出
+- **PDF / 文档输入**（0.5.0 起）：`input_file`、`file`、`document` 三种写法都接；字节先落到会话工作区的
+  `.attachments\`（按内容哈希去重、7 天后自动清理），再以 `resource_link`（`file://` URI）发给运行时
+- **联网搜索**（0.6.0 起）：agent 自带 `search_web` / `read_url_content`，由面板「工具权限」放行
 - 给运行时子进程按需注入 `HTTP(S)_PROXY`，不影响系统代理
 - **可选并发限制**（默认关闭）：设成 1 即串行，其余请求排队，带排队超时与队满拒绝
 - 面板一键下载官方运行时并做 SHA256 校验
-- **图片输入**（0.4.0 起）：`image_url` / `input_image` 的 `data:` URL 与 `http(s)` 链接都会转成 ACP 的
-  `image` 内容块随同一条 prompt 发出；模型没图时会直说收不到，所以「答非所问」不会再被误判为配额问题
-- 图片输入需要宿主端把该模型标成支持图片（vision）：PI-Desktop 只在模型带 vision 能力时才会把附件放进请求体
-- **PDF / 文档输入**（0.5.0 起）：`input_file`、`file`、`document` 三种写法都接。字节先落到会话工作区的
-  `.attachments\`（按内容哈希去重、7 天后自动清理），再以 `resource_link`（`file://` URI）发给运行时——
-  实测内联 blob 的 `resource` 块运行时不认，只有 `resource_link` 能读出来。宿主侧同理需要勾上「PDF」能力
 
 ## 安装与配置
 
 1. 插件页安装后打开命令「Antigravity: 打开配置面板」
 2. 点「下载官方运行时」（约 120 MB，走你填的代理；SHA256 会对官方清单校验）
-   - 首次加载若还没安装运行时，插件会主动弹提示，不需要先读 README
-   - 面板实时显示百分比、已下载/总量、速度；校验与解压各自有状态，完成后有提示
 3. 首次使用需登录：在终端跑一次运行时并完成 Google 登录，或先在本机 Antigravity 里登录
 
    ```powershell
@@ -37,6 +34,13 @@ OpenAI 兼容本地网关。
 4. 在 PI-Desktop「设置 → AI 服务 → 自定义端点」填 `http://127.0.0.1:41910/v1`，
    认证留空，接口格式选 Chat Completions 或 Responses，然后「获取模型列表」
 
+宿主侧还需要注意两点：
+
+- **能不能发图/发 PDF 由宿主决定**：PI-Desktop 只按模型能力决定是否把附件放进请求体，
+  图文能力取自它内置的 models.dev 目录，或用模型绑定里的 `supportsImages` / `supportsDocuments` 覆盖。
+- 想让它用 `reasoning_effort`，模型行的「思考协议」要选**标准**（自适应发的是 Anthropic 式
+  `thinking`/`output_config`，本网关不解析）。
+
 ## 配置只有一处
 
 面板写入插件数据目录的 `config.json`，**这是唯一配置来源**；不要手改文件。
@@ -46,12 +50,19 @@ OpenAI 兼容本地网关。
 | --- | --- | --- |
 | `port` | 41910 | 本地网关端口 |
 | `proxyMode` | `auto` | `auto` 跟随系统代理 / `manual` 用下面填的地址 / `direct` 直连 |
-| `defaultEffort` | 空 | 请求没带 `reasoning_effort` 时使用的档位（low/medium/high）；空 = 模型默认 medium |
 | `proxy` | 空 | 手动模式的代理地址，如 `http://127.0.0.1:10808` |
+| `toolPolicy` | `search` | 工具权限：`search` / `agent` / `all` / `none`，见「联网搜索」 |
+| `cancelOnDisconnect` | true | 客户端断开时发 `session/cancel` 通知；取消后 20 秒未结束才杀运行时 |
+| `idleSessionMinutes` | 10 | 空闲多久 `session/close` 回收 worker；下次优先 `session/resume` |
 | `concurrency` | 0 | 0 = 不限制；1 = 串行；2–8 = 并行上限 |
 | `queueTimeoutMs` | 300000 | 排队等待上限 |
+| `defaultEffort` | 空 | 请求没带 `reasoning_effort` 时使用的档位（low/medium/high）；空 = 模型默认 medium |
 | `virtualModels` | true | 按档位后缀合并模型 |
 | `exposeVariantModels` | false | 是否同时列出带档位后缀的显式模型 |
+| `promptTimeoutMs` | 600000 | 单轮回答超时 |
+| `bin` | 空 | `agy_acp_server.exe` 路径（面板下载后自动写入） |
+| `cwd` | 空 | 会话工作目录，留空 = 运行时所在目录 |
+| `modelCacheMs` | 300000 | 模型列表缓存时长 |
 
 ## 参数透传：哪些生效、哪些被运行时忽略
 
@@ -66,23 +77,23 @@ ACP 的 `session/prompt` 只接受内容块，**没有任何采样参数位**；
 | `image_url` / `input_image` | ✅ 生效 | `data:` URL 与 `http(s)` 链接都转成 ACP 的 `image` 块（0.4.0 起） |
 | `input_file` / `file` / `document`（PDF 等） | ✅ 生效（0.5.0 起） | 落盘到工作区 `.attachments\` 后以 `resource_link` 发出；`file_id` 形式取不到，会在 prompt 里留一句说明 |
 | `stream` | ✅ 生效 | SSE 流式 |
-| `temperature`、`top_p`、`top_k`、`max_tokens`、`max_completion_tokens`、`stop`、`seed`、`presence_penalty`、`frequency_penalty`、`logprobs`、`top_logprobs`、`logit_bias`、`response_format`、`text.format`、`verbosity` | ❌ 被忽略 | 实测 `max_tokens=8` 仍输出 229 字；发给运行时也不报错，属于静默丢弃，网关会在日志里打印一行「运行时忽略 …」 |
-| `tools`（**含 `web_search`**） | ⚠️ 部分生效 | 我们不映射函数调用，但 **agent 自带 `search_web` / `read_url_content`**，由面板「工具权限」放行即可联网；见下面「联网搜索」一节 |
-| `tool_choice`、`parallel_tool_calls` | ❌ 未映射 | 同上，工具由 agent 自己决定何时调用 |
+| `tools`（**含 `web_search`**） | ⚠️ 部分生效 | 不映射函数调用，但 agent 自带 `search_web` / `read_url_content`，由「工具权限」放行即可联网 |
+| `tool_choice`、`parallel_tool_calls` | ❌ 未映射 | 工具由 agent 自己决定何时调用 |
+| `temperature`、`top_p`、`top_k`、`max_tokens`、`max_completion_tokens`、`stop`、`seed`、`presence_penalty`、`frequency_penalty`、`logprobs`、`top_logprobs`、`logit_bias`、`response_format`、`text.format`、`verbosity` | ❌ 被忽略 | 实测 `max_tokens=8` 仍输出 229 字；运行时既不报错也不生效，属静默丢弃，网关会在日志里打印「运行时忽略 …」 |
 | 思考内容（`agent_thought_chunk`） | ⚠️ 通道已接好，但运行时不发 | 实测 carbon/argon/3.8-flash × low/high 四组，思考块都是 0 字：能改档位，读不到思维过程 |
-| `usage` | ⚠️ token 估算 + 上下文真实值 | ACP 不返回单次 token 数，按「CJK 每字 1 token、其余 4 字符 1 token」估算并标 `estimated: true`；同时透出运行时上报的真实 `context_used` / `context_size`（实测 `11643 / 1048576`） |
+| `usage` | ⚠️ token 估算 + 上下文真实值 | 单次 token 数按「CJK 每字 1 token、其余 4 字符 1 token」估算并标 `estimated: true`；同时透出运行时上报的真实 `context_used` / `context_size` |
 
 `GET /v1/models` 会顺带声明能力：`modalities.input = [text, image]`、`capabilities = [text, image, reasoning]`、
 `supports_reasoning_effort = true`、`reasoning_efforts = [low, medium, high]`、`context_length`。
-这些字段对标准 OpenAI 客户端无害，但**PI-Desktop 目前不读它们**：它的模型发现只从服务端的模型行里取
+这些字段对标准 OpenAI 客户端无害，但 **PI-Desktop 目前不读它们**：它的模型发现只从服务端的模型行里取
 `contextWindow` / `maxTokens`，图文能力一律取自它内置的 models.dev 目录（命中不到就按纯文本处理），
-用户可在「设置 → AI 服务 → 该服务 → 模型」里用 `supportsImages` 覆盖。所以能不能发图最终由宿主侧决定，
-插件这边只保证「宿主发来的图不丢」。
+用户可在「设置 → AI 服务 → 该服务 → 模型」里用 `supportsImages` 覆盖。能不能发附件最终由宿主侧决定，
+插件这边只保证「宿主发来的附件不丢」。
 
 ## 联网搜索（0.6.0 起）
 
 ACP 的 agent 自带一套工具：`search_web`、`read_url_content`、`view_file`、`run_command`、`write_to_file`、
-`invoke_subagent` 等。**联网能力一直都在**，之前用不了是因为网关把 agent 发来的
+`invoke_subagent`、`generate_image`、`schedule` 等。联网能力一直都在，之前用不了是因为网关把 agent 发来的
 `session/request_permission` 一律回成 `null`，运行时判成非法响应，工具直接失败
 （报错原文：`RequestPermissionResponse · input_value=None`）。
 
@@ -98,29 +109,28 @@ ACP 的 agent 自带一套工具：`search_web`、`read_url_content`、`view_fil
 实测（`gemini-4-carbon-high`，默认策略）：问「Antigravity 最新版本号」，agent 依次调用
 `search_web`（返回「Antigravity App v2.30.0 · 2026-11-09」等真实结果）→ `read_url_content`
 （读取 `antigravity.google/docs/changelog` 与 GitHub Releases）→ 再 `view_file` 读自己生成的步骤文件。
-搜索与抓取都成功，来源链接是真实的。
 
 代价要说清楚：这是**多步 agent 循环**，不是单次 API 调用。一次带联网的提问会跑十几个工具调用，
-几分钟很正常（实测单轮 4 分钟以上，主要耗在读自家步骤文件和反复核对来源）。想快就：
-
-- 不需要时效信息时别让它搜（提问里说清楚「不需要联网」）；
-- 或者把工具权限设成 `none`。
+几分钟很正常（实测单轮 4 分钟以上，主要耗在读自家步骤文件和反复核对来源）。不需要时效信息时
+在提问里说明「不需要联网」，或把工具权限设成 `none`。
 
 日志会记录每次放行/拒绝以及本次的工具使用统计，例如
 `工具权限 放行：Run search_web?（kind=search，策略=search）`、`本次工具使用：search×2，fetch×2，read×8`。
 
+## 取消、会话回收与 resume（0.8.0 起）
 
-## 取消与超时（0.7.0 起）
+**取消**：`session/cancel` 必须以**通知**（无 `id`、不等回复）发送——用请求形式会得到 `Method not found`，
+这是之前误判「运行时不支持取消」的原因。现在客户端断开时会发通知，实测本轮以 `stopReason: cancelled`
+结束，**运行时与会话都保留**（记忆不丢）。只有取消后 20 秒还没结束，才结束运行时兜底。
 
-ACP **没有 `session/cancel`**（实测返回 `Method not found`），所以请求发出去之后没法优雅中止
-agent 循环——它可能在后台继续跑几分钟。
+**会话回收**：运行时的 worker 只有 `session/close` 才会退出，光删本地映射会泄漏进程
+（每个都不小）。现在空闲 `idleSessionMinutes`（默认 10 分钟）或会话数超上限时发 `session/close`，
+但保留映射；同一对话再来时先 `session/resume`（不重放历史），失败才新建。
 
-网关的兜底：客户端一断开，如果此刻**没有别的请求在跑**，就直接结束运行时（下一个请求会自动重新拉起），
-日志会写「没有其它请求在跑：结束运行时以中止 agent 循环」。有并发请求时只能等它自己结束。
-这个行为由面板「客户端断开即停止」控制（默认开启）。副作用：运行时一换，会话缓存会清空，
-下一轮会重新 `session/new`。
+**会话键**：原先单轮对话的历史前缀为空，任意两个单轮对话会算成同一个 key、共用同一个会话
+（实测把 A 的上下文带给了 B）。现在空前缀会补上首条消息做判别位，并加了回归测试。
 
-另外运行时崩溃/被杀时会清空会话缓存（旧 `sessionId` 已失效，不清空会让后续请求报错）。
+运行时崩溃/被杀时会清空会话缓存（旧 `sessionId` 已失效，不清空会让后续请求报错）。
 
 ## 已知边界
 
@@ -129,11 +139,11 @@ agent 循环——它可能在后台继续跑几分钟。
   卸载前请先执行命令「Antigravity: 清理已下载的运行时」，或在面板点「清理运行时」释放空间
 - 退出时会用 `taskkill /T` 结束整棵进程树；插件启动时还会清掉「父进程已退出」的残留运行时，
   避免多个 ACP 实例共享同一账号额度导致偶发超时
-- 下载过程中面板会显示百分比、已下载/总量、速度；校验、解压各有独立状态，完成后有提示
-- 只做文本 + 图片输入，未映射工具调用（ACP 的 tool_call 事件目前忽略）
+- 输入只有文本 + 图片 + PDF 附件；工具调用由 agent 自己执行，网关只按「工具权限」放行或拒绝，
+  不把 `tool_call` 映射成 OpenAI function calling
 - 模型切换（`session/set_model`）失败时会重试一次，仍失败则直接报错，**不会用会话默认模型代替**回答
 - 思考内容（`agent_thought_chunk`）已接入 `reasoning_content` / `reasoning` item，
-  但实际是否出现取决于模型与档位
+  但实际是否出现取决于模型与档位（本运行时 1.3.0 实测不发）
 - 额度、限流与条款解释权在 Google 侧；请不要多账号轮换或当高并发后端使用
 
 ## 开发
@@ -143,7 +153,18 @@ node test/run-tests.js
 ```
 
 覆盖配置单源与迁移、并发限制（不限/串行/超时/队满）、模型分组与 `reasoning_effort` 解析、
-两种请求体归一化、图片块转换。测试不联网、不启动运行时。
+两种请求体归一化、图片与文档块转换、工具权限策略、会话键、usage 估算。测试不联网、不启动运行时。
+
+## 参考实现
+
+以下项目是 MIT 许可的同类实现，本版只借鉴协议用法（未复制代码）：
+
+- [angusggsimid/dsh-antigravity-acp](https://github.com/angusggsimid/dsh-antigravity-acp)（DeepSeek Harness 插件）：
+  `session/cancel` 用通知形式发送、`session/close` 回收 worker、`session/resume` 接回会话、
+  拒绝权限时优先用它自己的 `reject` 选项而不是裸 `cancelled`。
+  其中 `_meta.antigravity.systemPrompt.append` 在本地 server 版运行时（agy_acp_server 1.3.0）实测不生效，故未采用。
+- [xp26Ai/antigravity-openai-bridge](https://github.com/xp26Ai/antigravity-openai-bridge)、
+  [anglee0323/agy-bridge](https://github.com/anglee0323/agy-bridge)：同类 ACP→OpenAI 桥的会话与工具接入思路对照。
 
 ## 许可与来源
 

@@ -145,6 +145,11 @@
       <input id="promptTimeoutMinutes" type="number" min="1" max="60">
     </div>
     <div class="field">
+      <label for="idleSessionMinutes">会话空闲回收（分钟）</label>
+      <input id="idleSessionMinutes" type="number" min="1" max="240">
+      <span class="hint">到点用 session/close 放掉运行时的 worker；下次发言优先 session/resume（不重放历史）</span>
+    </div>
+    <div class="field">
       <label for="cwd">工作目录（留空=运行时所在目录）</label>
       <input id="cwd" type="text" placeholder="留空即可">
     </div>
@@ -167,9 +172,9 @@
 <script>
 (function () {
   const bridge = window.pluginBridge;
-  const ids = ['port', 'proxyMode', 'proxy', 'toolPolicy', 'bin', 'defaultModel', 'modelCacheMinutes', 'defaultEffort', 'virtualModels',
+  const ids = ['port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', 'idleSessionMinutes', 'bin', 'defaultModel', 'modelCacheMinutes', 'defaultEffort', 'virtualModels',
     'exposeVariantModels', 'concurrency', 'queueTimeoutMinutes', 'promptTimeoutMinutes', 'cwd'];
-  const ids = ['port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', 'bin', 'defaultModel', 'modelCacheMinutes', 'defaultEffort', 'virtualModels',
+  const $ = (id) => document.getElementById(id);
   const msg = $('msg');
 
   function show(text, kind) {

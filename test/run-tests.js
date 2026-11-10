@@ -257,6 +257,30 @@ async function main() {
     assert.strictEqual(configLib.loadConfig({ packageRoot: root, dataPath: fs.mkdtempSync(path.join(os.tmpdir(), 'agy-policy2-')) }).toolPolicy, 'search');
   });
 
+  await suite('session: 单轮对话不能撞到同一个会话 key', async () => {
+    const { keyFor } = require(path.join(root, 'lib/server.js'));
+    const a = [{ role: 'user', content: '甲' }];
+    const b = [{ role: 'user', content: '乙' }];
+    assert.notStrictEqual(keyFor('m', a), keyFor('m', b), '单轮不同内容必须不同 key');
+    assert.strictEqual(keyFor('m', a), keyFor('m', a));
+    const turn2 = [...a, { role: 'assistant', content: '好' }, { role: 'user', content: '继续' }];
+    assert.strictEqual(keyFor('m', turn2), keyFor('m', turn2));
+    assert.notStrictEqual(keyFor('m', turn2), keyFor('n', turn2), '换模型必须换 key');
+  });
+
+  await suite('config: 会话空闲回收与断开即停的默认值', async () => {
+    const ctx = { packageRoot: root, dataPath: fs.mkdtempSync(path.join(os.tmpdir(), 'agy-idle-')) };
+    const cfg = configLib.loadConfig(ctx);
+    assert.strictEqual(cfg.idleSessionMinutes, 10);
+    assert.strictEqual(cfg.cancelOnDisconnect, true);
+    const saved = configLib.savePanel(ctx, { idleSessionMinutes: 3, cancelOnDisconnect: 'false' }, null);
+    assert.strictEqual(saved.ok, true);
+    const reloaded = configLib.loadConfig(ctx);
+    assert.strictEqual(reloaded.idleSessionMinutes, 3);
+    assert.strictEqual(reloaded.cancelOnDisconnect, false);
+    assert.ok(configLib.validatePatch({ idleSessionMinutes: 0 }, ctx).errors.some((e) => e.includes('会话空闲回收')));
+  });
+
   await suite('usage: token 估算与「运行时不支持」参数识别', async () => {
     const { countTokens, usageFor, ignoredParams } = require(path.join(root, 'lib/server.js'));
     assert.strictEqual(countTokens('hello world'), 3);
@@ -270,7 +294,30 @@ async function main() {
     assert.deepStrictEqual(ignoredParams({ model: 'm', messages: [], temperature: 0.2, tools: [] }), ['temperature']);
     assert.deepStrictEqual(ignoredParams({ messages: [], max_tokens: 5, reasoning_effort: 'high' }), ['max_tokens']);
     assert.deepStrictEqual(ignoredParams({ messages: [], text: { format: { type: 'json_object' } } }), ['text.format']);
+    const withContext = usageFor('你好', '世界', '', { contextUsed: 11643, contextSize: 1048576 });
+    assert.strictEqual(withContext.context_used, 11643);
+    assert.strictEqual(withContext.context_size, 1048576);
   });
+
+  await suite('tools: agent 档放行 other、仍挡住写文件与执行命令', async () => {
+    const base = {
+      options: [
+        { optionId: 'allow-once', kind: 'allow_once' },
+        { optionId: 'reject', kind: 'reject_once' },
+      ],
+    };
+    const other = { ...base, toolCall: { kind: 'other', title: 'Run invoke_subagent?' } };
+    const edit = { ...base, toolCall: { kind: 'edit', title: 'Run write_to_file?' } };
+    const exec = { ...base, toolCall: { kind: 'execute', title: 'Run run_command?' } };
+    const search = { ...base, toolCall: { kind: 'search', title: 'Run search_web?' } };
+    assert.strictEqual(permissionOutcome('agent', other).decision, 'allow');
+    assert.strictEqual(permissionOutcome('agent', search).decision, 'allow');
+    assert.strictEqual(permissionOutcome('agent', edit).decision, 'reject');
+    assert.strictEqual(permissionOutcome('agent', exec).decision, 'reject');
+    assert.strictEqual(permissionOutcome('search', other).decision, 'reject');
+    assert.strictEqual(permissionOutcome('none', search).decision, 'reject');
+  });
+
 
   await suite('config: 只认数据目录一份配置，旧文件仅迁移一次', async () => {
     const base = tempDir('single-root');
