@@ -12,7 +12,7 @@ const path = require('node:path');
 
 const root = path.resolve(__dirname, '..');
 const configLib = require(path.join(root, 'lib/config.js'));
-const { createLimiter, levelOfEffort, AcpRuntime } = require(path.join(root, 'lib/core.js'));
+const { createLimiter, levelOfEffort, AcpRuntime, permissionOutcome } = require(path.join(root, 'lib/core.js'));
 const { normalizeMessages } = require(path.join(root, 'lib/server.js'));
 const manifest = require(path.join(root, 'manifest.json'));
 
@@ -223,6 +223,38 @@ async function main() {
     assert.strictEqual(blocks[1].type, 'resource_link');
     const textDoc = await buildPromptBlocks('看附件', [], [{ name: 'note.txt', inlineText: 'hello' }], dir);
     assert.ok(textDoc[1].text.includes('hello'), '纯文本文档应内联成文本');
+  });
+
+  await suite('tools: 权限策略决定 search_web 能不能跑', async () => {
+    const params = {
+      sessionId: 's1',
+      toolCall: { toolCallId: 't1', title: 'Run search_web?', kind: 'search', status: 'pending' },
+      options: [
+        { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+        { optionId: 'allow-always', name: 'Always allow', kind: 'allow_always' },
+        { optionId: 'reject', name: 'Reject', kind: 'reject_once' },
+      ],
+    };
+    const allowed = permissionOutcome('search', params);
+    assert.strictEqual(allowed.decision, 'allow');
+    assert.deepStrictEqual(allowed.outcome, { outcome: 'selected', optionId: 'allow-once' });
+    assert.strictEqual(permissionOutcome('none', params).outcome.optionId, 'reject');
+    assert.strictEqual(permissionOutcome('all', params).decision, 'allow');
+    const edit = { ...params, toolCall: { toolCallId: 't2', title: 'Run run_command?', kind: 'execute' } };
+    assert.strictEqual(permissionOutcome('search', edit).decision, 'reject');
+    assert.strictEqual(permissionOutcome('all', edit).decision, 'allow');
+    const bare = { toolCall: { kind: 'search' }, options: [] };
+    assert.deepStrictEqual(permissionOutcome('search', bare).outcome, { outcome: 'cancelled' });
+  });
+
+  await suite('config: toolPolicy 校验与默认值', async () => {
+    const ctx = { packageRoot: root, dataPath: fs.mkdtempSync(path.join(os.tmpdir(), 'agy-policy-')) };
+    assert.strictEqual(configLib.validatePatch({ toolPolicy: 'all' }, ctx).patch.toolPolicy, 'all');
+    assert.ok(configLib.validatePatch({ toolPolicy: 'yes' }, ctx).errors.some((e) => e.includes('工具权限')));
+    const saved = configLib.savePanel(ctx, { toolPolicy: 'none' }, null);
+    assert.strictEqual(saved.ok, true);
+    assert.strictEqual(configLib.loadConfig(ctx).toolPolicy, 'none');
+    assert.strictEqual(configLib.loadConfig({ packageRoot: root, dataPath: fs.mkdtempSync(path.join(os.tmpdir(), 'agy-policy2-')) }).toolPolicy, 'search');
   });
 
   await suite('usage: token 估算与「运行时不支持」参数识别', async () => {

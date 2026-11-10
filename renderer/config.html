@@ -68,6 +68,15 @@
       <label for="proxy">手动代理地址（仅手动模式生效）</label>
       <input id="proxy" type="text" placeholder="http://127.0.0.1:10808">
     </div>
+    <div class="field">
+      <label for="toolPolicy">工具权限（联网搜索）</label>
+      <select id="toolPolicy">
+        <option value="search">只放行只读工具（联网搜索 / 抓网页 / 读文件）</option>
+        <option value="all">放行全部工具（含执行命令、写文件）</option>
+        <option value="none">全部拒绝</option>
+      </select>
+      <span class="hint">ACP 的 agent 自带 search_web / read_url_content；设为「全部拒绝」后它只能靠预训练知识回答</span>
+    </div>
 
     <div class="field wide">
       <label for="bin">ACP 运行时（agy_acp_server.exe）</label>
@@ -149,7 +158,7 @@
 <script>
 (function () {
   const bridge = window.pluginBridge;
-  const ids = ['port', 'proxyMode', 'proxy', 'bin', 'defaultModel', 'modelCacheMinutes', 'defaultEffort', 'virtualModels',
+  const ids = ['port', 'proxyMode', 'proxy', 'toolPolicy', 'bin', 'defaultModel', 'modelCacheMinutes', 'defaultEffort', 'virtualModels',
     'exposeVariantModels', 'concurrency', 'queueTimeoutMinutes', 'promptTimeoutMinutes', 'cwd'];
   const $ = (id) => document.getElementById(id);
   const msg = $('msg');

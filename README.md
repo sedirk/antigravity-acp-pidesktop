@@ -67,7 +67,8 @@ ACP 的 `session/prompt` 只接受内容块，**没有任何采样参数位**；
 | `input_file` / `file` / `document`（PDF 等） | ✅ 生效（0.5.0 起） | 落盘到工作区 `.attachments\` 后以 `resource_link` 发出；`file_id` 形式取不到，会在 prompt 里留一句说明 |
 | `stream` | ✅ 生效 | SSE 流式 |
 | `temperature`、`top_p`、`top_k`、`max_tokens`、`max_completion_tokens`、`stop`、`seed`、`presence_penalty`、`frequency_penalty`、`logprobs`、`top_logprobs`、`logit_bias`、`response_format`、`text.format`、`verbosity` | ❌ 被忽略 | 实测 `max_tokens=8` 仍输出 229 字；发给运行时也不报错，属于静默丢弃，网关会在日志里打印一行「运行时忽略 …」 |
-| `tools`、`tool_choice`、`parallel_tool_calls` | ❌ 未映射 | ACP 的 `tool_call` 事件目前不处理；`session/set_mode`（default/auto_edit/yolo）存在但网关未暴露 |
+| `tools`（**含 `web_search`**） | ⚠️ 部分生效 | 我们不映射函数调用，但 **agent 自带 `search_web` / `read_url_content`**，由面板「工具权限」放行即可联网；见下面「联网搜索」一节 |
+| `tool_choice`、`parallel_tool_calls` | ❌ 未映射 | 同上，工具由 agent 自己决定何时调用 |
 | 思考内容（`agent_thought_chunk`） | ⚠️ 通道已接好，但运行时不发 | 实测 carbon/argon/3.8-flash × low/high 四组，思考块都是 0 字：能改档位，读不到思维过程 |
 | `usage` | ✅ 估算值 | ACP 不返回 token 数，按「CJK 每字 1 token、其余 4 字符 1 token」估算，并带 `estimated: true` |
 
@@ -77,6 +78,35 @@ ACP 的 `session/prompt` 只接受内容块，**没有任何采样参数位**；
 `contextWindow` / `maxTokens`，图文能力一律取自它内置的 models.dev 目录（命中不到就按纯文本处理），
 用户可在「设置 → AI 服务 → 该服务 → 模型」里用 `supportsImages` 覆盖。所以能不能发图最终由宿主侧决定，
 插件这边只保证「宿主发来的图不丢」。
+
+## 联网搜索（0.6.0 起）
+
+ACP 的 agent 自带一套工具：`search_web`、`read_url_content`、`view_file`、`run_command`、`write_to_file`、
+`invoke_subagent` 等。**联网能力一直都在**，之前用不了是因为网关把 agent 发来的
+`session/request_permission` 一律回成 `null`，运行时判成非法响应，工具直接失败
+（报错原文：`RequestPermissionResponse · input_value=None`）。
+
+现在网关按面板里的「工具权限」回答权限请求：
+
+| 策略 | 行为 |
+| --- | --- |
+| `search`（默认） | 只放行只读工具：`search` / `fetch` / `read`（联网搜索、抓网页、读文件） |
+| `all` | 全部放行，包括 `run_command` 与写文件（风险自负） |
+| `none` | 全部拒绝，模型只能靠预训练知识回答 |
+
+实测（`gemini-4-carbon-high`，默认策略）：问「Antigravity 最新版本号」，agent 依次调用
+`search_web`（返回「Antigravity App v2.30.0 · 2026-11-09」等真实结果）→ `read_url_content`
+（读取 `antigravity.google/docs/changelog` 与 GitHub Releases）→ 再 `view_file` 读自己生成的步骤文件。
+搜索与抓取都成功，来源链接是真实的。
+
+代价要说清楚：这是**多步 agent 循环**，不是单次 API 调用。一次带联网的提问会跑十几个工具调用，
+几分钟很正常（实测单轮 4 分钟以上，主要耗在读自家步骤文件和反复核对来源）。想快就：
+
+- 不需要时效信息时别让它搜（提问里说清楚「不需要联网」）；
+- 或者把工具权限设成 `none`。
+
+日志会记录每次放行/拒绝以及本次的工具使用统计，例如
+`工具权限 放行：Run search_web?（kind=search，策略=search）`、`本次工具使用：search×2，fetch×2，read×8`。
 
 ## 已知边界
 
