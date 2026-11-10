@@ -40,6 +40,7 @@ OpenAI 兼容本地网关。
 | --- | --- | --- |
 | `port` | 41910 | 本地网关端口 |
 | `proxyMode` | `auto` | `auto` 跟随系统代理 / `manual` 用下面填的地址 / `direct` 直连 |
+| `defaultEffort` | 空 | 请求没带 `reasoning_effort` 时使用的档位（low/medium/high）；空 = 模型默认 medium |
 | `proxy` | 空 | 手动模式的代理地址，如 `http://127.0.0.1:10808` |
 | `concurrency` | 0 | 0 = 不限制；1 = 串行；2–8 = 并行上限 |
 | `queueTimeoutMs` | 300000 | 排队等待上限 |

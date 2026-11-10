@@ -88,6 +88,16 @@
     </div>
 
     <div class="field">
+      <label for="defaultEffort">默认思考档位（请求未指定时）</label>
+      <select id="defaultEffort">
+        <option value="">跟随模型默认（medium）</option>
+        <option value="low">low</option>
+        <option value="medium">medium</option>
+        <option value="high">high</option>
+      </select>
+      <span class="hint">客户端没发 reasoning_effort 时用这个</span>
+    </div>
+    <div class="field">
       <label for="virtualModels">虚拟模型（按档位后缀自动合并）</label>
       <select id="virtualModels">
         <option value="true">开启（推荐）</option>
@@ -139,7 +149,7 @@
 <script>
 (function () {
   const bridge = window.pluginBridge;
-  const ids = ['port', 'proxyMode', 'proxy', 'bin', 'defaultModel', 'modelCacheMinutes', 'virtualModels',
+  const ids = ['port', 'proxyMode', 'proxy', 'bin', 'defaultModel', 'modelCacheMinutes', 'defaultEffort', 'virtualModels',
     'exposeVariantModels', 'concurrency', 'queueTimeoutMinutes', 'promptTimeoutMinutes', 'cwd'];
   const $ = (id) => document.getElementById(id);
   const msg = $('msg');
@@ -179,6 +189,7 @@
       if (el.value === '') continue;
       payload[id] = el.value;
     }
+    payload.defaultEffort = $('defaultEffort').value;
     return payload;
   }
 

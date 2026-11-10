@@ -53,6 +53,9 @@ async function main() {
     const cfg = configLib.loadConfig({ packageRoot: dir, dataPath: dir });
     assert.strictEqual(cfg.port, 41910);
     assert.strictEqual(cfg.concurrency, 0, '并发默认必须关闭');
+    assert.strictEqual(cfg.defaultEffort, '', '默认不干预思考档位');
+    assert.deepStrictEqual(configLib.validatePatch({ defaultEffort: 'HIGH' }, { packageRoot: dir, dataPath: dir }).patch, { defaultEffort: 'high' });
+    assert.strictEqual(configLib.validatePatch({ defaultEffort: 'max' }, { packageRoot: dir, dataPath: dir }).errors.length, 1);
     assert.ok(cfg.warnings.length > 0);
 
     const bad = configLib.validatePatch({ port: 'abc', proxy: 'ftp://x' }, { packageRoot: dir, dataPath: dir });
