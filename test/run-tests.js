@@ -281,15 +281,22 @@ async function main() {
     assert.ok(configLib.validatePatch({ idleSessionMinutes: 0 }, ctx).errors.some((e) => e.includes('会话空闲回收')));
   });
 
-  await suite('config: 工作目录默认用户主目录、可改、非法值拒绝', async () => {
+  await suite('config: 工作目录留空=跟随项目目录、显式值优先、非法值拒绝', async () => {
     const ctx = { packageRoot: root, dataPath: fs.mkdtempSync(path.join(os.tmpdir(), 'agy-cwd-')) };
-    assert.strictEqual(configLib.loadConfig(ctx).cwd, os.homedir(), '未配置时工作目录 = 用户主目录');
+    assert.strictEqual(configLib.loadConfig(ctx).cwd, '', '留空 = 跟随 PI-Desktop 当前项目目录');
     const target = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-cwd-target-'));
     assert.strictEqual(configLib.savePanel(ctx, { cwd: target }, null).ok, true);
     assert.strictEqual(configLib.loadConfig(ctx).cwd, target);
     assert.ok(configLib.validatePatch({ cwd: path.join(target, 'nope') }, ctx).errors.some((e) => e.includes('工作目录')));
     assert.strictEqual(configLib.validatePatch({ cwd: '' }, ctx).patch.cwd, '');
     assert.strictEqual(configLib.loadConfig(ctx).cwd, target, '清空只是待保存的补丁，不写盘就不生效');
+
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-cwd-project-'));
+    const makeAcp = (cfg, host) => new AcpRuntime({ getConfig: () => cfg, getCwd: host, log: () => {} });
+    assert.strictEqual(await makeAcp({ cwd: target }, async () => project).cwdFor(), target, '面板填了就用面板的');
+    assert.strictEqual(await makeAcp({ cwd: '' }, async () => project).cwdFor(), project, '留空跟随项目目录');
+    assert.strictEqual(await makeAcp({ cwd: '' }, async () => '').cwdFor(), os.homedir(), '宿主没项目 → 用户主目录');
+    assert.strictEqual(await makeAcp({ cwd: '' }, async () => path.join(project, 'nope')).cwdFor(), os.homedir(), '项目目录已消失 → 用户主目录');
   });
 
   await suite('tools: 请求级工具策略（tool_policy / web_search 声明）', async () => {

@@ -76,6 +76,22 @@ function ctx() {
   return { packageRoot, dataPath };
 }
 
+/**
+ * 当前 PI-Desktop 项目目录：面板「工作目录」留空时用它当运行时的会话工作区。
+ * 宿主没打开项目、或 API 不可用时返回空串，由 AcpRuntime.cwdFor 兜底用户主目录。
+ */
+async function workspaceCwd() {
+  try {
+    if (!pi || !pi.workspace || typeof pi.workspace.get !== 'function') return '';
+    const info = await pi.workspace.get();
+    const value = (info && info.workspace && info.workspace.path)
+      || (info && typeof info.path === 'string' ? info.path : '');
+    return typeof value === 'string' ? value : '';
+  } catch (error) {
+    writeLogLine(`读取 PI-Desktop 项目目录失败：${String(error && error.message).slice(0, 160)}`);
+    return '';
+  }
+}
 function reloadConfig() {
   config = configLib.loadConfig(ctx());
   for (const warning of config.warnings) log(`config: ${warning}`);
@@ -147,7 +163,7 @@ async function startService({ log: providedLog } = {}) {
   refreshProxy();
   reapOrphans();
   limiter = buildLimiter();
-  acp = new AcpRuntime({ getConfig: () => config, getProxy: () => resolvedProxy.url, log });
+  acp = new AcpRuntime({ getConfig: () => config, getProxy: () => resolvedProxy.url, getCwd: workspaceCwd, log });
   gateway = createGateway({ acp, limiter, getConfig: () => config, log });
   const base = config.port;
   const port = await gateway.listen([base, base + 1, base + 2, base + 3]);
@@ -493,6 +509,7 @@ module.exports = {
     get limiter() { return limiter; },
     get installState() { return installState; },
     setDataPath: (value) => { dataPath = value; },
+    get workspaceCwd() { return workspaceCwd; },
     setConfig: (value) => { config = value; },
     reloadConfig,
     startService,

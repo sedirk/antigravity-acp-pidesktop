@@ -75,7 +75,7 @@
 | `exposeVariantModels` | false | 是否同时列出带档位后缀的显式模型 |
 | `promptTimeoutMs` | 600000 | 单轮回答超时 |
 | `bin` | 空 | `agy_acp_server.exe` 路径（面板下载后自动写入） |
-| `cwd` | 用户主目录 | 会话工作目录 = 运行时允许读写的根（`view_file` / `run_command` 的边界）；留空即取用户主目录 |
+| `cwd` | 空 | 留空 = 跟随 PI-Desktop 当前项目目录（建会话时现问，取不到回退用户主目录）；填了就固定用它 |
 | `modelCacheMs` | 300000 | 模型列表缓存时长 |
 
 ## 参数透传：哪些生效、哪些被运行时忽略
@@ -153,8 +153,9 @@ ACP 的 agent 自带一套工具：`search_web`、`read_url_content`、`view_fil
    1.1.0 起默认 `all`，这一层不拦；只有你主动调成 `shell` / `agent` / `search` / `none` 才会拒。
    被拒时运行时的报错是 `denied by pre-tool hook: Denied by user (*)`，很容易被误认为宿主拒绝。
 3. **运行时的会话工作区** —— 真正的硬边界：只有会话 `cwd` 与 `~/.gemini` 下的路径可访问，
-   越界时 `view_file` 直接报「不在允许访问的工作区目录列表内」。`cwd` 由面板「工作目录」决定，
-   **1.1.0 起默认是用户主目录**；1.0.x 及更早默认是运行时所在目录，所以旧版默认连 `~/.codex` 都读不到。
+   越界时 `view_file` 直接报「不在允许访问的工作区目录列表内」。`cwd` 由面板「工作目录」决定：
+   **1.2.0 起留空 = 跟随 PI-Desktop 当前项目目录**（每次建会话现问宿主，取不到回退用户主目录）；
+   1.1.0 留空是用户主目录；1.0.x 及更早是运行时所在目录——那才是「连 `~/.codex` 都读不到」的原因。
 
 实测对照（同一句 prompt：统计 `.codex\config.toml` 行数 + 执行 `echo ACP-OK`），模型 `gemini-4-carbon-high`：
 
@@ -163,8 +164,9 @@ ACP 的 agent 自带一套工具：`search_web`、`read_url_content`、`view_fil
 | 1.0.x 默认（`search`，工作目录 = 运行时目录） | 两次都被拒：`工具权限 拒绝：…（kind=execute，策略=search）`；读文件报工作区不允许 |
 | `toolPolicy=all` + 工作目录 = `C:\Users\sedirk` | 通过：`行数=158` + `ACP-OK` |
 
-**1.1.0 的两个默认值就等于第二行**，升级后不必改任何设置。要读别的盘（例如 `D:\tools`）就在面板把
-「工作目录」填成它的上级目录；回答权限请求的是本插件这个客户端，**不需要在 Antigravity 界面里改什么**。
+**1.1.0 起 `toolPolicy` 默认 `all`；1.2.0 起工作目录留空就跟随当前项目**，所以「读本项目 / 跑命令」开箱即用。
+要读项目以外的盘（例如 `D:\tools`）才需要在面板把「工作目录」填成它的上级目录；填了就固定用它。
+回答权限请求的是本插件这个客户端，**不需要在 Antigravity 界面里改什么**。
 
 那为什么还是不能像 DeepSeek 原生 API 那样「随便读」？原生 API 的工具调用由 PI-Desktop 进程执行，
 走宿主的审批与沙箱；ACP 是 Google 的二进制在**自己进程里**跑 `view_file` / `run_command`，

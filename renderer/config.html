@@ -150,11 +150,11 @@
       <span class="hint">到点用 session/close 放掉运行时的 worker；下次发言优先 session/resume（不重放历史）</span>
     </div>
     <div class="field wide">
-      <label for="cwd">工作目录（运行时允许读写的根，留空 = 用户主目录）</label>
+      <label for="cwd">工作目录（留空 = 跟随 PI-Desktop 当前项目目录）</label>
       <div class="row">
-        <input id="cwd" type="text" placeholder="默认 C:\\Users\\你的用户名">
+        <input id="cwd" type="text" placeholder="留空即用当前项目目录（没有项目时用用户主目录）">
       </div>
-      <span class="hint">view_file / write_to_file / run_command 都以它为工作区：只有这个目录和 ~/.gemini 能访问。要读别的盘或项目就填它们的上级目录（例如 D:\\tools）——填得越宽，模型能动的东西越多。</span>
+      <span class="hint">运行时的 view_file / run_command / write_to_file 都以此为工作区，只有它和 ~/.gemini 能访问。留空后每次建会话都会现问一次宿主，切换项目不用重启网关；要额外覆盖（例如读 D 盘）就在这填上级目录。</span>
     </div>
   </form>
 
