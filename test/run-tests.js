@@ -275,6 +275,18 @@ async function main() {
     assert.strictEqual(cfg.cancelOnDisconnect, true);
     const saved = configLib.savePanel(ctx, { idleSessionMinutes: 3, cancelOnDisconnect: 'false' }, null);
     assert.strictEqual(saved.ok, true);
+
+  await suite('tools: 请求级工具策略（tool_policy / web_search 声明）', async () => {
+    const { policyForRequest, hasWebSearchTool } = require(path.join(root, 'lib/server.js'));
+    assert.deepStrictEqual(policyForRequest('search', { tool_policy: 'none' }), { policy: 'none', reason: 'request.tool_policy' });
+    assert.deepStrictEqual(policyForRequest('none', {}), { policy: 'none', reason: 'config' });
+    assert.deepStrictEqual(policyForRequest('none', { tools: [{ type: 'web_search' }] }), { policy: 'search', reason: 'request.web_search' });
+    assert.deepStrictEqual(policyForRequest('agent', { tools: [{ type: 'web_search' }] }), { policy: 'agent', reason: 'config' });
+    assert.deepStrictEqual(policyForRequest('bogus', {}), { policy: 'search', reason: 'config' });
+    assert.strictEqual(hasWebSearchTool({ tools: [{ type: 'web_search_preview' }] }), true);
+    assert.strictEqual(hasWebSearchTool({ tools: [{ type: 'function' }] }), false);
+    assert.strictEqual(hasWebSearchTool({}), false);
+  });
     const reloaded = configLib.loadConfig(ctx);
     assert.strictEqual(reloaded.idleSessionMinutes, 3);
     assert.strictEqual(reloaded.cancelOnDisconnect, false);

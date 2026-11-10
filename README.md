@@ -106,6 +106,27 @@ ACP 的 agent 自带一套工具：`search_web`、`read_url_content`、`view_fil
 | `all` | 全部放行，包括 `run_command` 与写文件（风险自负） |
 | `none` | 全部拒绝，模型只能靠预训练知识回答 |
 
+### 请求级调整（0.9.0 起）
+
+除了全局策略，单条请求也能改本轮权限：
+
+- 请求体带 `tool_policy`（自定义字段，`search` / `agent` / `all` / `none`）→ 本轮按它执行；
+- 宿主带了联网搜索工具声明（`tools` 里有 `web_search` / `web_search_preview`，PI-Desktop 勾「原生联网搜索」时会发）
+  → 即使配置是 `none`，本轮也临时放宽到 `search`（只放行只读工具）。
+
+生效时日志会写 `工具权限按请求调整：none（request.tool_policy）` 这类记录。
+
+### 用量记录（0.9.0 起）
+
+每次回答结束会往插件数据目录的 `usage.jsonl` 追加一行（超过 5MB 自动轮转成 `.1`）：
+
+```json
+{"at":"2026-11-10T18:49:00.963Z","session":"34d625c2","policy":"search","ms":15034,
+ "contextUsed":11247,"contextSize":1048576,"tools":{}}
+```
+
+`/health` 与插件命令「显示网关状态」里的 `lastRequest` 就是最近这一行。
+
 实测（`gemini-4-carbon-high`，默认策略）：问「Antigravity 最新版本号」，agent 依次调用
 `search_web`（返回「Antigravity App v2.30.0 · 2026-11-09」等真实结果）→ `read_url_content`
 （读取 `antigravity.google/docs/changelog` 与 GitHub Releases）→ 再 `view_file` 读自己生成的步骤文件。
@@ -165,6 +186,13 @@ node test/run-tests.js
   其中 `_meta.antigravity.systemPrompt.append` 在本地 server 版运行时（agy_acp_server 1.3.0）实测不生效，故未采用。
 - [xp26Ai/antigravity-openai-bridge](https://github.com/xp26Ai/antigravity-openai-bridge)、
   [anglee0323/agy-bridge](https://github.com/anglee0323/agy-bridge)：同类 ACP→OpenAI 桥的会话与工具接入思路对照。
+
+两条也验证过**做不到**，写在这里免得重复踩：
+
+- **额度（5 小时/每周窗口）**：DSH 那条路要走 `agy -p /usage`（Antigravity CLI）。本机只装了 server 版
+  `agy_acp_server.exe` + `localharness_external.exe`，没有 `agy` CLI，ACP 协议里也没有额度窗口，故无法提供。
+- **思考摘要**：试过 `_meta` 的 `thinking.summaries`、`thinkingSummaries`、`includeThoughts` 三种形状，
+  思考块都是 0 字——运行时 1.3.0 不下发 `agent_thought_chunk`。
 
 ## 许可与来源
 

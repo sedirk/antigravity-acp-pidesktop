@@ -320,6 +320,10 @@ function registerCommands() {
         `虚拟模型 ${status.models} 个`,
         `并发 ${info.limit > 0 ? `${info.limit}（进行 ${info.active}，排队 ${info.queued}）` : '不限'}`,
         config.proxy ? `代理 ${config.proxy}` : '代理 直连',
+        status.lastRequest
+          ? `最近一轮 ${status.lastRequest.ms} ms · 工具权限 ${status.lastRequest.policy} · 上下文 ${status.lastRequest.contextUsed}/${status.lastRequest.contextSize}`
+          : '还没有请求记录',
+        config.proxy ? `代理 ${config.proxy}` : '代理 直连',
       ].join('\n'), status.running ? 'info' : 'warning');
     },
   });
