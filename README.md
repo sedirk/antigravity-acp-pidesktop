@@ -70,7 +70,7 @@ ACP 的 `session/prompt` 只接受内容块，**没有任何采样参数位**；
 | `tools`（**含 `web_search`**） | ⚠️ 部分生效 | 我们不映射函数调用，但 **agent 自带 `search_web` / `read_url_content`**，由面板「工具权限」放行即可联网；见下面「联网搜索」一节 |
 | `tool_choice`、`parallel_tool_calls` | ❌ 未映射 | 同上，工具由 agent 自己决定何时调用 |
 | 思考内容（`agent_thought_chunk`） | ⚠️ 通道已接好，但运行时不发 | 实测 carbon/argon/3.8-flash × low/high 四组，思考块都是 0 字：能改档位，读不到思维过程 |
-| `usage` | ✅ 估算值 | ACP 不返回 token 数，按「CJK 每字 1 token、其余 4 字符 1 token」估算，并带 `estimated: true` |
+| `usage` | ⚠️ token 估算 + 上下文真实值 | ACP 不返回单次 token 数，按「CJK 每字 1 token、其余 4 字符 1 token」估算并标 `estimated: true`；同时透出运行时上报的真实 `context_used` / `context_size`（实测 `11643 / 1048576`） |
 
 `GET /v1/models` 会顺带声明能力：`modalities.input = [text, image]`、`capabilities = [text, image, reasoning]`、
 `supports_reasoning_effort = true`、`reasoning_efforts = [low, medium, high]`、`context_length`。
@@ -91,6 +91,7 @@ ACP 的 agent 自带一套工具：`search_web`、`read_url_content`、`view_fil
 | 策略 | 行为 |
 | --- | --- |
 | `search`（默认） | 只放行只读工具：`search` / `fetch` / `read`（联网搜索、抓网页、读文件） |
+| `agent` | 在 `search` 基础上再放行 `kind=other`：子代理（并行调研）、后台任务、生图、定时；仍然挡住写文件与执行命令 |
 | `all` | 全部放行，包括 `run_command` 与写文件（风险自负） |
 | `none` | 全部拒绝，模型只能靠预训练知识回答 |
 
@@ -107,6 +108,19 @@ ACP 的 agent 自带一套工具：`search_web`、`read_url_content`、`view_fil
 
 日志会记录每次放行/拒绝以及本次的工具使用统计，例如
 `工具权限 放行：Run search_web?（kind=search，策略=search）`、`本次工具使用：search×2，fetch×2，read×8`。
+
+
+## 取消与超时（0.7.0 起）
+
+ACP **没有 `session/cancel`**（实测返回 `Method not found`），所以请求发出去之后没法优雅中止
+agent 循环——它可能在后台继续跑几分钟。
+
+网关的兜底：客户端一断开，如果此刻**没有别的请求在跑**，就直接结束运行时（下一个请求会自动重新拉起），
+日志会写「没有其它请求在跑：结束运行时以中止 agent 循环」。有并发请求时只能等它自己结束。
+这个行为由面板「客户端断开即停止」控制（默认开启）。副作用：运行时一换，会话缓存会清空，
+下一轮会重新 `session/new`。
+
+另外运行时崩溃/被杀时会清空会话缓存（旧 `sessionId` 已失效，不清空会让后续请求报错）。
 
 ## 已知边界
 

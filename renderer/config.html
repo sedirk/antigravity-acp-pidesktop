@@ -71,6 +71,7 @@
     <div class="field">
       <label for="toolPolicy">工具权限（联网搜索）</label>
       <select id="toolPolicy">
+        <option value="agent">放行只读工具 + 子代理 / 后台任务 / 生图</option>
         <option value="search">只放行只读工具（联网搜索 / 抓网页 / 读文件）</option>
         <option value="all">放行全部工具（含执行命令、写文件）</option>
         <option value="none">全部拒绝</option>
@@ -112,6 +113,14 @@
         <option value="true">开启（推荐）</option>
         <option value="false">关闭（每个档位单独列出）</option>
       </select>
+    </div>
+    <div class="field">
+      <label for="cancelOnDisconnect">客户端断开即停止</label>
+      <select id="cancelOnDisconnect">
+        <option value="true">开启（没有别的请求时结束运行时，立刻中止 agent 循环）</option>
+        <option value="false">关闭（让它自己跑完）</option>
+      </select>
+      <span class="hint">ACP 没有 session/cancel，这是唯一能立刻停下来的办法；代价是该运行时里的会话缓存会被清空</span>
     </div>
     <div class="field">
       <label for="exposeVariantModels">同时列出显式档位模型</label>
@@ -160,7 +169,7 @@
   const bridge = window.pluginBridge;
   const ids = ['port', 'proxyMode', 'proxy', 'toolPolicy', 'bin', 'defaultModel', 'modelCacheMinutes', 'defaultEffort', 'virtualModels',
     'exposeVariantModels', 'concurrency', 'queueTimeoutMinutes', 'promptTimeoutMinutes', 'cwd'];
-  const $ = (id) => document.getElementById(id);
+  const ids = ['port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', 'bin', 'defaultModel', 'modelCacheMinutes', 'defaultEffort', 'virtualModels',
   const msg = $('msg');
 
   function show(text, kind) {
@@ -177,7 +186,7 @@
     try {
       const view = await call('config:read');
       for (const id of ids) {
-        if (id === 'virtualModels' || id === 'exposeVariantModels') { $(id).value = view[id] ? 'true' : 'false'; continue; }
+        if (id === 'virtualModels' || id === 'exposeVariantModels' || id === 'cancelOnDisconnect') { $(id).value = view[id] === false ? 'false' : 'true'; continue; }
         $(id).value = view[id] === undefined || view[id] === null ? '' : view[id];
       }
       $('file').textContent = view.file + (view.exists ? '' : '（尚未创建）');
@@ -194,7 +203,7 @@
     const payload = {};
     for (const id of ids) {
       const el = $(id);
-      if (id === 'virtualModels' || id === 'exposeVariantModels') { payload[id] = el.value === 'true'; continue; }
+      if (id === 'virtualModels' || id === 'exposeVariantModels' || id === 'cancelOnDisconnect') { payload[id] = el.value === 'true'; continue; }
       if (el.value === '') continue;
       payload[id] = el.value;
     }

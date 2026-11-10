@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "local.antigravity-acp",
   "name": "Antigravity ACP 网关",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "把 Google 官方 Antigravity ACP 运行时（agy_acp_server.exe）包装成 OpenAI 兼容的本地网关：不抓取 token、不逆向私有接口，凭据由官方二进制自己保管；同时提供 /v1/chat/completions 与 /v1/responses（含流式），支持文本 + 图片 + PDF 附件、虚拟模型 + reasoning_effort、可按需给子进程注入 HTTP 代理、可选的串行并发限制。",
   "main": "main.js",
   "permissions": [
