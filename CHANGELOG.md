@@ -1,5 +1,13 @@
 # 变更记录
 
+## 2.0.1
+
+- 修复 Responses 桥接**完全没有 usage**：`envelope()` 现在带上 `input/output/total_tokens`
+  与 `context_used/context_size`，宿主才能算上下文占比；此前该通道的计量是空的。
+- 首个工具轮（挂起那一轮）也会带计量，并在日志打印「本轮计量 输入/输出」。
+- 说明：宿主对 Responses 只在终止事件读取 usage，所以该通道**没有逐字速度**；
+  需要实时 tokens/s 时请把端点协议设为 chat completions（该通道每个 chunk 都带 usage）。
+
 ## 2.0.0
 
 - **两个通道都接桥接**：新增 Responses 通道的 `responsesBridged`，运行时工具调用发成
