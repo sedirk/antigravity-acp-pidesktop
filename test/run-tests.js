@@ -14,6 +14,8 @@ const root = path.resolve(__dirname, '..');
 const configLib = require(path.join(root, 'lib/config.js'));
 const { createLimiter, levelOfEffort, AcpRuntime, permissionOutcome } = require(path.join(root, 'lib/core.js'));
 const { normalizeMessages } = require(path.join(root, 'lib/server.js'));
+const bridgeLib = require(path.join(root, 'lib/bridge.js'));
+const { createMcpServer } = require(path.join(root, 'lib/mcp.js'));
 const manifest = require(path.join(root, 'manifest.json'));
 
 const results = [];
@@ -484,6 +486,63 @@ async function main() {
     rt.handleLine(JSON.stringify({ jsonrpc: '2.0', id: promptId, result: { stopReason: 'end_turn' } }));
     const result = await pending;
     assert.strictEqual(result.stopReason, 'end_turn');
+  });
+
+  await suite('bridge: 工具目录投影与结果回填', async () => {
+    const tools = bridgeLib.projectTools([
+      { type: 'function', function: { name: 'Bash', description: 'run', parameters: { type: 'object', properties: { command: { type: 'string' } } } } },
+      { type: 'function', function: { name: 'Read', parameters: { type: 'object', properties: {} } } },
+      { type: 'function', function: { name: 'bad name!', parameters: {} } },
+      { type: 'function', function: { name: 'Bash', parameters: {} } },
+    ]);
+    assert.deepStrictEqual(tools.map((t) => t.name), ['Bash', 'Read'], '非法名与重名要被过滤');
+    assert.strictEqual(tools[0].inputSchema.properties.command.type, 'string');
+
+    const calls = bridgeLib.toToolCalls({ toolCallId: 'call_1', name: 'Bash', args: { command: 'ls' } });
+    assert.strictEqual(calls[0].id, 'call_1');
+    assert.strictEqual(calls[0].type, 'function');
+    assert.deepStrictEqual(JSON.parse(calls[0].function.arguments), { command: 'ls' });
+
+    const found = bridgeLib.matchToolResult([
+      { role: 'user', content: 'hi' },
+      { role: 'tool', tool_call_id: 'call_1', content: 'out' },
+    ], 'call_1');
+    assert.strictEqual(bridgeLib.toolResultText(found), 'out');
+    assert.strictEqual(bridgeLib.matchToolResult([], 'call_1'), null);
+  });
+
+  await suite('mcp: initialize / tools/list / tools/call 挂起后回填', async () => {
+    let resolveCall;
+    const mcp = createMcpServer({
+      listTools: () => [{ name: 'Bash', description: 'run', inputSchema: { type: 'object', properties: {} } }],
+      callTool: () => new Promise((resolve) => { resolveCall = resolve; }),
+    });
+    const info = await mcp.listen(0, '127.0.0.1');
+    try {
+      const post = async (body) => {
+        const r = await fetch(info.url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+        return { status: r.status, text: await r.text() };
+      };
+      const init = JSON.parse((await post({ jsonrpc: '2.0', id: 1, method: 'initialize' })).text);
+      assert.strictEqual(init.result.protocolVersion, '2024-11-05');
+      const list = JSON.parse((await post({ jsonrpc: '2.0', id: 2, method: 'tools/list' })).text);
+      assert.deepStrictEqual(list.result.tools.map((t) => t.name), ['Bash']);
+
+      // tools/call：必须先拿到响应头，再等回填
+      const pending = fetch(info.url, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'Bash', arguments: { command: 'ls' } } }),
+      });
+      const response = await pending;
+      assert.strictEqual(response.status, 200, 'tools/call 必须先回响应头');
+      assert.ok(String(response.headers.get('content-type')).includes('text/event-stream'));
+      await sleep(30);
+      resolveCall({ content: [{ type: 'text', text: 'file.txt' }] });
+      const body = await response.text();
+      assert.ok(body.includes('file.txt'), '回填结果要写进同一路 SSE');
+    } finally {
+      mcp.close();
+    }
   });
 
   const failed = results.filter((r) => !r.ok);

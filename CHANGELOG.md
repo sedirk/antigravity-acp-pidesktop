@@ -1,5 +1,28 @@
 # 变更记录
 
+## 1.8.0
+
+**工具回交（实验，默认关闭）**：工具调用不再由运行时自己执行，而是交给 PI-Desktop 执行。
+
+- 新增回环 MCP 服务（`lib/mcp.js`）：`initialize`/`tools/list`/`tools/call`。
+  `tools/call` **先发 SSE 响应头再等待**——运行时的 HTTP 客户端约 60 秒无头就会放弃。
+- 新增桥接状态机（`lib/bridge.js`）：宿主工具目录 → MCP；运行时调用 → 挂起 → 以
+  `tool_calls` 结束这一轮 → 宿主用自己的工具循环执行 → 结果回到下一轮 → 回填 → 运行时继续。
+- `session/new` 与 `session/resume` 现在携带 `mcpServers`：
+  `{ type: 'http', name: 'pi-bridge', url, headers: [] }`。
+- `normalizeMessages` 保留 `tool_call_id`，否则工具结果无法配对回挂起的调用。
+- 面板新增「工具回交（实验）」开关（`bridgeTools`，默认关闭）。关闭时行为与 1.7.0 完全一致。
+
+实测：
+- 直连探针证明 1.3.0 运行时接受该 MCP 形状，会 `tools/list` 并 `tools/call`（工具名带 `pi-bridge_` 前缀）。
+- 端到端用例：运行时调工具 → 网关发 `tool_calls` → 宿主回填 → 运行时继续输出。
+- 单元 24/24、行为 14/14。
+
+限制（诚实记录）：
+- 仅实现了 Chat Completions 通道；Responses 通道仍是旧行为。
+- 长调用（>60 秒）目前只靠 SSE 注释帧保活，尚未实现轮询取回。
+- 运行时仍自带 `view_file`/`run_command`，需要在提示层引导它优先用桥接工具，否则可能不用。
+
 ## 1.7.0
 
 模型不再需要手工「添加 AI 服务」：插件用 manifest 的 `contributes.providers` 直接提供 provider。

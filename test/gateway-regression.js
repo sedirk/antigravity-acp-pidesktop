@@ -5,24 +5,24 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { createGateway } = require(process.env.AGY_SERVER || '../lib/server.js');
 async function main() {
-  const calls = []; let serial = 0; let plan = []; const logs = [];
+  const calls = []; let lastMcpServers = null; let serial = 0; let plan = []; const logs = [];
   const acp = {
     policyBySession: new Map(), start: async () => {}, discover: async () => {},
     cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(), resolveModel: x => x,
     status: () => ({ ready: true }), notify: (...args) => calls.push(args),
     request: async (method, params) => {
       calls.push([method, params]);
-      if (method === 'session/new') return { sessionId: 's' + ++serial };
+      if (method === 'session/new') { lastMcpServers = params.mcpServers; return { sessionId: 's' + ++serial }; }
       if (method === 'session/prompt') {
         const current = plan.shift(); assert.ok(current, 'unexpected automatic prompt');
         for (const update of current.updates) acp.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update } });
-        if (current.before) await current.before();
+        if (current.before) await current.before(params);
         return current.result || {};
       }
       return {};
     },
   };
-  const config = { bind:'127.0.0.1', port:0, defaultModel:'test', toolPolicy:'all', maxSessions:20, promptTimeoutMs:2000, promptIdleTimeoutMs:2000,
+  const config = { bind:'127.0.0.1', port:0, defaultModel:'test', toolPolicy:'all', maxSessions:20, promptTimeoutMs:2000, promptIdleTimeoutMs:2000, bridgeTools:true,
     source:path.join(process.env.PI_SCRATCH_DIR || process.cwd(),'gateway-regression-data','config.json') };
   const gateway = createGateway({ acp, limiter: { run: f => f(), stats: () => ({}) }, getConfig: () => config, log:x=>logs.push(x) });
   // Find a free port without relying on gateway's port=0 reporting.
@@ -106,6 +106,61 @@ async function main() {
       assert.ok(notes.includes('后台子任务仍在运行'),'emits background heartbeat: '+notes);
       const final=events.find(e=>e.type==='response.completed').response;
       assert.ok(final.output[0].content[0].text.includes('subagent done'));
+    });
+
+    await check('bridged: runtime tool call becomes tool_calls, result feeds back, stream continues', async () => {
+      const seen = {};
+      plan.push({
+        updates: [],
+        before: async (params) => {
+            const url = lastMcpServers?.[0]?.url;
+            assert.ok(url, 'session/new 必须带上回环 MCP 地址');
+            const r = await fetch(url, {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ jsonrpc: '2.0', id: 77, method: 'tools/call', params: { name: 'Bash', arguments: { command: 'echo hi' } } }),
+            });
+            seen.status = r.status;
+            seen.body = await r.text();
+            // 运行时拿到工具结果后，在同一轮里继续输出
+            acp.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'tool said hi' } } } });
+        },
+        result: { stopReason: 'end_turn' },
+      });
+      const first = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'test', stream: true,
+          messages: [{ role: 'user', content: 'run echo' }],
+          tools: [{ type: 'function', function: { name: 'Bash', parameters: { type: 'object', properties: { command: { type: 'string' } } } } }],
+          prompt_cache_key: 'bridge-key',
+        }),
+      });
+      const firstRaw = await first.text();
+      const events = firstRaw.split('\n').filter((x) => x.startsWith('data: {')).map((x) => JSON.parse(x.slice(6)));
+      const call = events.flatMap((e) => e.choices?.[0]?.delta?.tool_calls || [])[0];
+      assert.ok(call, '必须发出 tool_calls: ' + firstRaw.slice(0, 200));
+      assert.equal(call.function.name, 'Bash');
+      assert.deepStrictEqual(JSON.parse(call.function.arguments), { command: 'echo hi' });
+      assert.equal(events.find((e) => e.choices?.[0]?.finish_reason === 'tool_calls') !== undefined, true, 'finish_reason 应为 tool_calls');
+
+      const second = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'test', stream: true,
+          messages: [
+            { role: 'user', content: 'run echo' },
+            { role: 'assistant', content: '', tool_calls: [{ id: call.id, type: 'function', function: call.function }] },
+            { role: 'tool', tool_call_id: call.id, content: 'echo hi output' },
+          ],
+          tools: [{ type: 'function', function: { name: 'Bash', parameters: { type: 'object', properties: { command: { type: 'string' } } } } }],
+          prompt_cache_key: 'bridge-key',
+        }),
+      });
+      const secondText = (await second.text()).split('\n').filter((x) => x.startsWith('data: {')).map((x) => JSON.parse(x.slice(6)))
+        .map((e) => e.choices?.[0]?.delta?.content || '').join('');
+      assert.ok(secondText.includes('tool said hi'), '回填后应继续输出: ' + secondText);
+      assert.equal(seen.status, 200);
+      assert.ok(seen.body.includes('echo hi output'), 'MCP 调用应拿到 PI 的执行结果');
     });
 
     await check('cancelled stream preserves partial answer as incomplete',async()=>{plan.push({updates:[text('partial')],result:{stopReason:'cancelled'}});const events=await request('a',true);assert.ok(events.some(e=>e.type==='response.incomplete'));assert.ok(!events.some(e=>e.type==='response.completed'));});
