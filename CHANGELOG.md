@@ -1,5 +1,22 @@
 # 变更记录
 
+## 1.5.4
+
+`/v1/responses` 里终于能看到「思考 / 工具进度」：
+
+- 根因：宿主（`openai-responses-shared` 474–486 行）只在收到
+  `response.output_item.added`（`item.type = reasoning`）后，才会为
+  `response.reasoning_summary_text.delta` 建「思考」槽位。我之前把工具进度写成了 SSE 注释帧，
+  宿主直接丢弃——所以界面上什么都看不到
+- 现在：`agent_thought_chunk` 与每次工具调用都以 reasoning 事件下发
+  （`reasoning_summary_part.added` → `reasoning_summary_text.delta` → `…part.done` → `output_item.done`），
+  正文仍是独立的 `output_item.added(type=message)`，两者不互相污染
+- 实测帧序列：`created, in_progress, output_item.added, reasoning_summary_part.added,
+  reasoning_summary_text.delta ×8, content_part.added, output_text.delta, …, completed`，
+  delta 内容形如 `· echo REASON-OK`
+- 顺带说明：`/v1/chat/completions` 走的是 `reasoning_content` 字段（宿主
+  `openai-completions` 168 行），本来就可见；两条路径现在都能看到进度
+
 ## 1.5.3
 
 自动续跑真正生效（1.5.0 的判断依据是错的）：
