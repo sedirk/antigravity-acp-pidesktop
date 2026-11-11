@@ -1,5 +1,13 @@
 # 变更记录
 
+## 2.0.2
+
+- **重构：桥接状态机只保留一份**（`lib/bridge-turn.js`）。会话/挂起/回填/续流/提示层引导统一实现，
+  Chat 与 Responses 只保留各自的协议适配层（`begin/text/thought/park/finish/error/end`）。
+  此前两份实现已经出现“续流绑错 SSE”这类同源缺陷，现在从结构上消除。
+- 续流事件由核心统一发给**当前轮**的适配器，两个通道行为一致。
+- 无行为变更：单元 24/24、行为 15/15，Chat 与 Responses 的独立闭环脚本均通过。
+
 ## 2.0.1
 
 - 修复 Responses 桥接**完全没有 usage**：`envelope()` 现在带上 `input/output/total_tokens`
