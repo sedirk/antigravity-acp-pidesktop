@@ -616,6 +616,34 @@ async function main() {
     assert.ok(logs.some((l) => l.includes('读取失败')), '要留下日志但不能崩');
     assert.strictEqual(store.size(), 0);
   });
+
+  await suite('runtime: 直连启动后发现代理只给一次重建信号（单向）', async () => {
+    const { AcpRuntime } = require(path.join(root, 'lib/core.js'));
+    let proxy = '';
+    const rt = new AcpRuntime({ getConfig: () => ({ bin: 'x' }), getProxy: () => proxy, log: () => {} });
+    assert.strictEqual(rt.proxyDrift(), '', '运行时没起来就不该有信号');
+    rt.ready = true;
+    rt.child = { pid: 1 };
+    rt.spawnProxy = '';
+    assert.strictEqual(rt.proxyDrift(), '', '一直直连就没有信号');
+    proxy = 'http://127.0.0.1:10808';
+    assert.strictEqual(rt.proxyDrift(), proxy, '直连起、现在有代理 → 必须重建（否则联网全 Internal error）');
+    rt.spawnProxy = proxy;
+    proxy = '';
+    assert.strictEqual(rt.proxyDrift(), '', '反向（代理→直连）不重启，免得开关 VPN 反复重建');
+    assert.strictEqual(rt.status().proxy, 'http://127.0.0.1:10808', 'status 要暴露运行时实际用的网络路径');
+
+    // childEnv 是唯一把代理交给运行时的地方：它必须同时记下本次真正的值
+    rt.spawnProxy = '';
+    proxy = 'http://127.0.0.1:9999';
+    const env = rt.childEnv();
+    assert.strictEqual(env.HTTPS_PROXY, proxy);
+    assert.strictEqual(rt.spawnProxy, proxy, 'spawnProxy 要跟上真正传出去的值');
+    proxy = '';
+    const env2 = rt.childEnv();
+    assert.strictEqual(env2.HTTPS_PROXY, undefined, '直连时必须把代理环境变量删干净');
+    assert.strictEqual(rt.spawnProxy, '', 'spawnProxy 要跟着清空');
+  });
   const failed = results.filter((r) => !r.ok);
   console.log(`\n结果: ${results.length - failed.length}/${results.length} 通过`);
   if (failed.length > 0) process.exit(1);

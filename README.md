@@ -70,7 +70,7 @@
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |
 | `port` | 41910 | 本地网关端口 |
-| `proxyMode` | `auto` | `auto` 跟随系统代理 / `manual` 用下面填的地址 / `direct` 直连 |
+| `proxyMode` | `auto` | `auto` 跟随系统代理（每次启动运行时现读，5 秒缓存）/ `manual` 用下面填的地址 / `direct` 直连 |
 | `proxy` | 空 | 手动模式的代理地址，如 `http://127.0.0.1:10808` |
 | `toolPolicy` | `all` | 工具权限：`all` / `shell` / `agent` / `search` / `none`；**默认不额外拦截**，见「三层权限」 |
 | `cancelOnDisconnect` | true | 客户端断开时发 `session/cancel` 通知；取消后 20 秒未结束才杀运行时 |

@@ -483,6 +483,43 @@ async function main() {
         gateway9.close();
       }
     });
+
+    // 开机时 VPN 比 PI-Desktop 起得晚：运行时会按直连拉起来，之后永远连不上网。
+    // 网关发现「直连起、现在有代理」要自己重建一次，而不是一直拿坏运行时打 Internal error。
+    await check('runtime started direct is rebuilt once a proxy shows up', async () => {
+      let restarted = 0;
+      const calls11 = [];
+      const acp11 = {
+        policyBySession: new Map(), notify: () => {}, discover: async () => {}, resolveModel: (m) => m,
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        start: async () => {}, status: () => ({ running: true }),
+        restart: async () => { restarted += 1; },
+        proxyDrift: () => (restarted ? '' : 'http://127.0.0.1:10808'),
+        request: async (method, params) => {
+          calls11.push(method);
+          if (method === 'session/new') return { sessionId: 'proxied' };
+          if (method === 'session/prompt') {
+            acp11.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ok' } } } });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const gatewayC = createGateway({ acp: acp11, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => config, log: () => {} });
+      await gatewayC.listen([port]);
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'proxy-key', messages: [{ role: 'user', content: 'hi' }] }),
+        });
+        await res.text();
+        assert.equal(res.status, 200, '重建运行时这一轮仍要正常回答');
+        assert.equal(restarted, 1, '发现代理后应重建一次运行时');
+        assert.ok(calls11.includes('session/prompt'), '重建后本轮必须继续，而不是直接失败');
+      } finally {
+        gatewayC.close();
+      }
+    });
     console.log(`${passed}/${passed} behavioral tests passed`);
   } finally { gateway.close(); }
 }

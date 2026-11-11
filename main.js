@@ -43,12 +43,24 @@ let limiter = null;
 let gateway = null;
 let log = () => {};
 let resolvedProxy = { url: '', source: 'none', note: '尚未解析' };
+let proxyAt = 0;
+// auto 模式必须现读注册表：VPN/代理软件往往比 PI-Desktop 起得晚，开机那一刻的「系统代理未启用」
+// 不能定死一辈子，否则运行时会一直按直连走，所有联网调用都是 Internal error。
+const PROXY_TTL_MS = 5000;
 
 /** 解析当前生效的代理：auto 跟随系统代理，manual 用面板值，direct 直连。 */
-function refreshProxy() {
-  resolvedProxy = proxyLib.resolveProxy(config || {});
-  const shown = resolvedProxy.url || '直连';
-  log(`代理：${shown}（${resolvedProxy.source}：${resolvedProxy.note}）`);
+function refreshProxy({ force = true } = {}) {
+  const now = Date.now();
+  const first = !proxyAt;
+  if (!force && proxyAt && now - proxyAt < PROXY_TTL_MS) return resolvedProxy;
+  const next = proxyLib.resolveProxy(config || {});
+  const changed = next.url !== resolvedProxy.url || next.source !== resolvedProxy.source;
+  resolvedProxy = next;
+  proxyAt = now;
+  if (force || changed || first) {
+    const shown = next.url || '直连';
+    log(`代理：${shown}（${next.source}：${next.note}）`);
+  }
   return resolvedProxy;
 }
 
@@ -163,7 +175,7 @@ async function startService({ log: providedLog } = {}) {
   refreshProxy();
   reapOrphans();
   limiter = buildLimiter();
-  acp = new AcpRuntime({ getConfig: () => config, getProxy: () => resolvedProxy.url, getCwd: workspaceCwd, log });
+  acp = new AcpRuntime({ getConfig: () => config, getProxy: () => refreshProxy({ force: false }).url, getCwd: workspaceCwd, log });
   gateway = createGateway({ acp, limiter, getConfig: () => config, log });
   const base = config.port;
   const port = await gateway.listen([base, base + 1, base + 2, base + 3]);
