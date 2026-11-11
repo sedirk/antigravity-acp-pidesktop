@@ -165,7 +165,7 @@ async function main() {
       assert.ok(seen.body.includes('echo hi output'), 'MCP 调用应拿到 PI 的执行结果');
     });
 
-    await check('session created without the bridge is rebuilt when bridging is on', async () => {
+    await check('session created without the bridge is remounted, not rebuilt, when bridging turns on', async () => {
       plan.push({ updates: [text('plain')], result: { stopReason: 'end_turn' } });
       const plain = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
         method: 'POST', headers: { 'content-type': 'application/json' },
@@ -173,6 +173,7 @@ async function main() {
       });
       await plain.text();
       const before = serial;
+      const mark = calls.length;
       plan.push({ updates: [text('with bridge')], result: { stopReason: 'end_turn' } });
       const bridged = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
         method: 'POST', headers: { 'content-type': 'application/json' },
@@ -184,8 +185,16 @@ async function main() {
         }),
       });
       await bridged.text();
-      assert.ok(serial > before, '桥接开启时必须新建会话，不能复用未挂载 MCP 的会话');
-      assert.ok(calls.filter((c) => c[0] === 'session/close').length >= 1, '旧会话应被关闭');
+      const during = calls.slice(mark);
+      // 关 worker 是对的（旧会话没挂 MCP），但必须用 session/load 重新挂载把历史接回来：
+      // 重建 = 整段历史重放一遍，服务端前缀缓存全灭。
+      assert.ok(during.filter((c) => c[0] === 'session/close').length >= 1, '旧 worker 应先关掉');
+      const remount = during.filter((c) => c[0] === 'session/load');
+      assert.equal(remount.length, 1, '应通过 session/load 重新挂载工具桥');
+      const remountUrl = String((remount[0][1].mcpServers || [{}])[0].url || '');
+      assert.ok(/^http:\/\/127\.0\.0\.1:\d+/.test(remountUrl), '重新挂载必须带上桥接地址: ' + remountUrl);
+      assert.equal(during.filter((c) => c[0] === 'session/new').length, 0, '不得新建会话（会重放历史）');
+      assert.equal(serial, before, '不得新建会话（sessionId 不应变化）');
     });
 
     await check('cancelled stream preserves partial answer as incomplete',async()=>{plan.push({updates:[text('partial')],result:{stopReason:'cancelled'}});const events=await request('a',true);assert.ok(events.some(e=>e.type==='response.incomplete'));assert.ok(!events.some(e=>e.type==='response.completed'));});
@@ -377,6 +386,101 @@ async function main() {
         assert.ok(notified >= 1, '心跳之后仍必须按 idleMs 触发 session/cancel（说明心跳没有推迟判定）');
       } finally {
         gateway5.close();
+      }
+    });
+
+    // 缓存相关最要紧的一条：只要足迹还在，就不能重放整段历史（重放会让服务端前缀缓存全灭）。
+    await check('a dropped session mapping still restores via session/load instead of replaying', async () => {
+      const dataDir = path.dirname(config.source);
+      try { fs.rmSync(path.join(dataDir, 'sessions.json'), { force: true }); } catch { /* ignore */ }
+      const calls6 = [];
+      let promptPayload = '';
+      const acp6 = {
+        policyBySession: new Map(), notify: () => {}, discover: async () => {}, resolveModel: (m) => m,
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        start: async () => {}, status: () => ({ running: true }),
+        request: async (method, params) => {
+          calls6.push(method);
+          if (method === 'session/new') return { sessionId: 'mapped' };
+          if (method === 'session/load') return {};
+          if (method === 'session/prompt') {
+            promptPayload = JSON.stringify(params.prompt);
+            acp6.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ok' } } } });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const send = (text) => fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'drop-key', messages: [{ role: 'user', content: text }] }),
+      }).then((r) => r.text());
+
+      const gateway6 = createGateway({ acp: acp6, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => config, log: () => {} });
+      await gateway6.listen([port]);
+      await send('first');
+      assert.equal(calls6.filter((m) => m === 'session/new').length, 1, '第一轮应建会话');
+
+      // 模拟「内存映射丢了，但 sessions.json 足迹还在」：新实例读同一份足迹
+      gateway6.close();
+      await new Promise((r) => setTimeout(r, 80));
+      const gateway7 = createGateway({ acp: acp6, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => config, log: () => {} });
+      try {
+        await gateway7.listen([port]);
+        calls6.length = 0;
+        await send('second');
+        assert.equal(calls6.filter((m) => m === 'session/load').length, 1, '应通过 session/load 接回');
+        assert.equal(calls6.filter((m) => m === 'session/new').length, 0, '不得新建会话（会重放整段历史）');
+        assert.ok(!promptPayload.includes('first'), `不得重放历史，实际：${promptPayload.slice(0, 160)}`);
+        assert.ok(promptPayload.includes('second'), '只发本轮增量');
+      } finally {
+        gateway7.close();
+      }
+    });
+
+
+    // 还原出来的会话带着上次的模型：本轮换档位必须 set_model，而不是重建（重建要重放历史）。
+    await check('restored session applies the requested model instead of rebuilding', async () => {
+      const dataDir2 = path.dirname(config.source);
+      try { fs.rmSync(path.join(dataDir2, 'sessions.json'), { force: true }); } catch { /* ignore */ }
+      const calls8 = [];
+      const models = [];
+      const acp8 = {
+        policyBySession: new Map(), notify: () => {}, discover: async () => {}, resolveModel: (m) => m,
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        start: async () => {}, status: () => ({ running: true }),
+        request: async (method, params) => {
+          calls8.push(method);
+          if (method === 'session/new') return { sessionId: 'kept' };
+          if (method === 'session/load') return {};
+          if (method === 'session/set_model') { models.push(params.modelId); return {}; }
+          if (method === 'session/prompt') {
+            acp8.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ok' } } } });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const send8 = (model) => fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model, stream: true, prompt_cache_key: 'model-key', messages: [{ role: 'user', content: 'hi' }] }),
+      }).then((r) => r.text());
+      const gateway8 = createGateway({ acp: acp8, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => config, log: () => {} });
+      await gateway8.listen([port]);
+      await send8('old-model');
+      gateway8.close();
+      await new Promise((r) => setTimeout(r, 80));
+      // 新实例：内存映射为空，只剩足迹 → 走 session/load
+      const gateway9 = createGateway({ acp: acp8, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => config, log: () => {} });
+      try {
+        await gateway9.listen([port]);
+        calls8.length = 0;
+        await send8('new-model');
+        assert.equal(calls8.filter((m) => m === 'session/load').length, 1, '应先 session/load 还原');
+        assert.deepEqual(models, ['new-model'], '还原后必须把会话切到本轮模型');
+        assert.equal(calls8.filter((m) => m === 'session/new').length, 0, '换档位不得重建会话');
+      } finally {
+        gateway9.close();
       }
     });
     console.log(`${passed}/${passed} behavioral tests passed`);

@@ -582,7 +582,27 @@ async function main() {
       version: 1,
       sessions: [{ key: 'old', sessionId: 's', model: '', bridgeUrl: '', touched: Date.now() - MAX_AGE_MS - 1000 }],
     }), 'utf8');
-    assert.strictEqual(createSessionStore({ file }).load(), 0, '超过一天没动的足迹直接丢');
+    assert.strictEqual(createSessionStore({ file }).load(), 0, '超过 TTL 没动的足迹直接丢');
+
+    // 但「运行时早回收了」不是丢弃的理由：实测 close 之后 load 仍能拿回历史，
+    // 两天前的足迹留着才可能省下一次整段重放。
+    fs.writeFileSync(file, JSON.stringify({
+      version: 1,
+      sessions: [{ key: 'two-days', sessionId: 's', model: '', bridgeUrl: '', touched: Date.now() - 2 * 24 * 60 * 60 * 1000 }],
+    }), 'utf8');
+    assert.strictEqual(createSessionStore({ file }).load(), 1, '两天前的足迹必须保留');
+    // 兜底上限：超过 MAX_ENTRIES 时按最久未用淘汰，文件不能无限长
+    const many = [];
+    for (let i = 0; i < 520; i += 1) many.push({ key: `k${i}`, sessionId: `s${i}`, model: '', bridgeUrl: '', touched: Date.now() - i * 1000 });
+    fs.writeFileSync(file, JSON.stringify({ version: 1, sessions: many }), 'utf8');
+    const capped = createSessionStore({ file });
+    assert.strictEqual(capped.load(), 520, 'load 不设上限（读多少算多少）');
+    capped.touch('k0'); // 先弄脏，否则 flush 直接返回
+    capped.flush();
+    const saved = JSON.parse(fs.readFileSync(file, 'utf8')).sessions;
+    assert.strictEqual(saved.length, 500, '落盘时截到上限');
+    assert.ok(saved.some((s) => s.key === 'k0'), '保留最近用过的');
+    assert.ok(!saved.some((s) => s.key === 'k519'), '丢掉最久未用的');
   });
 
   await suite('session-store: 损坏文件不抛异常', async () => {
