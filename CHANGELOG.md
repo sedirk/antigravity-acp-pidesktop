@@ -1,5 +1,25 @@
 # 变更记录
 
+## 1.4.0
+
+流式与超时修复（对应「输出很怪 / 超级慢 / 说着说着就断」）：
+
+- **首字节**：`chat` 与 `responses` 原来在 `writeHead` 之前就 `await acp.start()` + `discover()` +
+  `session/new` + `set_model`，冷启动十几秒里客户端连响应头都拿不到。实测改前 **headers 10,455 ms**，
+  改后 **53–59 ms**（首个正文字节仍取决于模型：冷启动约 33 s，热态约 7 s）
+- **心跳**：prompt 期间每 10 秒写 `: ping`（SSE 注释帧），长工具链不再静默。实测 30 秒的一轮里 3 个心跳帧；
+  做法与参考实现 `angusggsimid/dsh-antigravity-acp`（`index.js:1575-1577`）一致
+- **工具进度可见**：`chat` 端点把 `tool_call` / `tool_call_update` 作为 `reasoning_content` 增量下发
+  （形如 `· execute echo STREAM-OK`，不进正文、不进最终 message）；`responses` 端点用 SSE 注释帧，
+  不污染 Responses 事件流。改前几十秒里前端一片死寂
+- **断流不再吞掉已生成内容**：异常时若已吐过正文，`chat` 发 `finish_reason: length` + `[DONE]` 正常收尾，
+  `responses` 发 `status: incomplete` + `incomplete_details.reason=stream_interrupted`；
+  只有正文为空时才发错误帧。改前一条 error 帧会把已写出的半篇答案整个作废
+- `responses` 端点补发 `response.in_progress`
+- 实测：`chat` 正文 6 个增量帧、间隔约 300 ms；`responses` 事件序列
+  `created → in_progress → output_item.added → content_part.added → output_text.delta → … → completed`
+- 自测 20/20；另用独立端口跑仓库代码做三组流式实测
+
 ## 1.3.0
 
 中断不再毁掉整个运行时 + 弹窗问题写进文档：
