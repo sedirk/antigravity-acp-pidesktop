@@ -24,7 +24,7 @@ ACP used/size is cumulative session occupancy, not measured per-request billing.
 - Existing offline tests: `node test/run-tests.js` (20 suites).
 - New behavioral HTTP tests: `node test/gateway-regression.js` (9 cases), using mock ACP and real local HTTP/SSE, no Google account calls.
 - Syntax check and git diff whitespace check.
-- A real geminitest run was launched against the installed 1.5.10, NOT this source. Its result cannot validate the repaired build.
+- A real geminitest run against the installed 1.5.10 failed (empty turn, then 180 s silence) and could not validate that build.
 
 ## Remaining acceptance work
 
@@ -51,3 +51,17 @@ request was never answered, leaving the runtime blocked. Raw probe evidence:
 Fix: only messages without `method` are treated as responses. Empty turns are nudged in the same session
 (twice, 90 s idle cap) instead of replaying in a fresh one. Cancel now gives a 20 s grace, then abandons
 the RPC and discards the unusable session.
+
+## Acceptance after the id fix (1.5.12)
+
+- Raw ACP probe, write task: 8 permissions (ids 0..7) all answered, 8 files created, `stopReason=end_turn`,
+  final text 1009 chars, no events after the result. The same probe without the fix returned an empty result
+  at the id-4 permission and hung on the follow-up.
+- Installed 1.5.12 verified by hash, then `geminitest` ran the twelve-file task through PI-Desktop:
+  **12/12 reads, SUM=68012**, single turn, `正文 1959 字 · 工具 13 次 · stopReason=end_turn`, no nudge and no
+  session switch. The same task failed on 1.5.10 and 1.5.11 with an empty turn followed by a stall.
+- Tests: 21/21 offline suites (including the new transport id-collision test) and 10/10 HTTP/SSE behavior tests.
+
+Still open: Responses streaming still cannot refresh usage mid-stream with the inspected host parser; output
+token counts remain estimates; model switching inside an existing host conversation only forwards the newest
+user text on a session hit.
