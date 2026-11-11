@@ -185,6 +185,34 @@ ACP 的 agent 自带一套工具：`search_web`、`read_url_content`、`view_fil
 日志会记录每次放行/拒绝以及本次的工具使用统计，例如
 `工具权限 放行：Run search_web?（kind=search，策略=search）`、`本次工具使用：search×2，fetch×2，read×8`。
 
+## 对话时闪出的控制台窗口（1.3.0 起有说明）
+
+用 `run_command` 这类工具时，Windows 上会闪出（有时一直留着）一个控制台窗口，标题是命令或
+`D:\...\Scripts\conda.exe` 之类，里面可能只有一行
+`[出现错误 2147942632 (0x800700e8) (启动 "...conda.exe" shell.powershell hook 时)]`。
+
+来源拆开看很清楚（实测）：
+
+1. **窗口本身**：运行时的 shell 工具每次起一个新控制台进程。Win11 把「新控制台」交给默认终端
+   （这台机器上是 Windows 终端），于是每次命令都开一个窗口。插件没法替运行时的 shell 指定
+   `CREATE_NO_WINDOW`——那是它自己进程内的行为。
+2. **窗口里的报错**：PowerShell 的 profile（`Documents\WindowsPowerShell\profile.ps1`）里那段
+   `conda init` 会无条件执行 `conda.exe shell.powershell hook`；没有交互式控制台时它写 stdout 失败，
+   于是报 `0x800700e8`（管道已关闭）。
+3. **顺带变慢**：带 profile 起一个 PowerShell 实测 **1494 ms**，`-NoProfile` 只要 **173 ms**，
+   每条命令白等约 1.3 秒。
+
+三种处置，按你想付出的代价挑：
+
+| 做法 | 效果 | 代价 |
+| --- | --- | --- |
+| 工具权限调到 `agent`（或 `search`） | 完全不跑命令 → 不再有任何窗口 | 失去 `run_command`，读文件只剩 `view_file`（限 `cwd` + `~/.gemini`） |
+| 改 profile：把 conda 那 4 行包进 `if ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) { ... }`，或直接 `conda init --reverse powershell` | 报错消失、每条命令省约 1.3 秒 | 交互式终端里也不再自动激活 conda 环境（要手 `conda activate`） |
+| Windows 设置 → 系统 → 开发者选项 → 终端 → 默认终端应用程序改成「Windows 控制台主机」 | 仍会闪，但窗口小、不开终端标签页 | 仅观感 |
+
+插件这边能做的（1.3.0 已做）：**别让一次中断毁掉整个运行时**。以前客户端断开后 20 秒没停就杀运行时，
+所有会话一起丢、下次还得重新握手；现在先 `session/close` 那一路 worker，再等 15 秒仍不停才杀。
+
 ## 取消、会话回收与 resume（0.8.0 起）
 
 **取消**：`session/cancel` 必须以**通知**（无 `id`、不等回复）发送——用请求形式会得到 `Method not found`，

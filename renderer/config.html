@@ -77,7 +77,7 @@
         <option value="search">只放行只读工具（联网搜索 / 抓网页 / 读文件）</option>
         <option value="none">全部拒绝（当纯聊天网关用）</option>
       </select>
-      <span class="hint">这一档只决定本插件怎么回 session/request_permission；真正的文件边界是下面的「工作目录」（运行时只认它和 ~/.gemini）。想更严再往下调，保持默认也能正常读写项目文件。</span>
+      <span class="hint">这一档只决定本插件怎么回 session/request_permission；真正的文件边界是下面的「工作目录」（运行时只认它和 ~/.gemini）。每多放行一档，agent 就可能多跑一次命令、在 Windows 上多闪一个控制台窗口；想彻底不弹窗就选 agent / search。</span>
     </div>
     <div class="field wide">
       <label for="bin">ACP 运行时（agy_acp_server.exe）</label>
