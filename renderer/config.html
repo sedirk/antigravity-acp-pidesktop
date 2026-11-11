@@ -43,6 +43,9 @@
   .bar.fail > i { background: #c9483d; }
   .path { margin-top: 16px; padding-top: 12px; border-top: 1px solid #2c2c31; font-size: 11px; color: #7c7c84; }
   code { background: #232326; padding: 2px 6px; border-radius: 4px; color: #b9b9c0; word-break: break-all; }
+  .section { margin: 18px 0 6px; font-size: 13px; color: #8a8a8a; border-bottom: 1px solid rgba(128,128,128,.25); padding-bottom: 4px; }
+  .row-actions { margin-top: 6px; }
+  button.ghost { background: transparent; border: 1px solid rgba(128,128,128,.4); color: inherit; padding: 4px 10px; border-radius: 6px; cursor: pointer; }
 </style>
 </head>
 <body>
@@ -50,6 +53,7 @@
   <div class="sub">保存后网关会重启。本插件不保存任何 Google 凭据，登录由官方 ACP 运行时自己完成。</div>
 
   <form id="form" class="grid" autocomplete="off">
+    <h3 class="section">服务与端点</h3>
     <div class="field">
       <label for="port">网关端口</label>
       <input id="port" type="number" min="1024" max="65535">
@@ -88,6 +92,7 @@
       <span class="hint" id="binHint"></span>
     </div>
 
+    <h3 class="section">模型与思考</h3>
     <div class="field">
       <label for="defaultModel">默认模型</label>
       <input id="defaultModel" type="text" placeholder="gemini-3.8-flash">
@@ -114,6 +119,7 @@
         <option value="false">关闭（每个档位单独列出）</option>
       </select>
     </div>
+    <h3 class="section">会话与超时</h3>
     <div class="field">
       <label for="cancelOnDisconnect">客户端断开即停止</label>
       <select id="cancelOnDisconnect">
@@ -130,6 +136,7 @@
       </select>
     </div>
 
+    <h3 class="section">高级</h3>
     <div class="field">
       <label for="concurrency">最大并发（0 = 不限制，默认关闭）</label>
       <input id="concurrency" type="number" min="0" max="8">
@@ -148,6 +155,7 @@
       <input id="promptIdleSeconds" type="number" min="30" max="3600">
       <span class="hint">连续这么久收不到任何进展才取消本轮；只要运行时还在报工具进展就不会被砍（长任务的真正保护）</span>
     </div>
+    <h3 class="section">工具与桥接</h3>
     <div class="field">
       <label for="bridgeTools">工具回交（实验）</label>
       <select id="bridgeTools"><option value="false">关闭</option><option value="true">开启</option></select>
@@ -155,7 +163,9 @@
     </div>
     <div class="field wide">
       <label for="bridgeGuidance">桥接提示层（可改）</label>
+      <input id="bridgeGuidanceDefault" type="hidden">
       <textarea id="bridgeGuidance" rows="6" placeholder="留空使用内置文案；可用 {tools} 占位，会被替换成可用的桥接工具名"></textarea>
+      <div class="row-actions"><button id="bridgeGuidanceReset" type="button" class="ghost">恢复默认</button></div>
       <span class="hint">每次发给运行时的提示会以这段开头；内置文案要求它“先说再做”，工具失败两次要换思路</span>
     </div>
     <div class="field">
@@ -216,6 +226,13 @@ const ids = ['port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', '
         if (id === 'virtualModels' || id === 'exposeVariantModels' || id === 'cancelOnDisconnect') { $(id).value = view[id] === false ? 'false' : 'true'; continue; }
         $(id).value = view[id] === undefined || view[id] === null ? '' : view[id];
       }
+      const def = view.bridgeGuidanceDefault || '';
+      $('bridgeGuidanceDefault').value = def;
+      if (!view.bridgeGuidance && def) $('bridgeGuidance').value = def;
+      $('bridgeGuidanceReset').addEventListener('click', () => {
+        $('bridgeGuidance').value = def;
+        show('已填入内置文案，点保存生效。', 'ok');
+      });
       $('file').textContent = view.file + (view.exists ? '' : '（尚未创建）');
       $('binHint').textContent = view.binExists ? '运行时已就绪' : '尚未安装运行时';
       const warn = (view.warnings || []).filter(Boolean);
