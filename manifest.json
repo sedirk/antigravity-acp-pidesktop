@@ -2,13 +2,12 @@
   "schemaVersion": 1,
   "id": "local.antigravity-acp",
   "name": "Antigravity ACP 网关",
-  "version": "1.8.1",
+  "version": "2.0.0",
   "description": "把 Google 官方 Antigravity ACP 运行时（agy_acp_server.exe）包装成 OpenAI 兼容的本地网关：不抓取 token、不逆向私有接口，凭据由官方二进制自己保管。提供 /v1/chat/completions 与 /v1/responses（含流式），支持文本 + 图片 + PDF、虚拟模型 + reasoning_effort、agent 自带工具（联网搜索／读文件／跑命令，权限默认不额外设防）、工作目录默认跟随 PI-Desktop 当前项目、会话 close/resume 与空闲回收、断开即取消、用量账本。",
   "main": "main.js",
   "permissions": [
     "background.service",
-    "ui.panel",
-    "provider.register"
+    "ui.panel"
   ],
   "ui": {
     "panel": "renderer/config.html",
@@ -87,64 +86,6 @@
           "卸载",
           "空间",
           "cleanup"
-        ]
-      }
-    ],
-    "providers": [
-      {
-        "id": "antigravity-acp",
-        "name": "Antigravity ACP",
-        "vendorKey": "antigravity-acp",
-        "baseUrl": "http://127.0.0.1:41910/v1",
-        "apiStyle": "chat_completions",
-        "authKind": "none",
-        "defaultModelId": "gemini-4-carbon",
-        "models": [
-          {
-            "id": "gemini-4-carbon",
-            "name": "Gemini 4 Carbon",
-            "contextWindow": 1048576,
-            "maxTokens": 131072,
-            "supportsImages": true,
-            "supportsDocuments": true,
-            "supportsReasoningEffort": true,
-            "thinkingLevels": [
-              "low",
-              "medium",
-              "high"
-            ],
-            "defaultThinkingLevel": "medium"
-          },
-          {
-            "id": "gemini-4-argon",
-            "name": "Gemini 4 Argon",
-            "contextWindow": 1048576,
-            "maxTokens": 131072,
-            "supportsImages": true,
-            "supportsDocuments": true,
-            "supportsReasoningEffort": true,
-            "thinkingLevels": [
-              "low",
-              "medium",
-              "high"
-            ],
-            "defaultThinkingLevel": "medium"
-          },
-          {
-            "id": "gemini-3.8-flash",
-            "name": "Gemini 3.8 Flash",
-            "contextWindow": 1048576,
-            "maxTokens": 131072,
-            "supportsImages": true,
-            "supportsDocuments": true,
-            "supportsReasoningEffort": true,
-            "thinkingLevels": [
-              "low",
-              "medium",
-              "high"
-            ],
-            "defaultThinkingLevel": "medium"
-          }
         ]
       }
     ]

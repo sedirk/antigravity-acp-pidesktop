@@ -1,5 +1,8 @@
 # Antigravity ACP · PI-Desktop 插件
 
+> **2.0.0**：工具调用交给 PI-Desktop 执行（原生卡片），模型可调用 `Task` 子代理；
+> 端点方式回到“自定义端点”，不再由插件声明只读服务行。见 [FUSION.md](FUSION.md)。
+
 > **1.7.0**：插件通过 `contributes.providers` 直接提供模型（无需手工添加自定义端点）；推理档位在对话里可调。见 [FUSION.md](FUSION.md)。
 
 > **1.6.0 修复说明**：已删除错误的自动换会话重跑；流式占用显示、计量和剩余限制见 [审计记录](AUDIT-STREAMING.md)、生态融合记录见 [FUSION.md](FUSION.md)。旧版关于运行时步数限制的推断不作为事实。

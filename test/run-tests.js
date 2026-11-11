@@ -50,25 +50,10 @@ async function main() {
     assert.strictEqual(manifest.contributes.services[0].id, 'antigravity-acp-gateway');
   });
 
-  await suite('manifest: 插件声明的 provider 必须带齐可调项', async () => {
-    const p = (manifest.contributes.providers || [])[0];
-    assert.ok(p, 'contributes.providers 必须存在（否则模型只能手工加自定义端点）');
-    assert.strictEqual(p.id, 'antigravity-acp');
-    assert.strictEqual(p.apiStyle, 'chat_completions');
-    assert.strictEqual(p.authKind, 'none');
-    assert.strictEqual(p.baseUrl, 'http://127.0.0.1:41910/v1', '默认端口要与 config 默认值一致');
-    assert.ok(manifest.permissions.includes('provider.register'));
-    assert.deepStrictEqual(p.models.map((m) => m.id).sort(), ['gemini-3.8-flash', 'gemini-4-argon', 'gemini-4-carbon']);
-    for (const m of p.models) {
-      assert.ok(Number.isSafeInteger(m.contextWindow) && m.contextWindow > 0, `${m.id}: contextWindow`);
-      assert.ok(Number.isSafeInteger(m.maxTokens) && m.maxTokens > 0, `${m.id}: maxTokens`);
-      assert.strictEqual(m.supportsImages, true);
-      assert.strictEqual(m.supportsDocuments, true);
-      assert.strictEqual(m.supportsReasoningEffort, true);
-      assert.ok(Array.isArray(m.thinkingLevels) && m.thinkingLevels.length >= 2, `${m.id}: thinkingLevels`);
-      assert.ok(m.thinkingLevels.includes(m.defaultThinkingLevel), `${m.id}: default 必须在 levels 内`);
-      assert.ok(m.thinkingLevels.includes('medium'), `${m.id}: 需要 medium 兜底`);
-    }
+  await suite('manifest: 不声明 provider（端点由用户自配，更自由）+ 工具回交默认开启', async () => {
+    assert.strictEqual((manifest.contributes && manifest.contributes.providers) || undefined, undefined, '2.0.0 起不再声明 provider，改回自定义端点');
+    assert.ok(!manifest.permissions.includes('provider.register'), '不再需要 provider.register');
+    assert.ok(manifest.permissions.includes('background.service') && manifest.permissions.includes('ui.panel'));
   });
 
   await suite('config: 默认值、钳制与校验', async () => {
