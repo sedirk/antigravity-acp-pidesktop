@@ -75,6 +75,8 @@ async function main() {
     const dir = tempDir('cfg');
     const cfg = configLib.loadConfig({ packageRoot: dir, dataPath: dir });
     assert.strictEqual(cfg.port, 41910);
+    assert.strictEqual(cfg.bridgeTools, true, '工具回交默认开启，否则日志显示 true 但实际不生效');
+    assert.strictEqual(configLib.loadConfig({ packageRoot: dir, dataPath: dir }).bridgeTools, true, '归一化必须保留 bridgeTools');
     assert.strictEqual(cfg.concurrency, 0, '并发默认必须关闭');
     assert.strictEqual(cfg.defaultEffort, '', '默认不干预思考档位');
     assert.deepStrictEqual(configLib.validatePatch({ defaultEffort: 'HIGH' }, { packageRoot: dir, dataPath: dir }).patch, { defaultEffort: 'high' });
