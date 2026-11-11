@@ -163,6 +163,29 @@ async function main() {
       assert.ok(seen.body.includes('echo hi output'), 'MCP 调用应拿到 PI 的执行结果');
     });
 
+    await check('session created without the bridge is rebuilt when bridging is on', async () => {
+      plan.push({ updates: [text('plain')], result: { stopReason: 'end_turn' } });
+      const plain = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'test', stream: true, messages: [{ role: 'user', content: 'no tools here' }], prompt_cache_key: 'no-bridge-key' }),
+      });
+      await plain.text();
+      const before = serial;
+      plan.push({ updates: [text('with bridge')], result: { stopReason: 'end_turn' } });
+      const bridged = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'test', stream: true,
+          messages: [{ role: 'user', content: 'now with tools' }],
+          tools: [{ type: 'function', function: { name: 'Bash', parameters: { type: 'object', properties: {} } } }],
+          prompt_cache_key: 'no-bridge-key',
+        }),
+      });
+      await bridged.text();
+      assert.ok(serial > before, '桥接开启时必须新建会话，不能复用未挂载 MCP 的会话');
+      assert.ok(calls.filter((c) => c[0] === 'session/close').length >= 1, '旧会话应被关闭');
+    });
+
     await check('cancelled stream preserves partial answer as incomplete',async()=>{plan.push({updates:[text('partial')],result:{stopReason:'cancelled'}});const events=await request('a',true);assert.ok(events.some(e=>e.type==='response.incomplete'));assert.ok(!events.some(e=>e.type==='response.completed'));});
     console.log(`${passed}/${passed} behavioral tests passed`);
   } finally { gateway.close(); }
