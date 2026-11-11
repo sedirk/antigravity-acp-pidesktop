@@ -1,5 +1,15 @@
 # 变更记录
 
+## 2.0.2
+
+- **两个通道都接桥接**：新增 Responses 通道的 `responsesBridged`，运行时工具调用发成
+  `response.output_item.*(type=function_call)`，宿主执行后由 `function_call_output` 回填继续。
+- **默认只走新后端**：分流条件改为 `bridgeTools !== false`；桥接启动失败时返回 502 并提示
+  “如需改用运行时自带工具，请在面板关闭「工具回交」”，不再静默降级到旧通道。
+- 修复：续流事件此前固定写到第一轮的 SSE（Responses 通道下表现为“工具执行完就没下文”）。
+  现在每轮把 `bridge.emit` 指向当前请求的流。
+- 回归：单元 24/24、行为 15/15；另附独立复现 `test/repro-responses-bridge.js`（Responses 闭环）。
+
 ## 2.0.1
 
 - 修复：桥接开启时若复用「创建时未挂载 MCP」的旧会话，运行时会看不到 `pi-bridge` 工具（表现为子代理又调不到）。
