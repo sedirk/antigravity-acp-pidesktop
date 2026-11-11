@@ -644,6 +644,33 @@ async function main() {
     assert.strictEqual(env2.HTTPS_PROXY, undefined, '直连时必须把代理环境变量删干净');
     assert.strictEqual(rt.spawnProxy, '', 'spawnProxy 要跟着清空');
   });
+
+  await suite('runtime/config: 单轮硬上限可以关掉（0 = 不设上限）', async () => {
+    const { AcpRuntime } = require(path.join(root, 'lib/core.js'));
+    const cfgLib = require(path.join(root, 'lib/config.js'));
+    const ctx = { packageRoot: root, dataPath: root };
+    assert.strictEqual(cfgLib.normalize({ promptTimeoutMs: 0 }, ctx).promptTimeoutMs, 0, '0 不能被夹回 1 分钟');
+    assert.strictEqual(cfgLib.normalize({}, ctx).promptTimeoutMs, 0, '默认就是不设上限');
+    assert.strictEqual(cfgLib.normalize({ promptTimeoutMs: 600000 }, ctx).promptTimeoutMs, 600000, '显式设置仍生效');
+    const { patch, errors } = cfgLib.validatePatch({ promptTimeoutMinutes: 0 }, ctx);
+    assert.deepStrictEqual(errors, [], '面板填 0 分钟不该报错');
+    assert.strictEqual(patch.promptTimeoutMs, 0);
+
+    // 关键：timeoutMs=0 必须真的「永不超时」，不能变成 setTimeout(..., 0) 的立刻超时
+    const rt = new AcpRuntime({ getConfig: () => ({ toolPolicy: 'all' }), log: () => {} });
+    rt.child = { stdin: { write: () => {} }, on: () => {}, kill: () => {} };
+    const id = rt.nextId;
+    const waiting = rt.request('session/prompt', {}, 0);
+    await new Promise((r) => setTimeout(r, 60));
+    assert.strictEqual(rt.pending.size, 1, 'timeoutMs=0 不能在几十毫秒后自己超时');
+    rt.handleLine(JSON.stringify({ jsonrpc: '2.0', id, result: { ok: 1 } }));
+    assert.deepStrictEqual(await waiting, { ok: 1 }, '结果要能正常回填');
+    const timed = rt.request('session/prompt', {}, 40);
+    await timed.then(
+      () => { throw new Error('设了上限就该超时'); },
+      (error) => assert.strictEqual(error.code, 'ACP_TIMEOUT'),
+    );
+  });
   const failed = results.filter((r) => !r.ok);
   console.log(`\n结果: ${results.length - failed.length}/${results.length} 通过`);
   if (failed.length > 0) process.exit(1);

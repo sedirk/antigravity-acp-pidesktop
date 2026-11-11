@@ -80,7 +80,7 @@
 | `defaultEffort` | 空 | 请求没带 `reasoning_effort` 时使用的档位（low/medium/high）；空 = 模型默认 medium |
 | `virtualModels` | true | 按档位后缀合并模型 |
 | `exposeVariantModels` | false | 是否同时列出带档位后缀的显式模型 |
-| `promptTimeoutMs` | 600000 | 单轮回答超时 |
+| `promptTimeoutMs` | 0 | 单轮硬上限；**0 = 不设上限**（默认）。长任务靠「无进展」看门狗止损，不再按墙钟砍 |
 | `bin` | 空 | `agy_acp_server.exe` 路径（面板下载后自动写入） |
 | `cwd` | 空 | 留空 = 跟随 PI-Desktop 当前项目目录（建会话时现问，取不到回退用户主目录）；填了就固定用它。它是文件工具的白名单根，不是命令沙箱 |
 | `modelCacheMs` | 300000 | 模型列表缓存时长 |

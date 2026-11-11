@@ -167,7 +167,8 @@
 
     <div class="field">
       <label for="promptTimeoutMinutes">单次回答超时（分钟）</label>
-      <input id="promptTimeoutMinutes" type="number" min="1" max="60">
+      <input id="promptTimeoutMinutes" type="number" min="0" max="1440">
+      <span class="hint">0 = 不设上限（推荐）。长任务可以一直跑，真正的止损是下面的「无进展判定」。</span>
     </div>
     <div class="field">
       <label for="promptIdleSeconds">无进展判定（秒，默认 180）</label>
