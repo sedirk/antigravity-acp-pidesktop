@@ -14,6 +14,7 @@ const acp = {
   request: async (method, params) => {
     if (method === 'session/new') { mcpUrl = (params.mcpServers || [])[0]?.url || null; log('session/new mcp=', mcpUrl); return { sessionId: 's' + (++serial) }; }
     if (method === 'session/prompt') {
+      acp.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'resp narration' } } } });
       log('prompt -> MCP tools/call');
       const r = await fetch(mcpUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'Bash', arguments: { command: 'echo resp' } } }) });
       const body = await r.text();
@@ -44,6 +45,9 @@ const parse = (t) => t.split('\n').filter((x) => x.startsWith('data: ') && !x.in
   const ev1 = parse(await first.text());
   log('第一轮事件:', ev1.map((e) => e.type).join(','));
   const fc = ev1.find((e) => e.type === 'response.output_item.done' && e.item && e.item.type === 'function_call');
+  const txt1 = ev1.filter((e) => e.type === 'response.output_text.delta').map((e) => e.delta).join('');
+  log('第一轮正文:', JSON.stringify(txt1));
+  if (!txt1.includes('resp narration')) process.exit(6);
   log('function_call:', fc ? fc.item.name + ' ' + fc.item.call_id : 'NONE');
   if (!fc) process.exit(3);
   const second = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
