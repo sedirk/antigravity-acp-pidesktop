@@ -151,17 +151,29 @@ async function main() {
     const acp = new AcpRuntime({ getConfig: () => ({ modelCacheMs: 0, cwd: '.' }), log: () => {} });
     acp.discovery = {
       at: Date.now(),
-      raw: [],
+      raw: [
+        { id: 'gemini-4-carbon-low' }, { id: 'gemini-4-carbon-medium' }, { id: 'gemini-4-carbon-high' },
+        { id: 'solo-model' },
+      ],
       groups: new Map([
         ['gemini-4-carbon', { base: 'gemini-4-carbon', names: ['Gemini 4 Carbon (Medium)'], levels: new Map([['low', 'gemini-4-carbon-low'], ['medium', 'gemini-4-carbon-medium'], ['high', 'gemini-4-carbon-high']]) }],
         ['solo-model', { base: 'solo-model', names: ['Solo'], levels: new Map() }],
       ]),
     };
-    assert.strictEqual(acp.resolveModel('gemini-4-carbon', 'low'), 'gemini-4-carbon-low');
-    assert.strictEqual(acp.resolveModel('gemini-4-carbon', 'high'), 'gemini-4-carbon-high');
-    assert.strictEqual(acp.resolveModel('gemini-4-carbon', undefined), 'gemini-4-carbon-medium');
-    assert.strictEqual(acp.resolveModel('solo-model', 'high'), 'solo-model');
-    assert.strictEqual(acp.resolveModel('gemini-4-carbon-low', 'high'), 'gemini-4-carbon-high');
+    assert.strictEqual(await acp.resolveModel('gemini-4-carbon', 'low'), 'gemini-4-carbon-low');
+    assert.strictEqual(await acp.resolveModel('gemini-4-carbon', 'high'), 'gemini-4-carbon-high');
+    assert.strictEqual(await acp.resolveModel('gemini-4-carbon', undefined), 'gemini-4-carbon-medium');
+    assert.strictEqual(await acp.resolveModel('solo-model', 'high'), 'solo-model');
+    assert.strictEqual(await acp.resolveModel('gemini-4-carbon-low', 'high'), 'gemini-4-carbon-high');
+
+    // 回归：模型发现缓存是空的（运行时重启过 / 预热失败）时，也绝不能把裸虚拟名发给运行时。
+    // 运行时只认带档位后缀的 id：Rejecting model gemini-4-carbon: not available under the active auth method.
+    const blind = new AcpRuntime({ getConfig: () => ({ modelCacheMs: 0, cwd: '.' }), log: () => {} });
+    blind.discovery = { at: 0, raw: [], groups: new Map() };
+    blind.discover = async () => { throw new Error('runtime not ready'); };
+    assert.strictEqual(await blind.resolveModel('gemini-4-carbon', 'high'), 'gemini-4-carbon-high');
+    // 列表已知但没有这个模型：明确报错（附可用列表）。绝不能静默换个模型冒充。
+    await assert.rejects(() => acp.resolveModel('no-such-model', 'high'), /当前不可用/);
     assert.strictEqual(levelOfEffort('xhigh'), 'high');
     assert.strictEqual(levelOfEffort('minimal'), 'low');
   });

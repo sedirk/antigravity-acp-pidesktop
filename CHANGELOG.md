@@ -1,5 +1,22 @@
 # 变更记录
 
+## 2.1.1
+
+- **修复 MODEL_SWITCH_FAILED（`Model 'gemini-4-carbon' is not available for the current authentication method.`）**
+  - 根因：`resolveModel()` 依赖模型发现的缓存分组；预热失败或运行时重启后缓存为空，
+    它就把**裸虚拟名** `gemini-4-carbon` 原样发给了 `session/set_model`。运行时只认带档位后缀的 id，
+    于是每一轮都失败，且看起来像「认证方式不支持这个模型」。
+  - 取证（运行时日志）：`set_model gemini-4-carbon → 拒绝`，`set_model gemini-4-carbon-high → OK`，
+    `set_model gemini-4-carbon-medium → OK`。同一账号、同一认证方式，只是 id 写法不同。
+  - 修复：`resolveModel()` 改成 async，缓存为空时先补一次模型发现；解析结果绝不可能是裸虚拟名
+    （补 `-low/-medium/-high`，缺档位默认 `medium`），列表已知但确实没有该模型时抛 `MODEL_UNAVAILABLE`
+    并附上可用列表，不再静默换模型。
+  - 配套：运行时退出时清空模型发现缓存（进程换了列表可能变）；`discover()` 单飞，
+    缓存为空时的并发请求不会各建一个探测会话。
+  - 真机验证：裸名 + 无 effort → `gemini-4-carbon-medium`；`effort=low` → `gemini-4-carbon-low`；
+    不传 model（默认 `gemini-4-carbon`）→ `gemini-4-carbon-medium`，三例都正常回答。
+- 自测：26 个离线用例 + 18 个 HTTP 行为用例全过（新增「缓存为空也不发裸名」「未知模型必须报错」断言）。
+
 ## 2.1.0
 
 - **跨重启会话恢复**：网关重启（连运行时一起重启）后，同一轮对话用 `session/load` 接回，不再重放整段历史。
