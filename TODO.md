@@ -26,8 +26,13 @@
 - 思考内容：运行时不发 `agent_thought_chunk`（`gateway.log` 里 0 条），已试过三种 `_meta` 形状。
 - 工具之间没有 `agent_message_chunk`：正文断档只能靠可编辑的桥接提示层缓解，不能保证模型照做。
 - Responses 通道只在 `response.completed/incomplete` 上报 usage，因此没有实时 tokens/s（chat 通道才有逐块 usage）。
-
-## 宿主侧（插件改不了）
+- **缓存命中数（宿主里「缓存读取」那一栏）永远是 0，不是 bug**：ACP 的 `usage_update` 只有 `{used, size}`，
+  网关的 usage 里也没有 `prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens`，
+  宿主读不到就显示 0。已核过运行时的 `brain/**/transcript_full.jsonl`：没有 `usageMetadata` /
+  `promptTokenCount` / `cachedContentTokenCount`，所以连「私下去读运行时文件」这条路也走不通。
+  与升级插件、重启软件、暂停时长都无关（否则应该是偶发 0，而不是恒为 0）。
+  附带事实：`prompt_tokens` 取运行时真实的 `context_used`，`completion_tokens` 是文本长度估算，
+  所以宿主里的「输入/输出/合计」本身也是估算值，分项相加会对不上——只能当粗略参考。
 
 - 模型能力提示：`/v1/models` 已声明 `modalities` / `capabilities`，PI-Desktop 目前不读；
   宿主以后支持的话，可自动完成图文 / PDF 能力协商。
