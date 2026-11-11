@@ -165,6 +165,46 @@ async function main() {
       assert.ok(seen.body.includes('echo hi output'), 'MCP 调用应拿到 PI 的执行结果');
     });
 
+    await check('bridged: a parked tool call is not treated as a stall', async () => {
+      const prevIdle = config.promptIdleTimeoutMs;
+      const prevCap = config.promptTimeoutMs;
+      config.promptIdleTimeoutMs = 2500;
+      config.promptTimeoutMs = 0; // 关掉墙钟硬上限，单独验证「无进展」判定
+      try {
+        plan.push({
+          updates: [],
+          before: async () => {
+            const url = lastMcpServers?.[0]?.url;
+            assert.ok(url, '需要桥接地址');
+            // 宿主「执行中」：tools/call 一直挂着，不返回结果
+            fetch(url, {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ jsonrpc: '2.0', id: 91, method: 'tools/call', params: { name: 'Bash', arguments: { command: 'sleep 300' } } }),
+            }).catch(() => {});
+            await new Promise((r) => setTimeout(r, 4200));
+          },
+          result: { stopReason: 'end_turn' },
+        });
+        const before = calls.length;
+        const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true,
+            messages: [{ role: 'user', content: 'run a slow tool' }],
+            tools: [{ type: 'function', function: { name: 'Bash', parameters: { type: 'object', properties: { command: { type: 'string' } } } } }],
+            prompt_cache_key: 'parked-key',
+          }),
+        });
+        await res.text();
+        await new Promise((r) => setTimeout(r, 5000));
+        const during = calls.slice(before);
+        assert.equal(during.filter((c) => c[0] === 'session/cancel').length, 0, '等待宿主执行工具时不能发 session/cancel: ' + JSON.stringify(during));
+        assert.equal(during.filter((c) => c[0] === 'session/prompt').length, 1, '同一轮只能发一次 prompt');
+      } finally {
+        config.promptIdleTimeoutMs = prevIdle;
+        config.promptTimeoutMs = prevCap;
+      }
+    });
     await check('session created without the bridge is remounted, not rebuilt, when bridging turns on', async () => {
       plan.push({ updates: [text('plain')], result: { stopReason: 'end_turn' } });
       const plain = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
