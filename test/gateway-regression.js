@@ -47,6 +47,35 @@ async function main() {
     await check('empty tool turn is nudged in the same session, then reported empty',async()=>{plan.push({updates:[tool]},{updates:[tool]},{updates:[tool]});const before=calls.length;const r=await request('a');const prompts=calls.slice(before).filter(c=>c[0]==='session/prompt');assert.equal(r.status,502);assert.equal(r.body.error.code,'EMPTY_RESPONSE');assert.equal(prompts.length,3,'one turn plus two same-session nudges');assert.equal(calls.slice(before).filter(c=>c[0]==='session/new').length,0,'must not switch session');assert.equal(calls.slice(before).filter(c=>c[0]==='session/close').length,0,'must not close the session');assert.ok(prompts.slice(1).every(p=>JSON.stringify(p[1].prompt).includes('没有输出正文')),'nudge text sent in same session');});
     await check('nudge recovers a final answer without replaying tools',async()=>{plan.push({updates:[tool]},{updates:[text('recovered answer'),usage]});const before=calls.length;const r=await request('a');assert.equal(r.status,200);assert.equal(r.body.output[0].content[0].text,'recovered answer');assert.equal(calls.slice(before).filter(c=>c[0]==='session/prompt').length,2);assert.equal(calls.slice(before).filter(c=>c[0]==='session/new').length,0);});
     await check('stream delta and final reasoning agree; output indexes agree',async()=>{plan.push({updates:[text('before'),tool,text('after'),usage]});const events=await request('a',true);const final=events.find(e=>e.type==='response.completed').response;const reasoning=events.filter(e=>e.type==='response.reasoning_summary_text.delta').map(e=>e.delta).join('');assert.equal(final.output[1].summary[0].text,reasoning);for(const e of events.filter(e=>e.type==='response.output_item.added'))assert.equal(final.output[e.output_index].id,e.item.id);assert.equal(final.output[0].content[0].text,'before\n\nafter');});
+    await check('tool progress reports each call once and stays short',async()=>{
+      const long='[Codex] • 运行命令: utf8 = [System.Text.Encoding]::UTF8; Console::OutputEncoding = $utf8; Get-ChildItem -Recurse';
+      plan.push({updates:[
+        {sessionUpdate:'tool_call',toolCallId:'c1',kind:'execute',title:long,status:'pending'},
+        {sessionUpdate:'tool_call_update',toolCallId:'c1',kind:'execute',title:long+' more',status:'completed'},
+        {sessionUpdate:'tool_call',toolCallId:'c2',kind:'read',title:'view_file step-01.txt',status:'pending'},
+        {sessionUpdate:'tool_call_update',toolCallId:'c2',kind:'read',status:'failed'},
+        text('done')]});
+      const events=await request('a',true);
+      const lines=events.filter(e=>e.type==='response.reasoning_summary_text.delta').map(e=>e.delta).join('');
+      assert.ok(!lines.includes('[Codex]'),`prefix stripped: ${JSON.stringify(lines)}`);
+      const rows=lines.split('\n').filter(Boolean);
+      assert.equal(rows.length,3,'one line per call plus one failure line');
+      assert.ok(rows[0].startsWith('· 运行命令：utf8 = [System.Text.Encoding]::UTF8'),rows[0]);
+      assert.ok(rows[0].endsWith('…'),'long command truncated');
+      assert.equal(rows[1],'· 读文件：view_file step-01.txt');
+      assert.equal(rows[2],'✖ 失败：读文件');
+    });
+    await check('repeated identical actions collapse into one line plus a count',async()=>{
+      const same={sessionUpdate:'tool_call',toolCallId:'r1',kind:'execute',title:'运行命令: Get-Content a.txt'};
+      plan.push({updates:[same,{...same,toolCallId:'r2'},{...same,toolCallId:'r3'},{...same,toolCallId:'r4'},
+        {sessionUpdate:'tool_call',toolCallId:'r5',kind:'read',title:'view_file b.txt'},text('ok')]});
+      const events=await request('a',true);
+      const lines=events.filter(e=>e.type==='response.reasoning_summary_text.delta').map(e=>e.delta).join('');
+      assert.equal(lines,'· 运行命令：Get-Content a.txt\n  ↳ 上一步重复 3 次\n· 读文件：view_file b.txt\n');
+    });
+
+
+
     await check('Chat streaming publishes usage before finish',async()=>{
       plan.push({updates:[usage,text('live')]});
       const r=await fetch(`http://127.0.0.1:${port}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'test',messages:[{role:'user',content:'test'}],stream:true})});
