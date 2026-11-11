@@ -257,15 +257,32 @@ async function main() {
     assert.strictEqual(configLib.loadConfig({ packageRoot: root, dataPath: fs.mkdtempSync(path.join(os.tmpdir(), 'agy-policy2-')) }).toolPolicy, 'all', '默认不设防：本插件不再当第三道防火墙');
   });
 
-  await suite('session: 单轮对话不能撞到同一个会话 key', async () => {
+  await suite('session: 会话键跨轮稳定（否则每轮都退化成新会话）', async () => {
     const { keyFor } = require(path.join(root, 'lib/server.js'));
-    const a = [{ role: 'user', content: '甲' }];
-    const b = [{ role: 'user', content: '乙' }];
-    assert.notStrictEqual(keyFor('m', a), keyFor('m', b), '单轮不同内容必须不同 key');
-    assert.strictEqual(keyFor('m', a), keyFor('m', a));
-    const turn2 = [...a, { role: 'assistant', content: '好' }, { role: 'user', content: '继续' }];
-    assert.strictEqual(keyFor('m', turn2), keyFor('m', turn2));
+    const a = [{ role: 'system', content: '你是助手' }, { role: 'user', content: '甲' }];
+    const b = [{ role: 'system', content: '你是助手' }, { role: 'user', content: '乙' }];
+    assert.notStrictEqual(keyFor('m', a), keyFor('m', b), '不同开场白不能撞进同一个会话');
+    const turn2 = [...a, { role: 'assistant', content: '收到' }, { role: 'user', content: '继续' }];
+    const turn3 = [...turn2, { role: 'assistant', content: '好' }, { role: 'user', content: '再继续' }];
+    assert.strictEqual(keyFor('m', a), keyFor('m', turn2), '同一对话第 2 轮必须命中第 1 轮的 key');
+    assert.strictEqual(keyFor('m', a), keyFor('m', turn3), '同一对话第 3 轮同样命中');
     assert.notStrictEqual(keyFor('m', turn2), keyFor('n', turn2), '换模型必须换 key');
+    // 宿主给了会话标识时以宿主为准（同一标识、不同内容也视为同一会话）
+    assert.strictEqual(
+      keyFor('m', a, { prompt_cache_key: 'conv-1' }),
+      keyFor('m', b, { prompt_cache_key: 'conv-1' }),
+      'prompt_cache_key 优先',
+    );
+    assert.notStrictEqual(
+      keyFor('m', a, { prompt_cache_key: 'conv-1' }),
+      keyFor('m', a, { prompt_cache_key: 'conv-2' }),
+      '不同会话标识必须分开',
+    );
+    assert.strictEqual(
+      keyFor('m', a, { metadata: { conversation_id: 'x' } }),
+      keyFor('m', b, { metadata: { conversation_id: 'x' } }),
+      'metadata.conversation_id 同样生效',
+    );
   });
 
   await suite('config: 会话空闲回收与断开即停的默认值', async () => {

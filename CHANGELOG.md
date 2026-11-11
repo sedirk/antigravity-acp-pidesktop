@@ -1,5 +1,29 @@
 # 变更记录
 
+## 1.5.0
+
+把「说到一半断掉」「每轮都从零重来」「段落粘连」的四个真凶一并修掉（不是再加心跳）：
+
+- **会话键不再随轮次变化**：旧实现哈希 `messages.slice(0,-1)`，第 1 轮存 `hash([S])`、第 2 轮算
+  `hash([S,U1,A1])` 必然不命中，于是**每轮都新建 ACP 会话**——实测日志里全是「新会话 · 首帧 7–11 秒」，
+  还要把整段历史重新压平重发。现在优先用宿主给的 `prompt_cache_key` / `conversation_id` /
+  `metadata.conversation_id`，否则用「系统提示 + 首条 user 消息」这种跨轮不变的标识。第 2 轮起命中
+  `session/resume`，实测省掉每轮 7–11 秒预热
+- **轮内步数上限自动续跑**：运行时的单次 `session/prompt` 到第 10 个工具调用就返回
+  `stopReason: max_turn_requests`，旧代码直接 `response.completed` 关流——这就是「话说到一半没了」。
+  现在识别 `max_turn_requests` / `max_tokens`，在同一条会话里自动续跑（最多 4 次，每次只发「继续」），
+  增量照常流给客户端；仍然到顶才按未完成收尾并在日志标注
+- **段落不再粘连**：工具调用前后的两段播报属于不同发言段，现在补 `\n\n` 分隔（`/v1/responses` 与
+  `chat` 两条路径同一套逻辑）
+- **活动看门狗取代固定总超时**：判据从「整轮最多 10 分钟」改成「120 秒完全没有进展」（可配
+  `promptIdleTimeoutMs`）。持续有工具进展的长任务不会再被整轮超时误杀；真卡死时发 `session/cancel` 而不是干等
+- **`http.Server` 显式放宽超时**：Node 默认 `requestTimeout = 300 s`，带工具的一轮轻松超过 5 分钟，
+  默认值会在第 300 秒把长连接掐掉（客户端表现为断流）。现在 `requestTimeout = 0`、`headersTimeout` /
+  `keepAliveTimeout` 各 120 s
+- **模型探测不再泄漏 worker**：`discover()` 每 5 分钟 `session/new` 一次却从不 `session/close`，后台
+  worker 会一直堆积；现在探测完立即关闭
+- 自测 20/20（新增跨轮会话键、宿主会话标识优先、会话标识隔离三组断言）
+
 ## 1.4.2
 
 把两个端点里重复的 SSE 样板合成一个 `openSse(res)`（行为不变）：
