@@ -1,5 +1,15 @@
 # 变更记录
 
+## 1.4.2
+
+把两个端点里重复的 SSE 样板合成一个 `openSse(res)`（行为不变）：
+
+- 之前 `chat` 与 `responses` 各写了一遍 `writeHead` / `setNoDelay` / 心跳定时器 / 关闭清理 / 中断统计，
+  约 40 行几乎相同；现在只有 `openSse()` 一处，端点只关心「发正文 / 发事件 / 发注释 / 收尾」
+- 结构与参考实现 `dsh-antigravity-acp` 的 `#sseOpen` 对齐（那是最小可用形态：写头 → `: open` → 定时 ping → 关闭清理）
+- 顺带把心跳、`socket.setTimeout(0)`、`sequence_number` 自增、帧数统计集中到一处，避免两个端点行为漂移
+- 自测 20/20；三组流式实测（冷启动首字节 / 带命令心跳 / responses 事件序列）复跑通过
+
 ## 1.4.1
 
 心跳加密 + 断开现场可诊断：
