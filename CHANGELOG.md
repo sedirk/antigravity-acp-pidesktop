@@ -1,5 +1,19 @@
 # 变更记录
 
+## 1.5.1
+
+上下文百分比不再恒为 2%：
+
+- PI-Desktop 的上下文标签读的是 `/v1/responses` 里 `response.usage.input_tokens`
+  （宿主源码 `openai-responses-shared-*.js` 的 `finalizeResponse`）。旧实现把「本轮发给运行时的文本」
+  估算成 `input_tokens`——会话复用后那只是一句增量（甚至就是「继续」），所以标签恒定停在 1–2%
+- 现在只要运行时上报了 `usage_update.used`（真实累计上下文），就直接拿它当 `input_tokens`，
+  `estimated` 相应变为 `false`；拿不到真实值才退回字符估算
+- 实测（同一会话两轮）：`input_tokens 11,255 → 11,465`，与日志里的 `上下文占用` 完全一致且逐轮增长
+
+顺带说明：这不是 Responses 协议的问题；Responses 路径只是让「截断」更安静（旧错误帧是 chat 端点格式，
+Responses 客户端只认 `response.failed` / `response.completed`），1.5.0 起已按 Responses 语义收尾。
+
 ## 1.5.0
 
 把「说到一半断掉」「每轮都从零重来」「段落粘连」的四个真凶一并修掉（不是再加心跳）：
