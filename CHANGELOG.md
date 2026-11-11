@@ -1,5 +1,21 @@
 # 变更记录
 
+## 1.7.0
+
+模型不再需要手工「添加 AI 服务」：插件用 manifest 的 `contributes.providers` 直接提供 provider。
+
+- 服务行由插件持有（宿主设计如此：地址与模型只读，唯一可改是 API Key），
+  但**可调项在对话层**——推理档位跟随模型声明的 `thinkingLevels`。
+- 逐模型声明 `contextWindow 1048576`、`maxTokens 131072`、图片/文档能力、
+  `supportsReasoningEffort`、`thinkingLevels: low/medium/high`、默认 `medium`。
+  这正是旧版「什么都调不了」缺的东西。
+- 走 `chat_completions`：宿主的 Responses 解析器只在终止事件读 usage，
+  chat 通道才能让上下文用量随流更新。
+- 网关默认端口 41910：改端口会让这条声明失效，需同时改 manifest（已在文档注明）。
+
+实测：同形状探针插件在 0.22.0 上成功出现在模型选择器，推理档可选 omit/low/medium/high，
+上下文显示 1.05M。回归测试新增 manifest 元数据断言。
+
 ## 1.6.0
 
 生态融合第一批（详见 FUSION.md，来源均为 MIT 公开项目）：

@@ -69,3 +69,16 @@
 
 以上仅借鉴公开文档与源码中的**缺陷描述与算法思路**；本仓库实现为独立重写。
 若后续直接内嵌其代码，将按其许可证保留版权与许可声明，并在 `THIRD_PARTY_NOTICES.md` 记录。
+
+## 五、provider 声明路径（1.7.0 采纳）
+
+调研结论（0.22.0 实测 + 宿主 i18n 源码）：
+
+- `contributes.agentExtensions` 里 `registerProvider` 能登记，但模型不会进入模型选择器（本版未接通）。
+- `contributes.providers` 会生成**插件持有**的服务行：`pluginProviderManaged` 文案明确
+  「接口地址和模型均由该插件提供」，因此**服务行只读**，唯一可改项是 API Key。
+- 可调项因此落在**对话层**：`thinkingLevels` 驱动 composer 的推理档，逐条消息生效。
+  这正是 1.6.0 及更早「参数全都调不了」的成因——不是缺字段，而是位置不对。
+
+采纳方案：manifest 声明 provider（3 个虚拟模型）+ chat_completions + 完整元数据；
+网关把 `reasoning_effort` 映射到 ACP 的 `-low/-medium/-high` 模型档位。

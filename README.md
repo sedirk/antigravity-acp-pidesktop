@@ -1,5 +1,7 @@
 # Antigravity ACP · PI-Desktop 插件
 
+> **1.7.0**：插件通过 `contributes.providers` 直接提供模型（无需手工添加自定义端点）；推理档位在对话里可调。见 [FUSION.md](FUSION.md)。
+
 > **1.6.0 修复说明**：已删除错误的自动换会话重跑；流式占用显示、计量和剩余限制见 [审计记录](AUDIT-STREAMING.md)、生态融合记录见 [FUSION.md](FUSION.md)。旧版关于运行时步数限制的推断不作为事实。
 
 把 Google 官方的 **Antigravity ACP 运行时**（`agy_acp_server.exe`）包装成 OpenAI 兼容的本地网关，
