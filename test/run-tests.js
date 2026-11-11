@@ -532,6 +532,48 @@ async function main() {
     }
   });
 
+  await suite('session-store: 足迹落盘、过期剔除、重启后重新列出', async () => {
+    const { createSessionStore, MAX_AGE_MS } = require(path.join(root, 'lib/session-store.js'));
+    const dir = tempDir('sessions');
+    const file = path.join(dir, 'sessions.json');
+    const store = createSessionStore({ file });
+    assert.strictEqual(store.load(), 0, '没有文件时载入 0 条');
+    store.set('k1', { sessionId: 'sess-1', model: 'gemini-4-carbon', bridgeUrl: 'http://127.0.0.1:1/mcp' });
+    store.set('k2', { sessionId: 'sess-2' });
+    store.flush();
+    assert.ok(fs.existsSync(file), 'flush 必须真的写盘');
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.strictEqual(raw.version, 1);
+    assert.strictEqual(raw.sessions.length, 2);
+    assert.strictEqual(raw.sessions.find((s) => s.key === 'k1').sessionId, 'sess-1');
+
+    // 「重启」：新建一个 store 读同一份文件
+    const reopened = createSessionStore({ file });
+    assert.strictEqual(reopened.load(), 2);
+    assert.strictEqual(reopened.get('k1').bridgeUrl, 'http://127.0.0.1:1/mcp');
+    reopened.remove('k2');
+    reopened.flush();
+    assert.strictEqual(createSessionStore({ file }).load(), 1, '删除要落盘');
+
+    // 过期足迹必须被剔除，否则重启后会拿早就没了的 sessionId 去 load
+    fs.writeFileSync(file, JSON.stringify({
+      version: 1,
+      sessions: [{ key: 'old', sessionId: 's', model: '', bridgeUrl: '', touched: Date.now() - MAX_AGE_MS - 1000 }],
+    }), 'utf8');
+    assert.strictEqual(createSessionStore({ file }).load(), 0, '超过一天没动的足迹直接丢');
+  });
+
+  await suite('session-store: 损坏文件不抛异常', async () => {
+    const { createSessionStore } = require(path.join(root, 'lib/session-store.js'));
+    const dir = tempDir('sessions-bad');
+    const file = path.join(dir, 'sessions.json');
+    fs.writeFileSync(file, '{ 这不是 JSON', 'utf8');
+    const logs = [];
+    const store = createSessionStore({ file, log: (m) => logs.push(m) });
+    assert.strictEqual(store.load(), 0);
+    assert.ok(logs.some((l) => l.includes('读取失败')), '要留下日志但不能崩');
+    assert.strictEqual(store.size(), 0);
+  });
   const failed = results.filter((r) => !r.ok);
   console.log(`\n结果: ${results.length - failed.length}/${results.length} 通过`);
   if (failed.length > 0) process.exit(1);

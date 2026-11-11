@@ -24,6 +24,8 @@ async function main() {
   };
   const config = { bind:'127.0.0.1', port:0, defaultModel:'test', toolPolicy:'all', maxSessions:20, promptTimeoutMs:2000, promptIdleTimeoutMs:2000, bridgeTools:true,
     source:path.join(process.env.PI_SCRATCH_DIR || process.cwd(),'gateway-regression-data','config.json') };
+  // 每轮测试从干净的会话足迹开始：否则上一轮留下的 sessions.json 会让首个请求走 session/load。
+  try { fs.rmSync(path.join(path.dirname(config.source), 'sessions.json'), { force: true }); } catch { /* ignore */ }
   const gateway = createGateway({ acp, limiter: { run: f => f(), stats: () => ({}) }, getConfig: () => config, log:x=>logs.push(x) });
   // Find a free port without relying on gateway's port=0 reporting.
   const net = require('node:net');
@@ -187,6 +189,155 @@ async function main() {
     });
 
     await check('cancelled stream preserves partial answer as incomplete',async()=>{plan.push({updates:[text('partial')],result:{stopReason:'cancelled'}});const events=await request('a',true);assert.ok(events.some(e=>e.type==='response.incomplete'));assert.ok(!events.some(e=>e.type==='response.completed'));});
+
+    // 重启还原：网关自己把「键 → sessionId」落盘，重启后先试 session/load；
+    // 成功则只发本轮增量，绝不重放历史（重放会让运行时再吃一遍上下文）。
+    await check('restart restores the same session through session/load', async () => {
+      const dataDir = path.dirname(config.source);
+      try { fs.rmSync(path.join(dataDir, 'sessions.json'), { force: true }); } catch { /* ignore */ }
+
+      plan.push({ updates: [text('before restart')], result: { stopReason: 'end_turn' } });
+      const first = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'restart-key', messages: [{ role: 'user', content: 'before restart' }] }),
+      });
+      await first.text();
+      assert.equal(calls.filter((c) => c[0] === 'session/new').length > 0, true);
+
+      // 关掉第一个实例：close() 会把足迹立刻落盘，等价于真实重启。
+      gateway.close();
+      await new Promise((r) => setTimeout(r, 50));
+      assert.ok(fs.existsSync(path.join(dataDir, 'sessions.json')), '重启前必须留下会话足迹');
+
+      const calls2 = [];
+      let serial2 = 0;
+      const plan2 = [];
+      const acp2 = {
+        policyBySession: new Map(),
+        start: async () => {},
+        discover: async () => {},
+        resolveModel: (m) => m,
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        status: () => ({ ready: true }),
+        notify: () => {},
+        request: async (method, params) => {
+          calls2.push([method, params]);
+          if (method === 'session/new') return { sessionId: `n${++serial2}` };
+          if (method === 'session/prompt') {
+            const current = plan2.shift();
+            for (const update of (current && current.updates) || []) {
+              acp2.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update } });
+            }
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const gateway2 = createGateway({ acp: acp2, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => config, log: () => {} });
+      try {
+        await gateway2.listen([port]);
+        plan2.push({ updates: [text('after restart')] });
+        const second = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'restart-key',
+            messages: [
+              { role: 'system', content: 'HISTORY-MARKER-不得重放' },
+              { role: 'user', content: 'before restart' },
+              { role: 'assistant', content: 'before restart' },
+              { role: 'user', content: 'second question' },
+            ],
+          }),
+        });
+        await second.text();
+        assert.equal(calls2.filter((c) => c[0] === 'session/load').length, 1, '重启后应 session/load 一次');
+        assert.equal(calls2.filter((c) => c[0] === 'session/new').length, 0, 'load 成功就不该新建会话');
+        const loadCall = calls2.find((c) => c[0] === 'session/load');
+        assert.equal(loadCall[1].sessionId.startsWith('s'), true, 'load 用重启前那个 sessionId');
+        const sent = JSON.stringify(calls2.find((c) => c[0] === 'session/prompt')[1].prompt);
+        assert.ok(!sent.includes('HISTORY-MARKER'), `load 之后不能重放历史：${sent.slice(0, 120)}`);
+        assert.ok(sent.includes('second question'), '只发本轮增量');
+      } finally {
+        gateway2.close();
+      }
+    });
+
+    await check('session/load failure falls back to a new session', async () => {
+      const dataDir = path.dirname(config.source);
+      // 宿主给了会话键时 keyFor 不依赖历史内容，直接算出真实键，伪造一条「重启前的足迹」。
+      const { keyFor } = require(process.env.AGY_SERVER || '../lib/server.js');
+      const staleKey = keyFor('test', [], { prompt_cache_key: 'stale-key' });
+      fs.mkdirSync(dataDir, { recursive: true });
+      fs.writeFileSync(path.join(dataDir, 'sessions.json'), JSON.stringify({
+        version: 1,
+        sessions: [{ key: staleKey, sessionId: 'stale-session', model: 'test', bridgeUrl: '', touched: Date.now() }],
+      }), 'utf8');
+      const calls3 = [];
+      const acp3 = {
+        policyBySession: new Map(), start: async () => {}, notify: () => {}, discover: async () => {}, resolveModel: (m) => m,
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        status: () => ({ ready: true }),
+        request: async (method, params) => {
+          calls3.push([method, params]);
+          if (method === 'session/load') throw new Error('unknown session');
+          if (method === 'session/new') return { sessionId: 'fresh-session' };
+          if (method === 'session/prompt') {
+            acp3.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'recovered' } } } });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const gateway3 = createGateway({ acp: acp3, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => config, log: () => {} });
+      try {
+        await gateway3.listen([port]);
+        const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'stale-key', messages: [{ role: 'user', content: 'hello' }] }),
+        });
+        const raw = await res.text();
+        assert.ok(raw.includes('recovered'), raw.slice(0, 200));
+        assert.equal(calls3.filter((c) => c[0] === 'session/new').length, 1, 'load 失败必须回落到新建');
+      } finally {
+        gateway3.close();
+      }
+    });
+
+
+    // 运行时被外部杀掉 / 崩溃后，旧实现会一直返 502「ACP 运行时未启动」直到用户重启网关。
+    // 现在下一轮就该自己拉起运行时并正常回答。
+    await check('crashed runtime is relaunched on the next turn', async () => {
+      const state = { running: true, starts: 0 };
+      const acp4 = {
+        policyBySession: new Map(), notify: () => {},
+        discover: async () => {}, resolveModel: (m) => m,
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        start: async () => { state.starts += 1; state.running = true; },
+        status: () => ({ running: state.running }),
+        request: async (method, params) => {
+          if (method === 'session/new') return { sessionId: 'revived' };
+          if (method === 'session/prompt') {
+            acp4.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'alive again' } } } });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const gateway4 = createGateway({ acp: acp4, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => config, log: () => {} });
+      try {
+        await gateway4.listen([port]);
+        state.running = false; // 运行时被杀
+        const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'crash-key', messages: [{ role: 'user', content: 'still there?' }] }),
+        });
+        const raw = await res.text();
+        assert.ok(raw.includes('alive again'), raw.slice(0, 200));
+        assert.equal(state.starts, 1, '应该按需重新拉起一次运行时');
+      } finally {
+        gateway4.close();
+      }
+    });
     console.log(`${passed}/${passed} behavioral tests passed`);
   } finally { gateway.close(); }
 }

@@ -1,5 +1,25 @@
 # 变更记录
 
+## 2.1.0
+
+- **跨重启会话恢复**：网关重启（连运行时一起重启）后，同一轮对话用 `session/load` 接回，不再重放整段历史。
+  - 依据：运行时 `initialize` 明确回了 `agentCapabilities { loadSession: true, sessionCapabilities: { list, resume } }`。
+  - 实现：`lib/session-store.js` 只存「对话键 → sessionId」（不含任何对话内容），落盘到数据目录的 `sessions.json`，
+    一天没动过的足迹自动丢弃；`session/load` 带上 `cwd` 与 `mcpServers`，所以工具桥照样挂得上。
+  - 失败回落：`session/load` 报错就删掉足迹、用 `session/new` 重建（原有逻辑不变）。
+  - `load` 会把历史以 `session/update` 重放回来，网关临时挂空 handler 吞掉，避免重放内容混进本轮正文。
+  - 实测（真运行时 1.3.0）：第一轮让它记暗号 → 关网关 + 杀掉运行时 → 新网关第二轮日志
+    `已载入 1 条会话足迹` → `已用 session/load 还原会话 0388ef48…` → 模型答出 `PINEAPPLE-7788`。
+- 用量账本多记一个 `model` 字段，方便以后按模型汇总。
+- `TODO.md` 重写为「结论清单」：额度显示写明证据与「明确不做」的原因
+  （只有 `v1internal:retrieveUserQuota` 这类私有接口能拿到真额度，不做；估算额度会误导，也不做）。
+- 自测：26 个离线用例 + 17 个 HTTP 行为用例全过（新增 session-store 2 例、
+- 自测：26 个离线用例 + 18 个 HTTP 行为用例全过（新增 session-store 2 例、
+  「重启还原」「load 失败回落新建」「运行时崩溃后按需拉起」3 个行为用例）。
+- **修复：运行时被外部杀掉 / 崩溃后不会自己回来。** 旧实现只在启动时拉起一次，之后每一轮都返
+  `502 ACP 运行时未启动`，必须手动重启网关才恢复（实测日志里连 8 条）。现在每个请求前确认一次
+  `acp.status().running`，不在位就按需重新拉起（`AcpRuntime.start()` 本身单飞 + 幂等）。
+
 ## 2.0.6
 
 - 面板「桥接提示层」**直接铺出内置文案**，可在窗口内原样修改；新增「恢复默认」按钮一键回填。
