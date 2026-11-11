@@ -437,12 +437,23 @@ async function onPanelInvoke(channel, payload) {
       runtimeReady: status.running,
       pid: status.pid,
       models: status.models,
+      workers: status.workers,
       limiter: status.limiter,
       toolPolicy: config.toolPolicy,
       lastRequest: status.lastRequest,
       proxy: resolvedProxy,
       runtime: runtimeStatus(),
     };
+  }
+  if (channel === 'runtime:restart') {
+    if (!gateway) return { ok: false, error: '网关未运行' };
+    try {
+      const result = gateway.restartRuntime('panel');
+      log(`面板请求重启运行时：${JSON.stringify(result)}`);
+      return { ok: true, ...result };
+    } catch (error) {
+      return { ok: false, error: String(error.message).slice(0, 300) };
+    }
   }
   if (channel === 'models:list') {
     if (!acp) return { ok: false, error: '服务未启动' };

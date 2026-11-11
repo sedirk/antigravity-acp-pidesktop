@@ -214,6 +214,7 @@
     <button id="reload" type="button">重新读取</button>
     <button id="status" type="button">查看状态</button>
     <button id="models" type="button">列出模型</button>
+    <button id="restartRuntime" type="button">重启运行时</button>
     <button id="cleanup" type="button">清理运行时</button>
   </div>
 
@@ -308,11 +309,14 @@ const ids = ['port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', '
         '网关 http://127.0.0.1:' + snap.port + '/v1',
         '运行时 ' + (snap.runtimeReady ? '就绪' : '未启动') + (snap.pid ? ' (pid ' + snap.pid + ')' : ''),
         '虚拟模型 ' + snap.models + ' 个',
+        snap.workers && snap.workers.supported
+          ? '运行时 worker ' + snap.workers.count + ' 个 · ' + snap.workers.memMB + ' MB'
+          : '运行时 worker（非 Windows，未统计）',
         '并发 ' + (limit.limit > 0 ? limit.limit + '（进行 ' + limit.active + '，排队 ' + limit.queued + '）' : '不限'),
-      '工具权限 ' + (snap.toolPolicy || 'all'),
-           snap.lastRequest
-             ? '最近一轮 ' + snap.lastRequest.ms + ' ms · 上下文 ' + snap.lastRequest.contextUsed + '/' + snap.lastRequest.contextSize
-             : '还没有请求记录',
+        '工具权限 ' + (snap.toolPolicy || 'all'),
+        snap.lastRequest
+          ? '最近一轮 ' + snap.lastRequest.ms + ' ms · 上下文 ' + snap.lastRequest.contextUsed + '/' + snap.lastRequest.contextSize
+          : '还没有请求记录',
         '代理 ' + (snap.proxy || '直连'),
       ].join('\n'), 'ok');
     } catch (error) { show('查询失败：' + (error && error.message ? error.message : error), 'err'); }
@@ -417,6 +421,19 @@ const ids = ['port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', '
   $('models').addEventListener('click', models);
   $('install').addEventListener('click', install);
   $('cleanup').addEventListener('click', cleanup);
+  $('restartRuntime').addEventListener('click', async () => {
+    const button = $('restartRuntime');
+    if (!window.confirm('重启运行时会结束正在进行的对话，下一次请求会自动拉起。继续？')) return;
+    button.disabled = true;
+    show('正在重启运行时…');
+    try {
+      const result = await call('runtime:restart');
+      if (!result || result.ok !== true) { show('重启失败：' + ((result && result.error) || '未知错误'), 'err'); return; }
+      show('已结束运行时进程' + (result.pid ? '（pid ' + result.pid + '）' : '') + '；下一次请求会自动拉起。\n会话足迹还在，下次发言会先尝试 session/load 接回。', 'ok');
+    } catch (error) {
+      show('重启失败：' + (error && error.message ? error.message : error), 'err');
+    } finally { button.disabled = false; }
+  });
   load();
 })();
 </script>

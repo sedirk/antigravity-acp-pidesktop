@@ -1,5 +1,19 @@
 # 变更记录
 
+## 2.1.5
+
+- **运行时状态可见 + 一键重启**（不做自动重启）：
+  - `/health` 与面板「查看状态」新增 `workers`：运行时派生的 `localharness_external` 数量与总内存
+    （`tasklist` 采样，结果缓存 30 秒，非 Windows 返回 `supported:false`）。
+  - 面板新增「重启运行时」按钮（带确认框）：杀掉整棵运行时进程树并清空会话映射，
+    下一次请求由 `ensureRuntime()` 自动拉起；会话足迹仍在，下次发言会先尝试 `session/load` 接回。
+  - 真机验证：`restartRuntime → {pid:4548, stopped:true}` → 1.5 秒后 `status.pid=null`（进程树确实没了）
+    → 第二轮请求自动拉起新运行时（pid 24712）并正常回答 → `/health` 返回 `workers:{count:5, memMB:612}`。
+- **没有做自动重启**：实测 worker 会随 `session/close` 回收（3 个左右是正常水位），
+  之前观察到的 12 个是连续跑 e2e 造成的尖峰，不是泄漏。自动重启会丢运行时进程内状态、
+  多一次 `session/load`、还要重做模型发现，收益不成立，所以只提供手动开关。
+- 自测：离线 27/27、HTTP 行为 19/19。
+
 ## 2.1.4
 
 - **会话键彻底去掉模型维度**：2.1.3 只是去掉了档位后缀，换**模型**（如 `gemini-4-carbon` → `gemini-3.8-flash`）
