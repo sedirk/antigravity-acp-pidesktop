@@ -307,6 +307,18 @@ async function main() {
     );
   });
 
+  await suite('session: 换思考档位不换会话，改为在同一会话上 set_model', async () => {
+    const { keyFor } = require(path.join(root, 'lib/server.js'));
+    const req = { prompt_cache_key: 'same-chat' };
+    const msgs = [{ role: 'user', content: 'hi' }];
+    // 档位不是对话身份：同一条对话的所有档位必须落到同一个 key
+    const keys = ['gemini-4-carbon-low', 'gemini-4-carbon-medium', 'gemini-4-carbon-high'].map((m) => keyFor(m, msgs, req));
+    assert.strictEqual(new Set(keys).size, 1, `换档位不得换会话键：${keys.join(',')}`);
+    assert.strictEqual(keyFor('gemini-4-carbon', msgs, req), keys[0], '虚拟名与具体档位同键');
+    // 换模型（base 不同）仍然要换会话
+    assert.notStrictEqual(keyFor('gemini-3.8-flash-high', msgs, req), keys[0], '换模型必须换会话');
+  });
+
   await suite('config: 会话空闲回收与断开即停的默认值', async () => {
     const ctx = { packageRoot: root, dataPath: fs.mkdtempSync(path.join(os.tmpdir(), 'agy-idle-')) };
     const cfg = configLib.loadConfig(ctx);

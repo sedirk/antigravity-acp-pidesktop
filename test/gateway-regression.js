@@ -338,6 +338,47 @@ async function main() {
         gateway4.close();
       }
     });
+
+    // 首字迟迟不来时不能再静默：前 3 次按 heartbeatMs 发提示，但**不**推迟无进展判定。
+    await check('silent first token emits progress heartbeats without deferring the stall check', async () => {
+      const slowCfg = { ...config, promptIdleTimeoutMs: 2400 }; // heartbeatMs = max(1000, 2400/6) = 1000
+      let notified = 0;
+      const acp5 = {
+        policyBySession: new Map(), notify: () => { notified += 1; }, discover: async () => {}, resolveModel: (m) => m,
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        start: async () => {}, status: () => ({ running: true }),
+        request: async (method) => {
+          if (method === 'session/new') return { sessionId: 'slow' };
+          if (method === 'session/prompt') return new Promise(() => {}); // 永不出字
+          return {};
+        },
+      };
+      const gateway5 = createGateway({ acp: acp5, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => slowCfg, log: () => {} });
+      const controller = new AbortController();
+      try {
+        await gateway5.listen([port]);
+        const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'slow-key', messages: [{ role: 'user', content: 'slow' }] }),
+          signal: controller.signal,
+        });
+        // 边读边收：心跳在 idleMs 之前就到，无进展判定在 idleMs 处触发
+        const reader = res.body.getReader();
+        let buf = '';
+        const deadline = Date.now() + 3200;
+        while (Date.now() < deadline) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += Buffer.from(value).toString('utf8');
+        }
+        controller.abort();
+        assert.ok(buf.includes('仍在等待模型首个响应'), `应发出等待提示，实际：${buf.slice(0, 400)}`);
+        assert.ok(notified >= 1, '心跳之后仍必须按 idleMs 触发 session/cancel（说明心跳没有推迟判定）');
+      } finally {
+        gateway5.close();
+      }
+    });
     console.log(`${passed}/${passed} behavioral tests passed`);
   } finally { gateway.close(); }
 }
