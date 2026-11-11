@@ -153,6 +153,11 @@
       <select id="bridgeTools"><option value="false">关闭</option><option value="true">开启</option></select>
       <span class="hint">开启后运行时的工具调用会交给 PI-Desktop 执行（原生工具卡片、可调用 Task 子代理）；工具不再由运行时自己跑</span>
     </div>
+    <div class="field wide">
+      <label for="bridgeGuidance">桥接提示层（可改）</label>
+      <textarea id="bridgeGuidance" rows="6" placeholder="留空使用内置文案；可用 {tools} 占位，会被替换成可用的桥接工具名"></textarea>
+      <span class="hint">每次发给运行时的提示会以这段开头；内置文案要求它“先说再做”，工具失败两次要换思路</span>
+    </div>
     <div class="field">
       <label for="clientName">客户端名称（解锁第三方模型）</label>
       <input id="clientName" type="text" maxlength="40" placeholder="留空＝antigravity-acp-pidesktop">
@@ -190,7 +195,7 @@
 (function () {
   const bridge = window.pluginBridge;
 const ids = ['port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', 'idleSessionMinutes', 'bin', 'defaultModel', 'modelCacheMinutes', 'defaultEffort', 'virtualModels',
-      'exposeVariantModels', 'concurrency', 'queueTimeoutMinutes', 'promptTimeoutMinutes', 'promptIdleSeconds', 'clientName', 'bridgeTools', 'cwd'];
+      'exposeVariantModels', 'concurrency', 'queueTimeoutMinutes', 'promptTimeoutMinutes', 'promptIdleSeconds', 'clientName', 'bridgeTools', 'bridgeGuidance', 'cwd'];
   const $ = (id) => document.getElementById(id);
   const msg = $('msg');
 
