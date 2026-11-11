@@ -439,6 +439,32 @@ async function main() {
     assert.strictEqual(fs.existsSync(path.join(dir, 'runtime')), false);
   });
 
+  await suite('transport: agent 请求 id 撞上在途响应 id 时不得误当作结果', async () => {
+    const writes = [];
+    const rt = new AcpRuntime({ getConfig: () => ({ toolPolicy: 'all' }), log: () => {} });
+    rt.child = { pid: 1, stdin: { write: (s) => writes.push(JSON.parse(s)) } };
+    const pending = rt.request('session/prompt', { sessionId: 's1', prompt: [] }, 5000);
+    const promptId = writes[0].id;
+
+    // 运行时自己的请求计数器从 0 开始递增，很容易与客户端 id 相同。
+    rt.handleLine(JSON.stringify({
+      jsonrpc: '2.0', id: promptId, method: 'session/request_permission',
+      params: { sessionId: 's1', toolCall: { kind: 'execute', title: 'run' }, options: [{ optionId: 'allow', kind: 'allow_once' }] },
+    }));
+    const answer = writes.find((w) => w.id === promptId && w.result);
+    assert.ok(answer, '权限请求必须被回答');
+    assert.strictEqual(answer.result.outcome.outcome, 'selected');
+
+    let settled = false;
+    pending.then(() => { settled = true; }, () => { settled = true; });
+    await sleep(20);
+    assert.strictEqual(settled, false, '权限请求不能把在途 prompt 提前结束');
+
+    rt.handleLine(JSON.stringify({ jsonrpc: '2.0', id: promptId, result: { stopReason: 'end_turn' } }));
+    const result = await pending;
+    assert.strictEqual(result.stopReason, 'end_turn');
+  });
+
   const failed = results.filter((r) => !r.ok);
   console.log(`\n结果: ${results.length - failed.length}/${results.length} 通过`);
   if (failed.length > 0) process.exit(1);

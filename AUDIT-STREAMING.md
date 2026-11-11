@@ -35,3 +35,19 @@ ACP used/size is cumulative session occupancy, not measured per-request billing.
 - Empty/missing ACP stop reasons are logged but do not prove a final answer was produced. Raw event ordering and delayed notifications still need runtime investigation.
 
 No installed plugin, credentials, registry, database, provider settings, or unrelated project files were changed.
+
+## Root cause confirmed (1.5.12)
+
+ACP requests from the agent and responses to the client share one id space. The runtime numbers
+`session/request_permission` from 0 upward while the gateway's `session/prompt` typically holds id 4 or 5.
+The old dispatcher matched any message by id, so a permission request with the same id resolved the
+in-flight prompt with `undefined`: the turn ended with zero text and no `stopReason`, and the permission
+request was never answered, leaving the runtime blocked. Raw probe evidence:
+
+- read-only task (no permissions): 12/12 files read, 1593 chars, `stopReason=end_turn`, no late events.
+- write task: permissions 0,1,2,3 answered; the fifth request (id 4 == prompt id 4) collided; turn returned
+  empty and the follow-up prompt hung until timeout.
+
+Fix: only messages without `method` are treated as responses. Empty turns are nudged in the same session
+(twice, 90 s idle cap) instead of replaying in a fresh one. Cancel now gives a 20 s grace, then abandons
+the RPC and discards the unusable session.
