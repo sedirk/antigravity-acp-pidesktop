@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 // Behavioral HTTP tests, no official runtime or network account required.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -266,7 +266,7 @@ async function main() {
       const dataDir = path.dirname(config.source);
       // 宿主给了会话键时 keyFor 不依赖历史内容，直接算出真实键，伪造一条「重启前的足迹」。
       const { keyFor } = require(process.env.AGY_SERVER || '../lib/server.js');
-      const staleKey = keyFor('test', [], { prompt_cache_key: 'stale-key' });
+      const staleKey = keyFor([], { prompt_cache_key: 'stale-key' });
       fs.mkdirSync(dataDir, { recursive: true });
       fs.writeFileSync(path.join(dataDir, 'sessions.json'), JSON.stringify({
         version: 1,

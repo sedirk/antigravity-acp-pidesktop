@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 
 /**
  * 离线自测：node test/run-tests.js
@@ -283,40 +283,38 @@ async function main() {
     const { keyFor } = require(path.join(root, 'lib/server.js'));
     const a = [{ role: 'system', content: '你是助手' }, { role: 'user', content: '甲' }];
     const b = [{ role: 'system', content: '你是助手' }, { role: 'user', content: '乙' }];
-    assert.notStrictEqual(keyFor('m', a), keyFor('m', b), '不同开场白不能撞进同一个会话');
+    assert.notStrictEqual(keyFor(a), keyFor(b), '不同开场白不能撞进同一个会话');
     const turn2 = [...a, { role: 'assistant', content: '收到' }, { role: 'user', content: '继续' }];
     const turn3 = [...turn2, { role: 'assistant', content: '好' }, { role: 'user', content: '再继续' }];
-    assert.strictEqual(keyFor('m', a), keyFor('m', turn2), '同一对话第 2 轮必须命中第 1 轮的 key');
-    assert.strictEqual(keyFor('m', a), keyFor('m', turn3), '同一对话第 3 轮同样命中');
-    assert.notStrictEqual(keyFor('m', turn2), keyFor('n', turn2), '换模型必须换 key');
+    assert.strictEqual(keyFor(a), keyFor(turn2), '同一对话第 2 轮必须命中第 1 轮的 key');
+    assert.strictEqual(keyFor(a), keyFor(turn3), '同一对话第 3 轮同样命中');
+    assert.strictEqual(keyFor(turn2), keyFor(turn2), '同一对话多次计算必须稳定');
     // 宿主给了会话标识时以宿主为准（同一标识、不同内容也视为同一会话）
     assert.strictEqual(
-      keyFor('m', a, { prompt_cache_key: 'conv-1' }),
-      keyFor('m', b, { prompt_cache_key: 'conv-1' }),
+      keyFor(a, { prompt_cache_key: 'conv-1' }),
+      keyFor(b, { prompt_cache_key: 'conv-1' }),
       'prompt_cache_key 优先',
     );
     assert.notStrictEqual(
-      keyFor('m', a, { prompt_cache_key: 'conv-1' }),
-      keyFor('m', a, { prompt_cache_key: 'conv-2' }),
+      keyFor(a, { prompt_cache_key: 'conv-1' }),
+      keyFor(a, { prompt_cache_key: 'conv-2' }),
       '不同会话标识必须分开',
     );
     assert.strictEqual(
-      keyFor('m', a, { metadata: { conversation_id: 'x' } }),
-      keyFor('m', b, { metadata: { conversation_id: 'x' } }),
+      keyFor(a, { metadata: { conversation_id: 'x' } }),
+      keyFor(b, { metadata: { conversation_id: 'x' } }),
       'metadata.conversation_id 同样生效',
     );
   });
 
-  await suite('session: 换思考档位不换会话，改为在同一会话上 set_model', async () => {
+  await suite('session: 会话键不含模型（换档位/换模型都不换会话）', async () => {
     const { keyFor } = require(path.join(root, 'lib/server.js'));
     const req = { prompt_cache_key: 'same-chat' };
     const msgs = [{ role: 'user', content: 'hi' }];
-    // 档位不是对话身份：同一条对话的所有档位必须落到同一个 key
-    const keys = ['gemini-4-carbon-low', 'gemini-4-carbon-medium', 'gemini-4-carbon-high'].map((m) => keyFor(m, msgs, req));
-    assert.strictEqual(new Set(keys).size, 1, `换档位不得换会话键：${keys.join(',')}`);
-    assert.strictEqual(keyFor('gemini-4-carbon', msgs, req), keys[0], '虚拟名与具体档位同键');
-    // 换模型（base 不同）仍然要换会话
-    assert.notStrictEqual(keyFor('gemini-3.8-flash-high', msgs, req), keys[0], '换模型必须换会话');
+    // 签名里已经没有模型参数（req 带默认值，所以 length === 1）：模型/档位不再参与会话身份
+    assert.strictEqual(keyFor.length, 1, 'keyFor 不得再接收模型');
+    assert.strictEqual(keyFor(msgs, req), keyFor(msgs, req), '同一对话稳定');
+    assert.notStrictEqual(keyFor(msgs, { prompt_cache_key: 'other-chat' }), keyFor(msgs, req), '不同对话仍然分开');
   });
 
   await suite('config: 会话空闲回收与断开即停的默认值', async () => {
