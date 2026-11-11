@@ -1,5 +1,20 @@
 # 变更记录
 
+## 1.5.2
+
+「第 10 分钟整轮被砍」与「Concurrent receive_steps」两处硬伤：
+
+- **硬上限 10 分钟 → 60 分钟**：`promptTimeoutMs` 默认从 600000 改成 3600000。日志实锤：
+  `02:08:16 新会话` → `02:18:16 流式中断（已保留 1185 字）：ACP session/prompt 超时（600000ms）`，
+  正好 600 秒。活动看门狗没触发是对的（gemini 一直在报工具进展），真正砍掉它的是这个固定上限
+- **新增「无进展判定」**：`promptIdleTimeoutMs` 默认 180 秒，面板可调（「无进展判定（秒）」）。
+  只要运行时还在报 `session/update` 就永不触发；真卡死才 `session/cancel`
+- **prompt 串行化**：运行时同一连接不支持并发 `receive_steps()`，宿主上一轮未收尾又发一轮就会报
+  `Concurrent receive_steps() calls are not supported on this connection`。现在后来的 prompt 排队
+  （日志会写「另一轮 prompt 尚未结束，本轮排队」），不再并行打到同一连接
+- 撞到硬上限时先发 `session/cancel` 再结束本轮，避免把「还在跑的那一轮」留给下一次请求踩
+- 面板「单次回答超时」上限从 60 分钟放宽到 120 分钟，并新增「无进展判定（秒）」输入
+
 ## 1.5.1
 
 上下文百分比不再恒为 2%：

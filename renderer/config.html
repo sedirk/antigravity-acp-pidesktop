@@ -143,6 +143,10 @@
     <div class="field">
       <label for="promptTimeoutMinutes">单次回答超时（分钟）</label>
       <input id="promptTimeoutMinutes" type="number" min="1" max="60">
+    <div class="field">
+      <label for="promptIdleSeconds">无进展判定（秒，默认 180）</label>
+      <input id="promptIdleSeconds" type="number" min="30" max="3600">
+      <span class="hint">连续这么久收不到任何进展才取消本轮；只要运行时还在报工具进展就不会被砍（长任务的真正保护）</span>
     </div>
     <div class="field">
       <label for="idleSessionMinutes">会话空闲回收（分钟）</label>
@@ -175,8 +179,8 @@
 <script>
 (function () {
   const bridge = window.pluginBridge;
-  const ids = ['port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', 'idleSessionMinutes', 'bin', 'defaultModel', 'modelCacheMinutes', 'defaultEffort', 'virtualModels',
-    'exposeVariantModels', 'concurrency', 'queueTimeoutMinutes', 'promptTimeoutMinutes', 'cwd'];
+const ids = ['port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', 'idleSessionMinutes', 'bin', 'defaultModel', 'modelCacheMinutes', 'defaultEffort', 'virtualModels',
+      'exposeVariantModels', 'concurrency', 'queueTimeoutMinutes', 'promptTimeoutMinutes', 'promptIdleSeconds', 'cwd'];
   const $ = (id) => document.getElementById(id);
   const msg = $('msg');
 
