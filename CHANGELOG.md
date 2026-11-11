@@ -1,5 +1,19 @@
 # 变更记录
 
+## 1.6.0
+
+生态融合第一批（详见 FUSION.md，来源均为 MIT 公开项目）：
+
+- **解锁第三方模型**：新增 `clientName` 配置，透传到 ACP `initialize.clientInfo.name`。
+  上游 1.3.0 只在该名字为 Zed / Xcode / JetBrains 时提供 Claude 与 GPT-OSS。
+  实测同一运行时：默认名 9 个模型；填 `Zed` 后 12 个，新增 `claude-sonnet-4-6`、
+  `claude-opus-4-6-thinking`、`gpt-oss-120b-medium`。面板可填，留空保持原名。
+- **后台子任务不再被误杀**：上游把 `invoke_subagent` / `schedule` 放到后台执行时不发任何 stdout，
+  旧版看门狗会把合法长任务当卡死并取消。现在识别这类工具，运行期间不发 `session/cancel`，
+  改为周期性输出"后台子任务仍在运行"，并保留 30 分钟硬上限兜底。
+
+验证：21/21 单元/集成、13/13 HTTP/SSE 行为测试（新增后台子任务用例）；模型解锁已用只读探针对比确认。
+
 ## 1.5.13
 
 「思考」栏里的工具进度不再是一墙重复命令：

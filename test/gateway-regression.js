@@ -22,7 +22,7 @@ async function main() {
       return {};
     },
   };
-  const config = { bind:'127.0.0.1', port:0, defaultModel:'test', toolPolicy:'all', maxSessions:20, promptTimeoutMs:2000,
+  const config = { bind:'127.0.0.1', port:0, defaultModel:'test', toolPolicy:'all', maxSessions:20, promptTimeoutMs:2000, promptIdleTimeoutMs:2000,
     source:path.join(process.env.PI_SCRATCH_DIR || process.cwd(),'gateway-regression-data','config.json') };
   const gateway = createGateway({ acp, limiter: { run: f => f(), stats: () => ({}) }, getConfig: () => config, log:x=>logs.push(x) });
   // Find a free port without relying on gateway's port=0 reporting.
@@ -94,6 +94,20 @@ async function main() {
       release(); await active; await new Promise(r=>setTimeout(r,40));
       assert.equal(calls.filter(c=>c[0]==='session/prompt').length,before);
     });
+    await check('background subagent is not cancelled by the idle watchdog',async()=>{
+      plan.push({updates:[{sessionUpdate:'tool_call',toolCallId:'bg1',kind:'other',title:'invoke_subagent research'}],
+        before:async()=>{ await new Promise(r=>setTimeout(r,2600)); },
+        result:{stopReason:'end_turn'}});
+      plan.push({updates:[text('subagent done')]});
+      const before=calls.length;
+      const events=await request('a',true);
+      assert.equal(calls.slice(before).filter(c=>c[0]==='session/cancel').length,0,'must not cancel while a subagent runs');
+      const notes=events.filter(e=>e.type==='response.reasoning_summary_text.delta').map(e=>e.delta).join('');
+      assert.ok(notes.includes('后台子任务仍在运行'),'emits background heartbeat: '+notes);
+      const final=events.find(e=>e.type==='response.completed').response;
+      assert.ok(final.output[0].content[0].text.includes('subagent done'));
+    });
+
     await check('cancelled stream preserves partial answer as incomplete',async()=>{plan.push({updates:[text('partial')],result:{stopReason:'cancelled'}});const events=await request('a',true);assert.ok(events.some(e=>e.type==='response.incomplete'));assert.ok(!events.some(e=>e.type==='response.completed'));});
     console.log(`${passed}/${passed} behavioral tests passed`);
   } finally { gateway.close(); }
