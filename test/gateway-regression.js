@@ -956,6 +956,66 @@ async function main() {
         gw.close();
       }
     });
+
+    await check('mid-turn steering: new user prompt while assistant is generating cancels previous turn and answers immediately', async () => {
+      const p = 43100 + Math.floor(Math.random() * 500);
+      const cancelled = [];
+      let slowPromptResolve;
+      let firstTurnStarted = false;
+      const acpMock = {
+        policyBySession: new Map(), discover: async () => {}, resolveModel: (m) => m,
+        cwdFor: async () => process.cwd(),
+        start: async () => {}, status: () => ({ running: true }),
+        notify: (method, params) => { if (method === 'session/cancel') cancelled.push(params.sessionId); },
+        abandon: () => 1,
+        request: async (method, params) => {
+          if (method === 'session/new') return { sessionId: 'steer-sess' };
+          if (method === 'session/prompt') {
+            if (!firstTurnStarted) {
+              firstTurnStarted = true;
+              await new Promise((r) => { slowPromptResolve = r; });
+              return { stopReason: 'cancelled' };
+            }
+            acpMock.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'steered answer' } } } });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const gw = createGateway({ acp: acpMock, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => config, log: () => {} });
+      await gw.listen([p]);
+      const tools = [{ type: 'function', function: { name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } } }];
+      try {
+        const parseChatSse = async (r) => (await r.text()).split('\n').filter((x) => x.startsWith('data: {')).map((x) => JSON.parse(x.slice(6)));
+        fetch(`http://127.0.0.1:${p}/v1/chat/completions`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'steer-key', tools, messages: [{ role: 'user', content: 'turn 1' }] }),
+        }).catch(() => {});
+        await new Promise((r) => setTimeout(r, 40));
+
+        const req2Promise = fetch(`http://127.0.0.1:${p}/v1/chat/completions`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'steer-key', tools,
+            messages: [{ role: 'user', content: 'turn 1' }, { role: 'user', content: 'steer: change direction' }],
+          }),
+        });
+
+        await new Promise((r) => setTimeout(r, 40));
+        assert.ok(cancelled.includes('steer-sess'), '第一轮正在生成时发起 steering 必须向会话发送 session/cancel');
+        if (slowPromptResolve) slowPromptResolve();
+
+        const res2 = await req2Promise;
+        assert.equal(res2.status, 200);
+        const frames2 = await parseChatSse(res2);
+        const text2 = frames2.map((f) => f.choices?.[0]?.delta?.content || '').join('');
+        assert.equal(text2, 'steered answer', '新方向的回答应顺利输出');
+        assert.ok(frames2.some((f) => f.choices?.[0]?.finish_reason === 'stop'), '新方向轮次应正常以 stop 收尾');
+      } finally {
+        if (slowPromptResolve) slowPromptResolve();
+        gw.close();
+      }
+    });
     console.log(`${passed}/${passed} behavioral tests passed`);
   } finally { gateway.close(); }
 }

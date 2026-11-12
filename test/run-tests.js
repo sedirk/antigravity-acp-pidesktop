@@ -833,6 +833,34 @@ async function main() {
       mcp.close();
     }
   });
+
+  await suite('models: 导出的虚拟模型必须包含 canSteer 与 steering 能力元数据', async () => {
+    const rt = new AcpRuntime({ getConfig: () => ({ virtualModels: true }), log: () => {} });
+    rt.discovery = {
+      raw: [{ id: 'gemini-2.5-pro-high', name: 'Gemini 2.5 Pro (high)' }],
+      groups: new Map([
+        ['gemini-2.5-pro', { base: 'gemini-2.5-pro', names: ['Gemini 2.5 Pro'], levels: new Map([['high', 'gemini-2.5-pro-high']]) }],
+      ]),
+    };
+    rt.discover = async () => rt.discovery;
+    const list = await rt.modelsForApi();
+    assert.ok(list.length > 0);
+    const m = list[0];
+    assert.strictEqual(m.canSteer, true, '应声明 canSteer: true');
+    assert.strictEqual(m.supports_steering, true, '应声明 supports_steering: true');
+    assert.ok(m.capabilities.includes('steer'), 'capabilities 列表中应包含 steer');
+  });
+
+  await suite('panel: onPanelInvoke 对 config:get 与 config:save 双向兼容', async () => {
+    const plugin = require('../main.js');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acp-panel-'));
+    plugin._internals.setDataPath(dir);
+    plugin._internals.reloadConfig();
+    const cfg = await plugin.onPanelInvoke('config:get');
+    assert.ok(cfg && typeof cfg === 'object', 'config:get 应能正常读取配置');
+    const saveRes = await plugin.onPanelInvoke('config:save', { port: 41910 });
+    assert.strictEqual(saveRes.ok, true, 'config:save 应能成功写入');
+  });
   const failed = results.filter((r) => !r.ok);
   console.log(`\n结果: ${results.length - failed.length}/${results.length} 通过`);
   if (failed.length > 0) process.exit(1);

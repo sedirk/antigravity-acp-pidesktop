@@ -173,10 +173,41 @@
     </div>
   </section>
 
-  <!-- 3. 服务与端点 -->
+  <!-- 3. 在模型面板中添加使用 -->
+  <section class="group highlight">
+    <div class="section-header">
+      <h3 class="section">3. 在模型面板中添加使用</h3>
+      <span class="badge ok">3 步完成</span>
+    </div>
+
+    <div class="field wide" style="line-height: 1.6; font-size: 12px; color: #cfcfd6;">
+      <div style="margin-bottom: 8px;">
+        <span style="color: #60a5fa; font-weight: 600;">步骤 ①</span>：打开 PI-Desktop 左侧栏或设置中的「模型」面板，点击「添加自定义提供商 / 模型」。
+      </div>
+      <div style="margin-bottom: 8px;">
+        <span style="color: #60a5fa; font-weight: 600;">步骤 ②</span>：协议选择 <b>OpenAI（Chat Completions）</b>，填入本地端点与留空密钥：
+        <div style="margin: 6px 0; padding: 8px 10px; background: rgba(0,0,0,0.3); border-radius: 6px; border: 1px solid rgba(255,255,255,0.08); font-family: monospace;">
+          API 端点：<span id="endpointPreview" style="color: #4ade80;">http://127.0.0.1:41910/v1</span>
+          <button id="copyEndpointBtn" type="button" class="ghost" style="padding: 2px 8px; margin-left: 8px; font-size: 11px;">复制端点</button><br>
+          API 密钥：<span style="color: #94a3b8;">留空（或随意填写任意字符）</span>
+        </div>
+      </div>
+      <div>
+        <span style="color: #60a5fa; font-weight: 600;">步骤 ③</span>：输入所需虚拟模型 ID，即可在对话中直接选用：
+        <div style="margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap;">
+          <button type="button" class="ghost copy-model-btn" data-model="gemini-2.5-pro" style="padding: 2px 8px; font-size: 11px;">📋 gemini-2.5-pro</button>
+          <button type="button" class="ghost copy-model-btn" data-model="gemini-2.5-flash" style="padding: 2px 8px; font-size: 11px;">📋 gemini-2.5-flash</button>
+          <button type="button" class="ghost copy-model-btn" data-model="claude-3-7-sonnet" style="padding: 2px 8px; font-size: 11px;">📋 claude-3-7-sonnet</button>
+        </div>
+        <span class="hint" style="margin-top: 4px; display: block;">提示：点击上方按钮可快速复制模型 ID；点击页面底部「列出可用模型」按钮可查看当前授权的全部模型。</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4. 服务与端点 -->
   <section class="group">
     <div class="section-header">
-      <h3 class="section">服务与端点</h3>
+      <h3 class="section">4. 服务与端点</h3>
     </div>
     <div class="field">
       <label for="port">网关端口</label>
@@ -412,6 +443,7 @@
         $('bridgeGuidanceDefault').value = cfg._defaults.bridgeGuidance;
       }
       $('file').textContent = cfg._file || '未知';
+      updateEndpointPreview();
       show('配置已载入', 'ok');
       await refreshRuntime();
     } catch (error) {
@@ -724,6 +756,47 @@
     } finally {
       btn.disabled = false;
     }
+  });
+
+  function updateEndpointPreview() {
+    const portEl = $('port');
+    const prevEl = $('endpointPreview');
+    if (portEl && prevEl) {
+      const p = (portEl.value || '41910').trim();
+      prevEl.textContent = 'http://127.0.0.1:' + p + '/v1';
+    }
+  }
+
+  const portInput = $('port');
+  if (portInput) {
+    portInput.addEventListener('input', updateEndpointPreview);
+  }
+
+  const copyEpBtn = $('copyEndpointBtn');
+  if (copyEpBtn) {
+    copyEpBtn.addEventListener('click', async () => {
+      const portVal = ($('port') && $('port').value) || '41910';
+      const ep = 'http://127.0.0.1:' + String(portVal).trim() + '/v1';
+      try {
+        await navigator.clipboard.writeText(ep);
+        show('已复制 API 端点：' + ep, 'ok');
+      } catch {
+        show('端点地址：' + ep);
+      }
+    });
+  }
+
+  document.querySelectorAll('.copy-model-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const model = btn.getAttribute('data-model');
+      if (!model) return;
+      try {
+        await navigator.clipboard.writeText(model);
+        show('已复制模型 ID：' + model, 'ok');
+      } catch {
+        show('模型 ID：' + model);
+      }
+    });
   });
 
   async function init() {

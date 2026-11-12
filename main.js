@@ -500,10 +500,10 @@ function runtimeStatus() {
 }
 
 async function onPanelInvoke(channel, payload) {
-  if (channel === 'config:read') {
+  if (channel === 'config:read' || channel === 'config:get') {
     return configLib.readPanel(ctx(), config || reloadConfig());
   }
-  if (channel === 'config:write') {
+  if (channel === 'config:write' || channel === 'config:save') {
     const result = configLib.savePanel(ctx(), payload || {}, null);
     if (!result.ok) return result;
     reloadConfig();
@@ -560,6 +560,7 @@ async function onPanelInvoke(channel, payload) {
   if (channel === 'runtime:install') return startInstall();
   if (channel === 'runtime:cleanup') {
     try { return cleanupRuntime(); } catch (error) { return { ok: false, error: String(error.message).slice(0, 300) }; }
+  }
   if (channel === 'sessions:list') {
     if (!gateway) return { ok: true, sessions: [] };
     return { ok: true, sessions: gateway.listSessions() };
@@ -572,7 +573,6 @@ async function onPanelInvoke(channel, payload) {
     } catch (error) {
       return { ok: false, error: String(error.message).slice(0, 300) };
     }
-  }
   }
   throw Object.assign(new Error(`未知的面板通道: ${channel}`), { code: 'UNSUPPORTED' });
 }
