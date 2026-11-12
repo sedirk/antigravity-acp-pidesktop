@@ -153,10 +153,12 @@ async function main() {
       at: Date.now(),
       raw: [
         { id: 'gemini-4-carbon-low' }, { id: 'gemini-4-carbon-medium' }, { id: 'gemini-4-carbon-high' },
+        { id: 'gemini-4-hydrogen-low' }, { id: 'gemini-4-hydrogen-medium' }, { id: 'gemini-4-hydrogen-high' }, { id: 'gemini-4-hydrogen-xhigh' },
         { id: 'solo-model' },
       ],
       groups: new Map([
         ['gemini-4-carbon', { base: 'gemini-4-carbon', names: ['Gemini 4 Carbon (Medium)'], levels: new Map([['low', 'gemini-4-carbon-low'], ['medium', 'gemini-4-carbon-medium'], ['high', 'gemini-4-carbon-high']]) }],
+        ['gemini-4-hydrogen', { base: 'gemini-4-hydrogen', names: ['Gemini 4 Hydrogen (XHigh)'], levels: new Map([['low', 'gemini-4-hydrogen-low'], ['medium', 'gemini-4-hydrogen-medium'], ['high', 'gemini-4-hydrogen-high'], ['xhigh', 'gemini-4-hydrogen-xhigh']]) }],
         ['solo-model', { base: 'solo-model', names: ['Solo'], levels: new Map() }],
       ]),
     };
@@ -166,16 +168,23 @@ async function main() {
     assert.strictEqual(await acp.resolveModel('solo-model', 'high'), 'solo-model');
     assert.strictEqual(await acp.resolveModel('gemini-4-carbon-low', 'high'), 'gemini-4-carbon-high');
 
+    // xhigh 与自适应档位降级
+    assert.strictEqual(await acp.resolveModel('gemini-4-hydrogen', 'xhigh'), 'gemini-4-hydrogen-xhigh');
+    assert.strictEqual(await acp.resolveModel('gemini-4-hydrogen-xhigh', 'low'), 'gemini-4-hydrogen-low');
+    assert.strictEqual(await acp.resolveModel('gemini-4-carbon', 'xhigh'), 'gemini-4-carbon-high'); // carbon 没有 xhigh，就近降级为 high
+    assert.strictEqual(await acp.resolveModel('gemini-4-carbon', 'minimal'), 'gemini-4-carbon-low'); // carbon 没有 minimal，就近降级为 low
+
     // 回归：模型发现缓存是空的（运行时重启过 / 预热失败）时，也绝不能把裸虚拟名发给运行时。
     // 运行时只认带档位后缀的 id：Rejecting model gemini-4-carbon: not available under the active auth method.
     const blind = new AcpRuntime({ getConfig: () => ({ modelCacheMs: 0, cwd: '.' }), log: () => {} });
     blind.discovery = { at: 0, raw: [], groups: new Map() };
     blind.discover = async () => { throw new Error('runtime not ready'); };
     assert.strictEqual(await blind.resolveModel('gemini-4-carbon', 'high'), 'gemini-4-carbon-high');
+    assert.strictEqual(await blind.resolveModel('gemini-4-hydrogen', 'xhigh'), 'gemini-4-hydrogen-xhigh');
     // 列表已知但没有这个模型：明确报错（附可用列表）。绝不能静默换个模型冒充。
     await assert.rejects(() => acp.resolveModel('no-such-model', 'high'), /当前不可用/);
-    assert.strictEqual(levelOfEffort('xhigh'), 'high');
-    assert.strictEqual(levelOfEffort('minimal'), 'low');
+    assert.strictEqual(levelOfEffort('xhigh'), 'xhigh');
+    assert.strictEqual(levelOfEffort('minimal'), 'minimal');
   });
 
   await suite('messages: Chat 与 Responses 两种入参归一化', async () => {
@@ -849,6 +858,8 @@ async function main() {
     assert.strictEqual(m.canSteer, true, '应声明 canSteer: true');
     assert.strictEqual(m.supports_steering, true, '应声明 supports_steering: true');
     assert.ok(m.capabilities.includes('steer'), 'capabilities 列表中应包含 steer');
+    assert.strictEqual(m.thinkingProtocol, 'adaptive', '思考模型应声明 adaptive 思考协议');
+    assert.strictEqual(m.contextWindow, 1048576, '应导出标准 contextWindow');
   });
 
   await suite('panel: onPanelInvoke 对 config:get 与 config:save 双向兼容', async () => {
@@ -860,6 +871,30 @@ async function main() {
     assert.ok(cfg && typeof cfg === 'object', 'config:get 应能正常读取配置');
     const saveRes = await plugin.onPanelInvoke('config:save', { port: 41910 });
     assert.strictEqual(saveRes.ok, true, 'config:save 应能成功写入');
+  });
+
+  await suite('prefix-cache: 桥接工具引导词稳定排序与前缀缓存对齐', async () => {
+    const { createBridgeTurn } = require('../lib/bridge-turn.js');
+    const bt = createBridgeTurn({
+      bridges: new Map(),
+      ensureBridgeServer: async () => 'http://127.0.0.1:50000',
+      ensureRuntime: async () => {},
+      sessionFor: async () => ({ sessionId: 'test', resume: false }),
+      prompt: async () => {},
+      policyForRequest: () => ({ policy: 'all' }),
+      usageFor: () => ({}),
+      log: () => {},
+      acp: {},
+      projectTools: (t) => t,
+      flatten: () => '',
+      getConfig: () => ({}),
+    });
+    const tools1 = [{ name: 'Write' }, { name: 'Bash' }, { name: 'Read' }];
+    const tools2 = [{ name: 'Read' }, { name: 'Write' }, { name: 'Bash' }];
+    const g1 = bt.guidanceFor(tools1);
+    const g2 = bt.guidanceFor(tools2);
+    assert.strictEqual(g1, g2, '不同传入顺序的工具必须生成100%字节级一致的引导词前缀');
+    assert.ok(g1.includes('pi-bridge_Bash') && g1.indexOf('pi-bridge_Bash') < g1.indexOf('pi-bridge_Read'), '工具必须按字母排序保证前缀稳定性');
   });
   const failed = results.filter((r) => !r.ok);
   console.log(`\n结果: ${results.length - failed.length}/${results.length} 通过`);
