@@ -20,6 +20,7 @@ const { createGateway } = require('./lib/server');
 const SERVICE_ID = 'antigravity-acp-gateway';
 const COMMANDS = {
   config: 'antigravity.config',
+  login: 'antigravity.login',
   status: 'antigravity.status',
   models: 'antigravity.models',
   install: 'antigravity.install-runtime',
@@ -319,9 +320,83 @@ function cleanupRuntime() {
   return { ok: true, freedBytes: before, dir };
 }
 
+// ---------------------------------------------------------------- 认证与登录
+
+/** 检查 Google 官方登录凭据是否在位（~/.gemini/antigravity-acp/settings.json 与 acp_token.json）。 */
+function authStatus() {
+  const geminiHome = process.env.GEMINI_HOME || path.join(process.env.USERPROFILE || process.env.HOME || '', '.gemini');
+  const dir = path.join(geminiHome, 'antigravity-acp');
+  const settingsFile = path.join(dir, 'settings.json');
+  const tokenFile = path.join(dir, 'acp_token.json');
+  const hasSettings = fs.existsSync(settingsFile) && fs.statSync(settingsFile).size > 0;
+  const hasToken = fs.existsSync(tokenFile) && fs.statSync(tokenFile).size > 0;
+  let projectId = '';
+  if (hasToken) {
+    try {
+      const data = JSON.parse(fs.readFileSync(tokenFile, 'utf8'));
+      if (data && data.project_id) projectId = String(data.project_id);
+    } catch { /* ignore */ }
+  }
+  return {
+    loggedIn: hasSettings && hasToken,
+    hasSettings,
+    hasToken,
+    projectId,
+    dir,
+  };
+}
+
+/**
+ * 触发官方运行时进行 Google OAuth 交互式登录：
+ * 向 agy_acp_server 发送 authenticate(method_id='oauth-personal')，
+ * 运行时内置的 WSGI 临时服务将自动调用 webbrowser.open 弹起默认浏览器完成授权。
+ */
+async function loginGoogle() {
+  const bin = config ? config.bin : configLib.defaultBin(ctx());
+  if (!bin || !fs.existsSync(bin)) {
+    const msg = '官方运行时尚未下载，请先在面板点击「下载官方运行时」';
+    await toast(msg, 'warning');
+    return { ok: false, error: msg };
+  }
+  if (!acp) {
+    const msg = 'ACP 运行时未初始化';
+    await toast(msg, 'warning');
+    return { ok: false, error: msg };
+  }
+  await toast('已向运行时发起登录请求，正在自动调起系统浏览器...', 'info');
+  try {
+    if (!acp.ready || !acp.child) {
+      log('登录请求：拉起运行时子进程');
+      await acp.start();
+    }
+    log('登录请求：发送 authenticate (oauth-personal)');
+    await acp.request('authenticate', { method_id: 'oauth-personal' }, 180000);
+    const auth = authStatus();
+    log(`Google OAuth 授权完成：loggedIn=${auth.loggedIn}`);
+    await toast('Google 账号授权成功！凭据已保存，可直接在 PI-Desktop 中使用。', 'info');
+    try { await acp.discover(); } catch { /* ignore */ }
+    return { ok: true, ...auth };
+  } catch (error) {
+    const errText = error && error.message ? error.message : String(error);
+    log(`Google OAuth 授权失败或取消：${errText}`);
+    await toast(`Google 登录未完成：${errText.slice(0, 160)}`, 'error');
+    return { ok: false, error: errText };
+  }
+}
+
 // ---------------------------------------------------------------- 命令
 
 function registerCommands() {
+  pi.commands.register({
+    id: COMMANDS.login,
+    title: 'Antigravity: 登录 Google 账号 (调起浏览器)',
+    category: 'AI',
+    keywords: ['antigravity', 'agy', 'google', 'login', '登录', 'auth', 'oauth'],
+    run: async () => {
+      await loginGoogle();
+    },
+  });
+
   pi.commands.register({
     id: COMMANDS.config,
     title: 'Antigravity: 打开配置面板',
@@ -420,6 +495,7 @@ function runtimeStatus() {
     version: RUNTIME.version,
     sha256: RUNTIME.sha256,
     proxy: resolvedProxy,
+    auth: authStatus(),
   };
 }
 
@@ -456,8 +532,11 @@ async function onPanelInvoke(channel, payload) {
       lastRequest: status.lastRequest,
       proxy: resolvedProxy,
       runtime: runtimeStatus(),
+      auth: authStatus(),
     };
   }
+  if (channel === 'auth:status') return authStatus();
+  if (channel === 'auth:login') return await loginGoogle();
   if (channel === 'runtime:restart') {
     if (!gateway) return { ok: false, error: '网关未运行' };
     try {

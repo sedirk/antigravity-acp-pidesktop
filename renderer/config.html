@@ -111,6 +111,19 @@
 
     </section>
     <section class="group">
+    <h3 class="section">Google 账号认证</h3>
+    <div class="field wide">
+      <div class="row" style="justify-content: space-between; align-items: center;">
+        <span class="hint" id="authStatusText">登录状态：读取中…</span>
+        <div class="row-actions">
+          <button id="loginGoogle" type="button" class="primary">登录 Google 账号 (调起浏览器)</button>
+          <button id="refreshAuth" type="button" class="ghost">刷新认证</button>
+        </div>
+      </div>
+      <span class="hint" id="authDetailText">无需安装 Antigravity 官方客户端。点击后将拉起后台运行时并在默认浏览器中弹出 Google 官方授权页；登录授权完成后凭据自动持久化在本地。</span>
+    </div>
+    </section>
+    <section class="group">
     <h3 class="section">模型与思考</h3>
     <div class="field">
       <label for="defaultModel">默认模型</label>
@@ -493,6 +506,46 @@ const ids = ['port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', '
     }
   }
 
+  async function refreshAuth() {
+    const text = $('authStatusText');
+    const btn = $('loginGoogle');
+    try {
+      const res = await call('auth:status');
+      if (res && res.loggedIn) {
+        text.innerHTML = '<span style="color:#6bd48a;font-weight:600">✓ 已登录 Google 账号</span>' + (res.projectId ? ' <span style="color:#8f8f96">(' + res.projectId + ')</span>' : '');
+        btn.textContent = '重新登录 Google 账号';
+      } else {
+        text.innerHTML = '<span style="color:#ff8a80;font-weight:600">未登录</span> <span style="color:#8f8f96">（缺少有效的 Google 授权凭证）</span>';
+        btn.textContent = '登录 Google 账号 (调起浏览器)';
+      }
+    } catch (e) {
+      text.textContent = '检查登录状态失败：' + (e && e.message ? e.message : e);
+    }
+  }
+
+  $('refreshAuth').addEventListener('click', refreshAuth);
+  $('loginGoogle').addEventListener('click', async () => {
+    const btn = $('loginGoogle');
+    const prevText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '正在调起浏览器…';
+    show('正在启动 ACP 运行时以唤起 Google 授权页面，请在弹出的系统浏览器中完成登录…');
+    try {
+      const res = await call('auth:login');
+      if (res && res.ok) {
+        show('Google 授权成功！凭证已在本地就绪。', 'ok');
+      } else {
+        show('登录未完成：' + ((res && res.error) || '未知原因'), 'err');
+      }
+    } catch (err) {
+      show('登录失败：' + (err && err.message ? err.message : err), 'err');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = prevText;
+      await refreshAuth();
+    }
+  });
+
   $('refreshSessions').addEventListener('click', refreshSessions);
   $('recycleSessions').addEventListener('click', async () => {
     const btn = $('recycleSessions');
@@ -509,6 +562,7 @@ const ids = ['port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', '
     }
   });
   load();
+  refreshAuth();
   refreshSessions();
 })();
 </script>
