@@ -671,6 +671,156 @@ async function main() {
       (error) => assert.strictEqual(error.code, 'ACP_TIMEOUT'),
     );
   });
+
+  await suite('runtime: 重启后旧子进程异步 exit 不得冲掉新进程与在途请求', async () => {
+    const { EventEmitter } = require('node:events');
+    const cp = require('node:child_process');
+    const corePath = path.join(root, 'lib/core.js');
+    const origSpawn = cp.spawn;
+    const spawned = [];
+    cp.spawn = () => {
+      const proc = new EventEmitter();
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.killed = false;
+      proc.kill = () => { proc.killed = true; };
+      proc.stdin = {
+        write(chunk) {
+          const msg = JSON.parse(String(chunk).trim());
+          if (msg.method === 'initialize') {
+            setImmediate(() => {
+              proc.stdout.emit('data', `${JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { agentInfo: { gen: spawned.length } } })}\n`);
+            });
+          }
+        },
+      };
+      spawned.push(proc);
+      return proc;
+    };
+    delete require.cache[require.resolve(corePath)];
+    try {
+      const { AcpRuntime: FreshRuntime } = require(corePath);
+      const rt = new FreshRuntime({
+        getConfig: () => ({ bin: process.execPath, toolPolicy: 'all' }),
+        log: () => {},
+      });
+      await rt.start();
+      assert.strictEqual(spawned.length, 1);
+      const oldChild = spawned[0];
+      rt.restart();
+      await rt.start();
+      assert.strictEqual(spawned.length, 2);
+      const newChild = spawned[1];
+      assert.strictEqual(rt.child, newChild);
+      assert.strictEqual(rt.ready, true);
+
+      const reqId = rt.nextId;
+      const inflight = rt.request('session/prompt', { sessionId: 's-new' }, 0);
+      // 模拟旧进程在 Windows 下延迟触发 exit / error / stdout
+      oldChild.stdout.emit('data', `${JSON.stringify({ jsonrpc: '2.0', id: reqId, error: { message: 'wrong child' } })}\n`);
+      oldChild.emit('error', new Error('old EPIPE'));
+      oldChild.emit('exit', 0, 'SIGTERM');
+
+      assert.strictEqual(rt.ready, true, '旧进程 exit 不能把新运行时的 ready 清掉');
+      assert.strictEqual(rt.child, newChild, '旧进程 exit 不能把新 child 置空');
+      assert.strictEqual(rt.pending.size, 1, '新进程上的在途请求不能被旧进程 exit 拒绝');
+
+      newChild.stdout.emit('data', `${JSON.stringify({ jsonrpc: '2.0', id: reqId, result: { stopReason: 'end_turn' } })}\n`);
+      assert.deepStrictEqual(await inflight, { stopReason: 'end_turn' });
+    } finally {
+      cp.spawn = origSpawn;
+      delete require.cache[require.resolve(corePath)];
+    }
+  });
+
+  await suite('runtime: abandon 支持按 sessionId 精确放弃，不误伤其它会话', async () => {
+    const rt = new AcpRuntime({ getConfig: () => ({ toolPolicy: 'all' }), log: () => {} });
+    rt.child = { stdin: { write: () => {} }, on: () => {}, kill: () => {} };
+    const idA = rt.nextId;
+    const reqA = rt.request('session/prompt', { sessionId: 'sess-a' }, 0);
+    const idB = rt.nextId;
+    const reqB = rt.request('session/prompt', { sessionId: 'sess-b' }, 0);
+    assert.strictEqual(rt.abandon('session/prompt', '会话 A 已取消', 'sess-a'), 1);
+    await assert.rejects(reqA, (err) => err.code === 'ACP_ABANDONED' && err.message.includes('会话 A'));
+    assert.strictEqual(rt.pending.size, 1, '会话 B 的在途请求必须保留');
+    assert.strictEqual(idA !== idB, true);
+    rt.handleLine(JSON.stringify({ jsonrpc: '2.0', id: idB, result: { stopReason: 'end_turn' } }));
+    assert.deepStrictEqual(await reqB, { stopReason: 'end_turn' });
+  });
+
+  await suite('config: 面板可清空可选字段，且默认桥接提示词不会冻结进 config.json', async () => {
+    const dir = tempDir('panel-clear');
+    const ctx = { packageRoot: root, dataPath: dir };
+    const s1 = configLib.savePanel(ctx, {
+      cwd: root,
+      clientName: 'custom-client',
+      proxy: 'http://127.0.0.1:7890',
+    });
+    assert.strictEqual(s1.ok, true);
+    const panel1 = configLib.readPanel(ctx, configLib.loadConfig(ctx));
+    assert.strictEqual(panel1.cwd, root);
+    assert.strictEqual(panel1.clientName, 'custom-client');
+    assert.strictEqual(panel1.proxy, 'http://127.0.0.1:7890');
+    assert.strictEqual(panel1.bridgeGuidance, '', '未自定义时 readPanel 应返空串，由 placeholder 展示内置默认');
+    assert.strictEqual(panel1.bridgeGuidanceDefault, configLib.BUILTIN_BRIDGE_GUIDANCE);
+
+    // 用户清空字段，或误把默认提示词原样提交：都应落回空串而不冻结旧文案
+    const s2 = configLib.savePanel(ctx, {
+      cwd: '',
+      clientName: '',
+      proxy: '',
+      bridgeGuidance: configLib.BUILTIN_BRIDGE_GUIDANCE,
+    });
+    assert.strictEqual(s2.ok, true);
+    const rawSaved = JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf8'));
+    assert.strictEqual(rawSaved.cwd, '');
+    assert.strictEqual(rawSaved.clientName, '');
+    assert.strictEqual(rawSaved.proxy, '');
+    assert.strictEqual(rawSaved.bridgeGuidance, '', '与内置默认一致的提示词不能写死进 config.json');
+    const loaded = configLib.loadConfig(ctx);
+    assert.strictEqual(loaded.bridgeGuidance, '');
+  });
+
+  await suite('bridge/mcp: 并行工具批量映射与 MCP 连接中断自动清理挂起项', async () => {
+    const batch = bridgeLib.toToolCalls([
+      { toolCallId: 'c1', name: 'Read', args: { path: 'a.js' } },
+      { toolCallId: 'c2', name: 'Grep', args: { pattern: 'foo' } },
+    ]);
+    assert.strictEqual(batch.length, 2);
+    assert.deepStrictEqual(batch.map((x) => [x.index, x.id, x.function.name]), [
+      [0, 'c1', 'Read'],
+      [1, 'c2', 'Grep'],
+    ]);
+
+    let cancelled = 0;
+    const mcp = createMcpServer({
+      listTools: () => [],
+      callTool: ({ registerCancel }) => new Promise(() => {
+        registerCancel(() => { cancelled += 1; });
+      }),
+    });
+    const { port } = await mcp.listen(0, '127.0.0.1');
+    try {
+      const http = require('node:http');
+      await new Promise((resolve, reject) => {
+        const req = http.request({
+          host: '127.0.0.1', port, path: '/mcp?k=1', method: 'POST',
+          headers: { 'content-type': 'application/json' },
+        }, (res) => {
+          res.once('data', () => {
+            req.destroy();
+            resolve();
+          });
+        });
+        req.on('error', (err) => { if (err.code !== 'ECONNRESET') reject(err); });
+        req.end(JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'Read', arguments: {} } }));
+      });
+      await sleep(40);
+      assert.strictEqual(cancelled, 1, 'MCP HTTP 流断开时必须触发 registerCancel 清理挂起状态');
+    } finally {
+      mcp.close();
+    }
+  });
   const failed = results.filter((r) => !r.ok);
   console.log(`\n结果: ${results.length - failed.length}/${results.length} 通过`);
   if (failed.length > 0) process.exit(1);

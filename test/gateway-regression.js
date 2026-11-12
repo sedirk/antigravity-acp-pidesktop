@@ -43,7 +43,7 @@ async function main() {
   }
   try {
     await check('listen and health',async()=>{assert.equal(await gateway.listen([port]),port);const h=await (await fetch(`http://127.0.0.1:${port}/health`)).json(); assert.equal(h.port,port);assert.equal(gateway.status().port,port);});
-    await check('text plus tool does not replay or replace session',async()=>{plan.push({updates:[tool,text('final answer'),usage]});const r=await request('a');assert.equal(r.status,200);assert.equal(r.body.output[0].content[0].text,'final answer');assert.equal(serial,1);assert.equal(calls.filter(c=>c[0]==='session/prompt').length,1);assert.ok(logs.some(x=>x.includes('正文 12 字')));assert.equal(r.body.usage.input_tokens,12345);assert.equal(r.body.usage.estimated,true);});
+    await check('text plus tool does not replay or replace session',async()=>{plan.push({updates:[tool,text('final answer'),usage]});const r=await request('a');assert.equal(r.status,200);assert.equal(r.body.output[0].content[0].text,'final answer');assert.equal(serial,1);assert.equal(calls.filter(c=>c[0]==='session/prompt').length,1);assert.ok(logs.some(x=>x.includes('正文 12 字')));assert.equal(r.body.usage.input_tokens,12345);assert.equal(r.body.usage.estimated,false);});
     await check('same conversation retains context',async()=>{plan.push({updates:[text('next')]});const r=await request('a');assert.equal(serial,1);assert.equal(r.body.usage.input_tokens,12345);});
     await check('different conversation cannot inherit usage',async()=>{plan.push({updates:[text('other')]});const r=await request('b');assert.equal(serial,2);assert.notEqual(r.body.usage.input_tokens,12345);});
     await check('empty tool turn is nudged in the same session, then reported empty',async()=>{plan.push({updates:[tool]},{updates:[tool]},{updates:[tool]});const before=calls.length;const r=await request('a');const prompts=calls.slice(before).filter(c=>c[0]==='session/prompt');assert.equal(r.status,502);assert.equal(r.body.error.code,'EMPTY_RESPONSE');assert.equal(prompts.length,3,'one turn plus two same-session nudges');assert.equal(calls.slice(before).filter(c=>c[0]==='session/new').length,0,'must not switch session');assert.equal(calls.slice(before).filter(c=>c[0]==='session/close').length,0,'must not close the session');assert.ok(prompts.slice(1).every(p=>JSON.stringify(p[1].prompt).includes('没有输出正文')),'nudge text sent in same session');});
@@ -559,6 +559,231 @@ async function main() {
       } finally {
         gatewayC.close();
       }
+    });
+
+    await check('bridged mode forwards image and document attachments into session/prompt', async () => {
+      let seenPrompt = null;
+      let seenMcp = null;
+      const acpImg = {
+        policyBySession: new Map(), notify: () => {}, discover: async () => {}, resolveModel: (m) => m,
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        start: async () => {}, status: () => ({ running: true }),
+        request: async (method, params) => {
+          if (method === 'session/new') { seenMcp = params.mcpServers; return { sessionId: 'bridged-media' }; }
+          if (method === 'session/prompt') {
+            seenPrompt = params.prompt;
+            acpImg.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'saw attachments' } } } });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const gw = createGateway({ acp: acpImg, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => config, log: () => {} });
+      await gw.listen([port]);
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'media-bridge-key',
+            tools: [{ type: 'function', function: { name: 'Read', parameters: { type: 'object', properties: {} } } }],
+            messages: [{
+              role: 'user',
+              content: [
+                { type: 'text', text: 'inspect both attachments' },
+                { type: 'image_url', image_url: { url: 'data:image/png;base64,aGVsbG8=' } },
+                { type: 'input_file', filename: 'spec.pdf', file_data: 'data:application/pdf;base64,cGRmLWJvZHk=' },
+              ],
+            }],
+          }),
+        });
+        const raw = await res.text();
+        assert.equal(res.status, 200);
+        assert.ok(Array.isArray(seenMcp) && seenMcp.length === 1, '必须走带 MCP 工具桥的流式路径');
+        assert.ok(raw.includes('saw attachments'), raw.slice(0, 200));
+        assert.ok(Array.isArray(seenPrompt), 'session/prompt 应收到数组块');
+        const imgBlock = seenPrompt.find((b) => b.type === 'image');
+        const docBlock = seenPrompt.find((b) => b.type === 'resource_link');
+        assert.ok(imgBlock && imgBlock.mimeType === 'image/png' && imgBlock.data === 'aGVsbG8=', '桥接模式不能丢弃图片块');
+        assert.ok(docBlock && docBlock.name === 'spec.pdf' && String(docBlock.uri || '').endsWith('.pdf'), '桥接模式不能丢弃文档附件');
+      } finally {
+        gw.close();
+      }
+    });
+
+    await check('bridged mode coalesces parallel MCP calls and recovers when user interrupts parked tools', async () => {
+      let mcpUrl = '';
+      let promptCount = 0;
+      const cancelledSessions = [];
+      const mcpResults = [];
+      const acpPar = {
+        policyBySession: new Map(), discover: async () => {}, resolveModel: (m) => m,
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        start: async () => {}, status: () => ({ running: true }),
+        notify: (method, params) => { if (method === 'session/cancel') cancelledSessions.push(params.sessionId); },
+        abandon: () => 1,
+        request: async (method, params) => {
+          if (method === 'session/new') { mcpUrl = params.mcpServers[0].url; return { sessionId: 'par-sess' }; }
+          if (method === 'session/prompt') {
+            promptCount += 1;
+            if (promptCount === 1) {
+              // 并发发起两个 MCP tools/call
+              const callOne = (id, file) => fetch(mcpUrl, {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'Read', arguments: { path: file } } }),
+              }).then((r) => r.text()).then((t) => mcpResults.push(t));
+              await Promise.all([callOne(201, 'one.js'), callOne(202, 'two.js')]);
+              return { stopReason: 'cancelled' };
+            }
+            acpPar.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'switched to new question' } } } });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const gw = createGateway({ acp: acpPar, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => config, log: () => {} });
+      await gw.listen([port]);
+      const tools = [{ type: 'function', function: { name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } } }];
+      try {
+        const parseChatSse = async (r) => (await r.text()).split('\n').filter((x) => x.startsWith('data: {')).map((x) => JSON.parse(x.slice(6)));
+        const first = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'par-key', tools, messages: [{ role: 'user', content: 'read both files' }] }),
+        });
+        assert.equal(first.status, 200);
+        const firstFrames = await parseChatSse(first);
+        const toolFrame = firstFrames.find((f) => f.choices?.[0]?.finish_reason === 'tool_calls');
+        assert.ok(toolFrame, '第一轮应以 tool_calls 挂起');
+        assert.equal(toolFrame.choices[0].delta.tool_calls.length, 2, '并发 MCP 工具调用应合并进同一轮 tool_calls');
+
+        // 用户没有回填 tool_result，而是中断并发送新问题
+        const second = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'par-key', tools,
+            messages: [
+              { role: 'user', content: 'read both files' },
+              { role: 'user', content: 'stop and answer new question instead' },
+            ],
+          }),
+        });
+        assert.equal(second.status, 200);
+        const secondFrames = await parseChatSse(second);
+        assert.ok(secondFrames.some((f) => f.choices?.[0]?.finish_reason === 'stop'), '用户插话后不能死循环重发旧 tool_calls');
+        const secondText = secondFrames.map((f) => f.choices?.[0]?.delta?.content || '').join('');
+        assert.equal(secondText, 'switched to new question');
+        assert.ok(cancelledSessions.includes('par-sess'), '放弃旧挂起工具时应通知 session/cancel');
+        await new Promise((r) => setTimeout(r, 30));
+        assert.equal(mcpResults.length, 2, '被取消的两个挂起 MCP 请求都应收到错误结束帧');
+        assert.ok(mcpResults.every((t) => t.includes('"isError":true')), mcpResults.join('\n'));
+      } finally {
+        gw.close();
+      }
+    });
+
+    await check('bridged /v1/responses emits valid reasoning item and non-colliding output_index', async () => {
+      let mcpUrl = '';
+      let releasePrompt = null;
+      const acpResp = {
+        policyBySession: new Map(), notify: () => {}, discover: async () => {}, resolveModel: (m) => m,
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        start: async () => {}, status: () => ({ running: true }),
+        request: async (method, params) => {
+          if (method === 'session/new') { mcpUrl = params.mcpServers[0].url; return { sessionId: 'resp-idx-sess' }; }
+          if (method === 'session/prompt') {
+            acpResp.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'thinking first' } } } });
+            acpResp.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'checking file' } } } });
+            fetch(mcpUrl, {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ jsonrpc: '2.0', id: 301, method: 'tools/call', params: { name: 'Read', arguments: { path: 'x.js' } } }),
+            }).catch(() => {});
+            await new Promise((r) => { releasePrompt = r; });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const gw = createGateway({ acp: acpResp, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => config, log: () => {} });
+      await gw.listen([port]);
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'resp-idx-key',
+            tools: [{ type: 'function', name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } }],
+            input: 'inspect x.js',
+          }),
+        });
+        const raw = await res.text();
+        const events = raw.split('\n').filter((x) => x.startsWith('data: ')).map((x) => JSON.parse(x.slice(6)));
+        const added = events.filter((e) => e.type === 'response.output_item.added');
+        assert.deepEqual(added.map((e) => [e.output_index, e.item.type]), [
+          [0, 'reasoning'],
+          [1, 'message'],
+          [2, 'function_call'],
+        ], 'reasoning、message、function_call 的 output_index 必须严格递增且不碰撞');
+        const thoughtDelta = events.find((e) => e.type === 'response.reasoning_summary_text.delta');
+        assert.ok(thoughtDelta && thoughtDelta.item_id === added[0].item.id && thoughtDelta.output_index === 0, 'thought delta 必须挂在已声明的 reasoning item 上');
+        const completed = events.find((e) => e.type === 'response.completed').response;
+        for (const e of added) {
+          assert.equal(completed.output[e.output_index].id, e.item.id, 'completed.output 顺序必须与 output_item.added 一致');
+        }
+      } finally {
+        if (releasePrompt) releasePrompt();
+        gw.close();
+      }
+    });
+
+    await check('timed-out session is purged from sessions.json and proxy drift restarts before discover', async () => {
+      const tmpData = path.join(process.env.PI_SCRATCH_DIR || process.cwd(), `gw-purge-${Date.now()}`);
+      const fastCfg = { ...config, promptTimeoutMs: 80, source: path.join(tmpData, 'config.json') };
+      const order = [];
+      let drifted = true;
+      let turn = 0;
+      const acpPurge = {
+        policyBySession: new Map(), notify: () => {},
+        start: async () => {}, status: () => ({ running: true }),
+        proxyDrift: () => (drifted ? 'http://127.0.0.1:10809' : ''),
+        restart: async () => { order.push('restart'); drifted = false; },
+        discover: async () => { order.push('discover'); },
+        resolveModel: (m) => { order.push('resolveModel'); return m; },
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        request: async (method, params) => {
+          if (method === 'session/new') return { sessionId: 'doomed-sess' };
+          if (method === 'session/prompt') {
+            turn += 1;
+            if (turn === 1) {
+              acpPurge.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'first ok' } } } });
+              return { stopReason: 'end_turn' };
+            }
+            const err = new Error('ACP session/prompt 超时');
+            err.code = 'ACP_TIMEOUT';
+            throw err;
+          }
+          return {};
+        },
+      };
+      const gw = createGateway({ acp: acpPurge, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => fastCfg, log: () => {} });
+      await gw.listen([port]);
+      try {
+        // 第一轮非桥接 /v1/responses：验证 proxyDrift 重启发生在 discover / resolveModel 之前，并把会话写入 sessions.json
+        const r1 = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: false, prompt_cache_key: 'purge-key', input: 'hi' }),
+        });
+        assert.equal(r1.status, 200);
+        assert.equal(order[0], 'restart', `proxyDrift 重启必须在 discover/resolveModel 之前: ${order.join('->')}`);
+
+        // 第二轮触发 ACP_TIMEOUT：必须同时从内存和 sessions.json 移除坏会话
+        const r2 = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: false, prompt_cache_key: 'purge-key', input: 'hang' }),
+        });
+        assert.equal(r2.status, 502);
+      } finally {
+        gw.close();
+      }
+      const saved = JSON.parse(fs.readFileSync(path.join(tmpData, 'sessions.json'), 'utf8'));
+      assert.equal(saved.sessions.length, 0, '超时失联的坏会话必须从 sessions.json 一并清除，避免重启后继续 load 死会话');
     });
     console.log(`${passed}/${passed} behavioral tests passed`);
   } finally { gateway.close(); }

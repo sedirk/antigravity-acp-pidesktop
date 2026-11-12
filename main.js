@@ -342,12 +342,13 @@ function registerCommands() {
       if (!gateway) { await toast('网关未启动', 'warning'); return; }
       const status = gateway.status();
       const info = status.limiter || {};
+      const activeProxy = refreshProxy({ force: false });
       await toast([
         `网关 http://127.0.0.1:${status.port}/v1`,
         `运行时 ${status.running ? '就绪' : '未启动'}${status.pid ? ` (pid ${status.pid})` : ''}`,
         `虚拟模型 ${status.models} 个`,
         `并发 ${info.limit > 0 ? `${info.limit}（进行 ${info.active}，排队 ${info.queued}）` : '不限'}`,
-        config.proxy ? `代理 ${config.proxy}` : '代理 直连',
+        `代理 ${activeProxy.url || '直连'}（${activeProxy.source}）`,
         status.lastRequest
           ? `最近一轮 ${status.lastRequest.ms} ms · 工具权限 ${status.lastRequest.policy} · 上下文 ${status.lastRequest.contextUsed}/${status.lastRequest.contextSize}`
           : '还没有请求记录',
@@ -480,6 +481,19 @@ async function onPanelInvoke(channel, payload) {
   if (channel === 'runtime:install') return startInstall();
   if (channel === 'runtime:cleanup') {
     try { return cleanupRuntime(); } catch (error) { return { ok: false, error: String(error.message).slice(0, 300) }; }
+  if (channel === 'sessions:list') {
+    if (!gateway) return { ok: true, sessions: [] };
+    return { ok: true, sessions: gateway.listSessions() };
+  }
+  if (channel === 'sessions:recycle') {
+    if (!gateway) return { ok: false, error: '网关未运行' };
+    try {
+      const res = await gateway.recycleSessions();
+      return { ok: true, ...res };
+    } catch (error) {
+      return { ok: false, error: String(error.message).slice(0, 300) };
+    }
+  }
   }
   throw Object.assign(new Error(`未知的面板通道: ${channel}`), { code: 'UNSUPPORTED' });
 }

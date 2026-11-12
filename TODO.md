@@ -2,6 +2,30 @@
 
 只记「还没做」和「明确不做」。做完的从这里删掉，避免清单越写越长。
 
+## 待办事项：代码优化与健壮性提升（按优先级排序）
+
+> 遵循核心原则：不碰 Google 凭据、默认并发不限制（`concurrency: 0`）、权限默认放行（`toolPolicy: 'all'`）、工具回交优先宿主原生卡片。
+
+### 🔴 第一优先级：会话核心稳定性与并发防护
+1. [x] **工具桥多会话目录隔离与精准路由**（`lib/mcp.js`, `lib/server.js`）：`tools/list` 传递 URL 并在服务端按 `?k=` 解析会话键，彻底杜绝多个不同配置会话并发时的工具列表串扰。（✅ 已完成，含回归测试）
+2. [x] **单连接串行锁与限流队列解耦**（`lib/server.js`）：保持默认 `concurrency: 0`（不限并发）；将底层 ACP 单连接串行排队下沉至执行阶段，外层由限流器接管队列上限与超时丢弃，防止内存无界挂起。（✅ 已完成，含解耦测试）
+3. [x] **模型探测与切换异常分支的会话/Worker 泄露防护**（`lib/core.js`, `lib/server.js`）：`#discoverNow` 与 `applyModel` 增加严格的 `try...finally`，确保任何异常分支均能调用 `session/close` 释放外部 `localharness_external.exe` 进程。（✅ 已完成，含异常闭锁测试）
+4. [x] **MCP 协议 `notifications/cancelled` 联动取消挂起**（`lib/mcp.js`, `lib/bridge-turn.js`）：支持客户端主动取消工具时触发 `registerCancel` 提前释放挂起 Promise，避免挂起一直阻塞到超时。（✅ 已完成，含协议测试）
+
+### 🟡 第二优先级：生态兼容性与持久化数据完整性
+5. [x] **特殊命名工具的合法转义与双向映射**（`lib/bridge.js`）：对包含 `/`、`.` 或 `:` 的宿主工具名（如 `pi-desktop/visualize`）做合规安全转义与双向映射，避免被 `NAME_OK` 正则静默丢弃。（✅ 已完成，含双向映射测试）
+6. [x] **会话足迹 `sessions.json` 原子化落盘**（`lib/session-store.js`）：引入 `.tmp` + rename 的 `writeAtomic` 机制，防止断电或被杀进程时足迹半写导致历史全丢。（✅ 已完成，含落盘测试）
+7. [x] **`file://` 本地附件白名单与路径边界检查**（`lib/server.js`）：限制仅允许访问工作区 `cwd`、宿主项目根路径或附件目录，防止越界读取系统任意文件。（✅ 已完成，含越界防御测试）
+
+### 🟢 第三优先级：标准协议互通与交互细节优化
+8. [x] **增加 CORS 跨域支持与 `OPTIONS` 预检响应**（`lib/server.js`）：补充 `Access-Control-Allow-Origin: *` 与 `OPTIONS` 快速 204，方便 Web 客户端（OpenWebUI 等）跨域调用本地网关。（✅ 已完成，含跨域与预检测试）
+9. [x] **超限请求优雅返回 HTTP 413 替代直接断开 TCP**（`lib/server.js`, `lib/mcp.js`）：超过请求体限制时返回标准的 HTTP 413 JSON 错误后再关闭流，替代强制 `destroy` 造成的 `ECONNRESET`。（✅ 已完成，含 413 异常状态测试）
+10. [x] **官方累计上下文占用命中时标明 `estimated: false`**（`lib/server.js`）：取得运行时真实的 `contextUsed` 时将 `estimated` 设为 `false`，提升宿主界面百分比与计费准确度。（✅ 已完成，含上下文估算回归测试）
+
+### ⚪ 第四优先级：管理面板功能增强
+11. [x] **配置面板增加会话管理与会话状态可视化**（`renderer/config.html`, `main.js`, `lib/server.js`）：展示当前内存活跃会话列表及绑定状态，提供一键回收闲置会话功能。（✅ 已完成，含会话列表与回收测试）
+12. [x] **工具权限策略界面细化说明**（`renderer/config.html`）：细化 `toolPolicy` 各档位放行/拦截的具体工具类型说明。（✅ 已完成，界面文案已细化）
+
 ## 明确不做：额度显示（5 小时 / 每周窗口）
 
 2026-11 复核结论：没有「官方 + 无风险」的数据来源，而估算出来的额度只会误导，所以不做。
