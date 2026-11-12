@@ -785,6 +785,177 @@ async function main() {
       const saved = JSON.parse(fs.readFileSync(path.join(tmpData, 'sessions.json'), 'utf8'));
       assert.equal(saved.sessions.length, 0, '超时失联的坏会话必须从 sessions.json 一并清除，避免重启后继续 load 死会话');
     });
+
+    // 复现 bf876a46 死锁现场：
+    // 1) 多步桥接续流（第 2+ 次 park）不能丢失运行时真实 contextUsed，退化成按整段历史估算虚高 token；
+    // 2) 桥接工具挂起期间，宿主插队发来同 prompt_cache_key、无 tools 的自动压缩请求时，必须立刻释放挂起轮次（不死锁），
+    //    且压缩请求走独立临时会话（policy=none、跑完即 session/close），不污染原业务会话；
+    // 3) 压缩结束后宿主续跑时，原业务会话仍可正常复用，且能收到挂起期间宿主已跑完的尾部 tool 输出。
+    await check('mid-turn context compaction preempts parked bridge without deadlock, isolates summary session, and preserves real contextUsed across parks', async () => {
+      const tmpData = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'ag-compact-'));
+      const compactCfg = { ...config, source: path.join(tmpData, 'config.json') };
+      let mcpUrl = '';
+      let newCount = 0;
+      const closedSessions = [];
+      const cancelledSessions = [];
+      const sessionPrompts = [];
+      const policiesSeen = new Map();
+      const acpCompact = {
+        policyBySession: new Map(),
+        discover: async () => {},
+        resolveModel: (m) => m,
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        start: async () => {},
+        status: () => ({ running: true }),
+        notify: (method, params) => {
+          if (method === 'session/cancel') cancelledSessions.push(params.sessionId);
+        },
+        abandon: () => 0,
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            newCount += 1;
+            if (params.mcpServers && params.mcpServers.length > 0) {
+              mcpUrl = params.mcpServers[0].url;
+              return { sessionId: 'main-bridged-sess' };
+            }
+            return { sessionId: `ephemeral-compact-${newCount}` };
+          }
+          if (method === 'session/close') {
+            closedSessions.push(params.sessionId);
+            return {};
+          }
+          if (method === 'session/prompt') {
+            const sid = params.sessionId;
+            const promptText = params.prompt.map((b) => b.text || '').join('\n');
+            sessionPrompts.push({ sid, promptText });
+            policiesSeen.set(sid, acpCompact.policyBySession.get(sid));
+            if (sid.startsWith('ephemeral-compact-')) {
+              acpCompact.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '<summary>compacted ok</summary>' } } },
+              });
+              return { stopReason: 'end_turn' };
+            }
+            if (sessionPrompts.filter((p) => p.sid === 'main-bridged-sess').length === 1) {
+              // 第 1 次调 Read → 回填后第 2 次调 Read（此时宿主不回填，改发自动压缩请求）
+              acpCompact.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'usage_update', used: 128945, size: 1048576 } },
+              });
+              const callMcpRead = (id, file) => fetch(mcpUrl, {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'Read', arguments: { path: file } } }),
+              }).then((r) => r.text());
+              const r1 = await callMcpRead(1, 'first.js');
+              assert.ok(!r1.includes('"isError":true') && r1.includes('first file content'), `第一次 Read 应正常拿到回填结果: ${r1}`);
+              const r2 = await callMcpRead(2, 'second.js');
+              assert.ok(r2.includes('"isError":true'), `第二次挂起被自动压缩抢占时应收到 isError=true: ${r2}`);
+              return { stopReason: 'cancelled' };
+            }
+            acpCompact.onNotification({
+              method: 'session/update',
+              params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'resumed cleanly after compaction' } } },
+            });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const gw = createGateway({ acp: acpCompact, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => compactCfg, log: () => {} });
+      const p = await gw.listen([0]);
+      const tools = [{ type: 'function', name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } }];
+      const parseRespSse = async (r) => {
+        const raw = await r.text();
+        return raw.split('\n\n').filter(Boolean).map((blk) => {
+          const ev = /^event: (.+)$/m.exec(blk)?.[1];
+          const d = /^data: (.+)$/m.exec(blk)?.[1];
+          return ev && d ? { type: ev, data: JSON.parse(d) } : null;
+        }).filter(Boolean);
+      };
+      try {
+        // Step 1: 发起首轮桥接请求，进入第一次 park
+        const turn1 = await parseRespSse(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'bf876a46', tools, input: [{ role: 'user', content: 'inspect logs' }] }),
+        }));
+        const done1 = turn1.find((e) => e.type === 'response.completed');
+        const fc1 = done1.data.response.output.find((o) => o.type === 'function_call');
+        assert.ok(fc1, '首轮应挂起返回第一个 function_call');
+        assert.equal(done1.data.response.usage.input_tokens, 128945);
+        assert.equal(done1.data.response.usage.estimated, false);
+
+        // Step 2: 回填第一个工具结果，同时携带膨胀的本地历史文本，进入第二次 park
+        const bloatedHistory = 'x'.repeat(240000);
+        const turn2 = await parseRespSse(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'bf876a46', tools,
+            input: [
+              { role: 'user', content: bloatedHistory },
+              { type: 'function_call', call_id: fc1.call_id, name: 'Read', arguments: fc1.arguments },
+              { type: 'function_call_output', call_id: fc1.call_id, output: 'first file content' },
+            ],
+          }),
+        }));
+        const done2 = turn2.find((e) => e.type === 'response.completed');
+        assert.ok(done2, `续流轮应正常 completed，实际事件: ${JSON.stringify(turn2)}`);
+        const fc2 = done2.data.response.output.find((o) => o.type === 'function_call');
+        assert.ok(fc2, '续流轮应挂起返回第二个 function_call');
+        assert.equal(done2.data.response.usage.input_tokens, 128945, '第 2+ 次 park 必须继续上报运行时真实 contextUsed，不能退化成虚高本地估算');
+        assert.equal(done2.data.response.usage.estimated, false);
+
+        // Step 3: 此时 main-bridged-sess 正挂在第二个 Read 上！
+        // 真实模拟 PI-Desktop 发起的自动压缩请求（带 previous_response_id、instructions、完整历史多条消息、无 tools）：不得死锁！
+        const compactEvents = await parseRespSse(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'bf876a46',
+            previous_response_id: 'resp_real_world_turn2',
+            instructions: 'You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.',
+            input: [
+              { role: 'user', content: 'hello' },
+              { role: 'assistant', content: 'hi' },
+              { role: 'user', content: 'Summarize the entire conversation above.' },
+            ],
+          }),
+        }));
+        const compactDone = compactEvents.find((e) => e.type === 'response.completed');
+        assert.ok(compactDone, '自动压缩请求必须顺利完成，不得卡在 serializePrompt 死锁');
+        const summaryText = compactDone.data.response.output.find((o) => o.type === 'message').content[0].text;
+        assert.equal(summaryText, '<summary>compacted ok</summary>');
+        assert.ok(cancelledSessions.includes('main-bridged-sess'), '抢占挂起桥接轮次时必须发送 session/cancel');
+        assert.ok(closedSessions.some((s) => s.startsWith('ephemeral-compact-')), '压缩临时会话结束后必须立即 session/close 释放 worker');
+        assert.ok(!closedSessions.includes('main-bridged-sess'), '原业务会话不应被误关或销毁');
+        const ephemId = [...policiesSeen.keys()].find((s) => s.startsWith('ephemeral-compact-'));
+        assert.equal(policiesSeen.get(ephemId), 'none', '旁路压缩会话应强制使用 policy=none 禁止调内置工具');
+        assert.ok(
+          !sessionPrompts.some((p) => p.sid === 'main-bridged-sess' && p.promptText.includes('Summarize the entire conversation')),
+          '压缩提示词绝不能发进原业务会话污染上下文',
+        );
+
+        // Step 4: 压缩完成后宿主带着摘要与刚才本地已执行完的第二个 Read 结果继续提问
+        const turn3 = await parseRespSse(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'bf876a46', tools,
+            input: [
+              { role: 'user', content: '<context_summary>compacted</context_summary>' },
+              { type: 'function_call', call_id: fc2.call_id, name: 'Read', arguments: fc2.arguments },
+              { type: 'function_call_output', call_id: fc2.call_id, output: 'second file content after compaction' },
+            ],
+          }),
+        }));
+        const done3 = turn3.find((e) => e.type === 'response.completed');
+        assert.ok(done3, '压缩后业务会话应正常恢复回答');
+        const finalMsg = done3.data.response.output.find((o) => o.type === 'message').content[0].text;
+        assert.equal(finalMsg, 'resumed cleanly after compaction');
+        const resumedMainPrompts = sessionPrompts.filter((p) => p.sid === 'main-bridged-sess');
+        assert.equal(resumedMainPrompts.length, 2, '压缩后应继续复用原 main-bridged-sess 会话');
+        assert.ok(resumedMainPrompts[1].promptText.includes('second file content after compaction'), '被抢占期间宿主已完成的尾部工具结果应补进续跑提示词');
+      } finally {
+        gw.close();
+      }
+    });
     console.log(`${passed}/${passed} behavioral tests passed`);
   } finally { gateway.close(); }
 }

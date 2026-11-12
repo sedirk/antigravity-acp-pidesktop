@@ -576,6 +576,18 @@ async function main() {
     reopened.remove('k2');
     reopened.flush();
     assert.strictEqual(createSessionStore({ file }).load(), 1, '删除要落盘');
+    // 真实上下文用量（contextUsed / contextSize）跨重启保留；同 sessionId 更新元数据不冲掉旧值，换 sessionId 则重置
+    const withUsage = createSessionStore({ file });
+    withUsage.load();
+    withUsage.set('k1', { sessionId: 'sess-1', model: 'gemini-4-carbon', bridgeUrl: 'http://127.0.0.1:1/mcp', contextUsed: 128945, contextSize: 1048576 });
+    withUsage.set('k1', { sessionId: 'sess-1', model: 'gemini-4-carbon-high', bridgeUrl: 'http://127.0.0.1:1/mcp' });
+    withUsage.flush();
+    const usageReloaded = createSessionStore({ file });
+    usageReloaded.load();
+    assert.strictEqual(usageReloaded.get('k1').contextUsed, 128945, '同 sessionId 更新不应丢失已记录的 contextUsed');
+    assert.strictEqual(usageReloaded.get('k1').contextSize, 1048576, '同 sessionId 更新不应丢失已记录的 contextSize');
+    usageReloaded.set('k1', { sessionId: 'sess-new', model: 'gemini-4-carbon' });
+    assert.strictEqual(usageReloaded.get('k1').contextUsed, undefined, '切换新 sessionId 时不应继承旧会话的 contextUsed');
 
     // 过期足迹必须被剔除，否则重启后会拿早就没了的 sessionId 去 load
     fs.writeFileSync(file, JSON.stringify({
