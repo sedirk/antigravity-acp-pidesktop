@@ -6,66 +6,178 @@
 <title>Antigravity ACP · 配置</title>
 <style>
   :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
+  * { box-sizing: border-box; min-width: 0; }
   body {
     margin: 0;
-    padding: calc(var(--pi-plugin-titlebar-height, 0px) + 18px) 22px 22px;
+    padding: calc(var(--pi-plugin-titlebar-height, 0px) + 16px) 20px 24px;
     font: 13px/1.55 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
     background: #1b1b1d; color: #e6e6e8;
+    overflow-x: hidden;
   }
   h1 { font-size: 15px; margin: 0 0 2px; font-weight: 600; }
-  .sub { color: #8f8f96; font-size: 12px; margin-bottom: 16px; }
-  /* 每个分区是一张卡片：标题独占整行，卡片内部自己两列；窄屏自动单列。 */
-  .field { display: flex; flex-direction: column; gap: 5px; }
-  .grid { display: grid; grid-template-columns: 1fr; gap: 14px; }
+  .sub { color: #8f8f96; font-size: 12px; margin-bottom: 16px; word-break: break-word; }
+  .field { display: flex; flex-direction: column; gap: 5px; width: 100%; }
+  .grid { display: grid; grid-template-columns: 1fr; gap: 14px; width: 100%; }
   .group {
     display: grid; grid-template-columns: 1fr 1fr; gap: 12px 18px;
     border: 1px solid #2c2c31; border-radius: 10px;
     padding: 14px 16px 16px; background: #1e1e21;
+    width: 100%;
+  }
+  .group.highlight {
+    border-color: #3b5998;
+    background: #1c202a;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
+  }
+  .group.highlight-auth {
+    border-color: #2b5240;
+    background: #19231f;
+  }
+  .section-header {
+    grid-column: 1 / -1;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 0 0 4px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
   }
   .section {
-    grid-column: 1 / -1; margin: 0; font-size: 12px; font-weight: 600;
-    color: #9c9ca6; letter-spacing: .02em;
+    margin: 0; font-size: 13px; font-weight: 600;
+    color: #e2e2e8; letter-spacing: .02em;
+    display: flex; align-items: center; gap: 6px;
   }
-  @media (max-width: 760px) { .group { grid-template-columns: 1fr; } }
+  .badge {
+    display: inline-block;
+    padding: 1px 7px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: normal;
+  }
+  .badge.ok { background: rgba(58, 167, 109, 0.2); color: #6bd48a; border: 1px solid rgba(58, 167, 109, 0.4); }
+  .badge.warn { background: rgba(234, 179, 8, 0.2); color: #eab308; border: 1px solid rgba(234, 179, 8, 0.4); }
+  .badge.err { background: rgba(239, 68, 68, 0.2); color: #ff8a80; border: 1px solid rgba(239, 68, 68, 0.4); }
+  .badge.info { background: rgba(76, 125, 255, 0.2); color: #8cb0ff; border: 1px solid rgba(76, 125, 255, 0.4); }
+
+  @media (max-width: 760px) {
+    .group { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 520px) {
+    body { padding: calc(var(--pi-plugin-titlebar-height, 0px) + 12px) 12px 16px; }
+    .group { padding: 12px 12px 14px; gap: 10px; }
+  }
   .field.wide { grid-column: 1 / -1; }
-  label { font-size: 12px; color: #a9a9b0; }
-  input, select {
+  label { font-size: 12px; color: #a9a9b0; word-break: break-word; }
+  input, select, textarea {
     background: #232326; border: 1px solid #35353a; border-radius: 7px;
     color: #e6e6e8; padding: 7px 9px; font: inherit; outline: none;
+    width: 100%; max-width: 100%;
   }
-  input:focus, select:focus { border-color: #4c7dff; }
-  .hint { font-size: 11px; color: #7c7c84; }
-  .row { display: flex; gap: 8px; align-items: center; }
-  .row input { flex: 1; }
-  .actions { display: flex; gap: 8px; align-items: center; margin-top: 18px; flex-wrap: wrap; }
+  input:focus, select:focus, textarea:focus { border-color: #4c7dff; }
+  .hint { font-size: 11px; color: #7c7c84; word-break: break-word; line-height: 1.5; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; width: 100%; }
+  .row input { flex: 1 1 180px; }
+  .actions { display: flex; gap: 8px; align-items: center; margin-top: 18px; flex-wrap: wrap; width: 100%; }
+  .btn-group { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; width: 100%; }
   button {
     border: 1px solid #35353a; background: #26262a; color: #e6e6e8;
-    border-radius: 7px; padding: 7px 14px; font: inherit; cursor: pointer;
+    border-radius: 7px; padding: 7px 13px; font: inherit; cursor: pointer;
+    font-size: 12px; transition: background .15s, border-color .15s;
+    text-align: center;
   }
+  button:hover { background: #303036; border-color: #484852; }
   button.primary { background: #2f6bff; border-color: #2f6bff; color: #fff; font-weight: 600; }
+  button.primary:hover { background: #2458db; }
+  button.success { background: #2d8a55; border-color: #2d8a55; color: #fff; font-weight: 600; }
+  button.success:hover { background: #257548; }
+  button.danger { background: #8a2d2d; border-color: #8a2d2d; color: #fff; }
+  button.danger:hover { background: #a33535; }
+  button.ghost { background: transparent; border: 1px solid rgba(128,128,128,.4); color: inherit; padding: 4px 9px; font-size: 11px; }
+  button.ghost:hover { background: rgba(255,255,255,.06); }
   button:disabled { opacity: .5; cursor: default; }
-  .status { margin-top: 14px; font-size: 12px; white-space: pre-wrap; }
+  .status { margin-top: 14px; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
   .status.ok { color: #6bd48a; }
   .status.err { color: #ff8a80; }
-  .bar { height: 8px; background: #2a2a2f; border-radius: 4px; overflow: hidden; margin: 8px 0 4px; }
+  .bar { height: 8px; background: #2a2a2f; border-radius: 4px; overflow: hidden; margin: 8px 0 4px; width: 100%; }
   .bar > i { display: block; height: 100%; width: 0; background: #2f6bff; transition: width .3s ease; }
   .bar.done > i { background: #3aa76d; }
   .bar.fail > i { background: #c9483d; }
-  .path { margin-top: 16px; padding-top: 12px; border-top: 1px solid #2c2c31; font-size: 11px; color: #7c7c84; }
+  .path { margin-top: 16px; padding-top: 12px; border-top: 1px solid #2c2c31; font-size: 11px; color: #7c7c84; word-break: break-word; }
   code { background: #232326; padding: 2px 6px; border-radius: 4px; color: #b9b9c0; word-break: break-all; }
-  .section { margin: 18px 0 6px; font-size: 13px; color: #8a8a8a; border-bottom: 1px solid rgba(128,128,128,.25); padding-bottom: 4px; }
-  .row-actions { margin-top: 6px; }
-  button.ghost { background: transparent; border: 1px solid rgba(128,128,128,.4); color: inherit; padding: 4px 10px; border-radius: 6px; cursor: pointer; }
+  .row-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 4px; }
+  @media (max-width: 480px) {
+    .actions button { flex: 1 1 calc(50% - 6px); }
+    .btn-group button { flex: 1 1 calc(50% - 6px); }
+    button.primary-full { flex: 1 1 100% !important; }
+  }
 </style>
 </head>
 <body>
-  <h1>Antigravity ACP · 配置</h1>
-  <div class="sub">保存后网关会重启。本插件不保存任何 Google 凭据，登录由官方 ACP 运行时自己完成。</div>
+<h1>Antigravity ACP · 配置</h1>
+<div class="sub">将官方 Antigravity ACP 运行时桥接到 PI-Desktop。新手请先确认完成上方第 1、2 步。</div>
 
-  <form id="form" class="grid" autocomplete="off">
-    <section class="group">
-    <h3 class="section">服务与端点</h3>
+<form id="form" class="grid" autocomplete="off">
+
+  <!-- 1. 官方运行时管理 (最醒目置顶) -->
+  <section class="group highlight">
+    <div class="section-header">
+      <h3 class="section">1. 官方运行时 (agy_acp_server)</h3>
+      <span id="rtBadge" class="badge info">检测中…</span>
+    </div>
+
+    <div class="field wide">
+      <div style="font-size: 12px; color: #cfcfd6;" id="runtimeStatusSummary">状态检测中…</div>
+      <span class="hint" id="proxyHint"></span>
+    </div>
+
+    <div class="field wide">
+      <label for="bin">运行时程序路径 (bin)</label>
+      <input id="bin" type="text" placeholder="留空即默认使用插件数据目录下的官方运行时">
+      <span class="hint" id="binHint"></span>
+    </div>
+
+    <!-- 聚合所有运行时操作按钮 -->
+    <div class="field wide">
+      <label>运行时操作与管理</label>
+      <div class="btn-group">
+        <button id="install" type="button" class="primary primary-full">下载官方运行时 (约 120 MB)</button>
+        <button id="restartRuntime" type="button">重启运行时</button>
+        <button id="cleanup" type="button">清理运行时文件</button>
+        <button id="refreshRuntimeBtn" type="button" class="ghost">刷新运行时状态</button>
+      </div>
+      <!-- 内嵌下载进度条 -->
+      <div class="bar" id="bar"><i id="barFill"></i></div>
+      <div class="hint" id="progress"></div>
+    </div>
+  </section>
+
+  <!-- 2. Google 账号认证 (最醒目置顶) -->
+  <section class="group highlight highlight-auth">
+    <div class="section-header">
+      <h3 class="section">2. Google 账号认证</h3>
+      <span id="authBadge" class="badge warn">检测中…</span>
+    </div>
+
+    <div class="field wide">
+      <div style="font-size: 12px; color: #cfcfd6;" id="authStatusText">登录状态：读取中…</div>
+      <span class="hint" id="authDetailText">无需安装 Antigravity 官方客户端。点击下方按钮将唤起后台运行时并在默认浏览器中打开 Google 官方授权页；授权完成后凭据自动持久化在本地。</span>
+    </div>
+
+    <div class="field wide">
+      <div class="btn-group">
+        <button id="loginGoogle" type="button" class="success primary-full">登录 Google 账号 (调起浏览器)</button>
+        <button id="refreshAuth" type="button" class="ghost">刷新认证状态</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- 3. 服务与端点 -->
+  <section class="group">
+    <div class="section-header">
+      <h3 class="section">服务与端点</h3>
+    </div>
     <div class="field">
       <label for="port">网关端口</label>
       <input id="port" type="number" min="1024" max="65535">
@@ -78,7 +190,6 @@
         <option value="manual">手动（用下面填的地址）</option>
         <option value="direct">直连（不使用代理）</option>
       </select>
-      <span class="hint" id="proxyHint"></span>
     </div>
     <div class="field">
       <label for="proxy">手动代理地址（仅手动模式生效）</label>
@@ -87,44 +198,26 @@
     <div class="field">
       <label for="toolPolicy">工具权限（本插件的安全策略，默认全部放行）</label>
       <select id="toolPolicy">
-        <option value="all">全部放行（默认：不作拦截，读写文件/命令行/子代理均交给运行时与宿主）</option>
-        <option value="shell">只读 + 命令行（放行 execute/read/search 等，拦截 write/edit 写文件）</option>
-        <option value="agent">只读 + 子代理/生图（放行 other/search/read 等，拦截直接运行 shell 命令与写文件）</option>
-        <option value="search">纯只读模式（仅放行联网搜索/抓取网页/读文件，拦截所有写与执行）</option>
-        <option value="none">纯对话模式（拒绝所有外部工具与命令调用）</option>
+        <option value="all">全部放行（默认：不作拦截，读写文件/命令执行/子代理均交给运行时与宿主）</option>
+        <option value="shell">只读 + 命令行（允许 execute/read/search 等，禁止写/改文件）</option>
+        <option value="agent">只读 + 子代理/搜图（允许 other/search/read 等，绝绝弹出命令行窗口与写文件）</option>
+        <option value="search">纯只读模式（仅允许联网搜索与查看文件，防止任何系统环境变动）</option>
+        <option value="none">纯对话模式（完全拦截工具，降级为纯文本对话模式）</option>
       </select>
-      <span class="hint">各档位详细说明：<br>
+      <span class="hint">各位详细说明：<br>
       • <b>all（全部放行）</b>：不作拦截；工具执行与权限确认交由宿主卡片处理。<br>
       • <b>shell（执行 + 只读）</b>：允许跑 bash/powershell 命令与读文件，禁止写/改文件。<br>
       • <b>agent（子任务 + 只读）</b>：允许委派子代理与生图，杜绝弹出命令行窗口与写文件。<br>
       • <b>search（纯只读）</b>：仅允许联网搜索与查看文件，防止任何系统环境变动。<br>
       • <b>none（纯对话）</b>：完全拦截工具，降级为纯文本对话模式。</span>
     </div>
-    <div class="field wide">
-      <label for="bin">ACP 运行时（agy_acp_server.exe）</label>
-      <div class="row">
-        <input id="bin" type="text" placeholder="C:\\...\\agy_acp_server.exe">
-        <button id="install" type="button">下载官方运行时</button>
-      </div>
-      <span class="hint" id="binHint"></span>
-    </div>
+  </section>
 
-    </section>
-    <section class="group">
-    <h3 class="section">Google 账号认证</h3>
-    <div class="field wide">
-      <div class="row" style="justify-content: space-between; align-items: center;">
-        <span class="hint" id="authStatusText">登录状态：读取中…</span>
-        <div class="row-actions">
-          <button id="loginGoogle" type="button" class="primary">登录 Google 账号 (调起浏览器)</button>
-          <button id="refreshAuth" type="button" class="ghost">刷新认证</button>
-        </div>
-      </div>
-      <span class="hint" id="authDetailText">无需安装 Antigravity 官方客户端。点击后将拉起后台运行时并在默认浏览器中弹出 Google 官方授权页；登录授权完成后凭据自动持久化在本地。</span>
+  <!-- 4. 模型与思考 -->
+  <section class="group">
+    <div class="section-header">
+      <h3 class="section">模型与思考</h3>
     </div>
-    </section>
-    <section class="group">
-    <h3 class="section">模型与思考</h3>
     <div class="field">
       <label for="defaultModel">默认模型</label>
       <input id="defaultModel" type="text" placeholder="gemini-3.8-flash">
@@ -133,7 +226,6 @@
       <label for="modelCacheMinutes">模型缓存（分钟）</label>
       <input id="modelCacheMinutes" type="number" min="0" max="60">
     </div>
-
     <div class="field">
       <label for="defaultEffort">默认思考档位（请求未指定时）</label>
       <select id="defaultEffort">
@@ -151,9 +243,13 @@
         <option value="false">关闭（每个档位单独列出）</option>
       </select>
     </div>
-    </section>
-    <section class="group">
-    <h3 class="section">会话与超时</h3>
+  </section>
+
+  <!-- 5. 会话与超时 -->
+  <section class="group">
+    <div class="section-header">
+      <h3 class="section">会话与超时</h3>
+    </div>
     <div class="field">
       <label for="cancelOnDisconnect">客户端断开即停止</label>
       <select id="cancelOnDisconnect">
@@ -169,10 +265,23 @@
         <option value="true">列出 -low/-medium/-high</option>
       </select>
     </div>
+    <div class="field">
+      <label for="promptTimeoutMinutes">单次回答超时（分钟）</label>
+      <input id="promptTimeoutMinutes" type="number" min="0" max="1440">
+      <span class="hint">0 = 不设上限（推荐）。长任务可以一直跑，真正的止损是「无进展判定」。</span>
+    </div>
+    <div class="field">
+      <label for="promptIdleSeconds">无进展判定（秒，默认 180）</label>
+      <input id="promptIdleSeconds" type="number" min="30" max="3600">
+      <span class="hint">连续这么久收不到任何进展才取消本轮；只要运行时还在报工具进展就不会被砍</span>
+    </div>
+  </section>
 
-    </section>
-    <section class="group">
-    <h3 class="section">高级</h3>
+  <!-- 6. 高级与并发 -->
+  <section class="group">
+    <div class="section-header">
+      <h3 class="section">高级与并发</h3>
+    </div>
     <div class="field">
       <label for="concurrency">最大并发（0 = 不限制，默认关闭）</label>
       <input id="concurrency" type="number" min="0" max="8">
@@ -182,39 +291,32 @@
       <label for="queueTimeoutMinutes">排队超时（分钟）</label>
       <input id="queueTimeoutMinutes" type="number" min="1" max="60">
     </div>
-
-    <div class="field">
-      <label for="promptTimeoutMinutes">单次回答超时（分钟）</label>
-      <input id="promptTimeoutMinutes" type="number" min="0" max="1440">
-      <span class="hint">0 = 不设上限（推荐）。长任务可以一直跑，真正的止损是下面的「无进展判定」。</span>
-    </div>
-    <div class="field">
-      <label for="promptIdleSeconds">无进展判定（秒，默认 180）</label>
-      <input id="promptIdleSeconds" type="number" min="30" max="3600">
-      <span class="hint">连续这么久收不到任何进展才取消本轮；只要运行时还在报工具进展就不会被砍（长任务的真正保护）</span>
-    </div>
-    </section>
-    <section class="group">
-    <h3 class="section">工具与桥接</h3>
-    <div class="field">
-      <label for="bridgeTools">工具回交（实验）</label>
-      <select id="bridgeTools"><option value="false">关闭</option><option value="true">开启</option></select>
-      <span class="hint">开启后运行时的工具调用会交给 PI-Desktop 执行（原生工具卡片、可调用 Task 子代理）；工具不再由运行时自己跑</span>
-    </div>
     <div class="field">
       <label for="clientName">客户端名称（解锁第三方模型）</label>
       <input id="clientName" type="text" maxlength="40" placeholder="留空＝antigravity-acp-pidesktop">
       <span class="hint">上游 1.3.0 只在 clientInfo.name 为 Zed / Xcode / JetBrains 时才提供 Claude、GPT-OSS；填 Zed 即可看到</span>
     </div>
-    <div class="field wide">
+    <div class="field">
       <label for="idleSessionMinutes">会话空闲回收（分钟）</label>
       <input id="idleSessionMinutes" type="number" min="1" max="240">
-      <span class="hint">到点用 session/close 放掉运行时的 worker；下次发言优先 session/resume（不重放历史）</span>
+      <span class="hint">到点用 session/close 释放运行时的 worker；下次发言优先 session/resume 接回</span>
+    </div>
+  </section>
+
+  <!-- 7. 工具与桥接 -->
+  <section class="group">
+    <div class="section-header">
+      <h3 class="section">工具与桥接</h3>
+    </div>
+    <div class="field">
+      <label for="bridgeTools">工具回交（实验）</label>
+      <select id="bridgeTools"><option value="false">关闭</option><option value="true">开启</option></select>
+      <span class="hint">开启后运行时的工具调用会交给 PI-Desktop 执行（原生工具卡片、可调用 Task 子代理）；工具不再由运行时自己跑</span>
     </div>
     <div class="field wide">
       <label for="bridgeGuidance">桥接提示层（可改）</label>
       <input id="bridgeGuidanceDefault" type="hidden">
-      <textarea id="bridgeGuidance" rows="6" placeholder="留空使用内置文案；可用 {tools} 占位，会被替换成可用的桥接工具名"></textarea>
+      <textarea id="bridgeGuidance" rows="5" placeholder="留空使用内置文案；可用 {tools} 占位，会被替换成可用的桥接工具名"></textarea>
       <div class="row-actions"><button id="bridgeGuidanceReset" type="button" class="ghost">恢复默认</button></div>
       <span class="hint">每次发给运行时的提示会以这段开头；内置文案让它在阶段之间总体汇报进度，不必每调一次工具就解释一遍</span>
     </div>
@@ -223,45 +325,46 @@
       <div class="row">
         <input id="cwd" type="text" placeholder="留空即用当前项目目录（没有项目时用用户主目录）">
       </div>
-      <span class="hint">运行时的文件工具（view_file / write_to_file）只认这个目录和 ~/.gemini；run_command 走系统权限、不受它限制（实测能读 cwd 之外的路径）。留空 = 每次建会话现问宿主当前项目，切项目不用重启网关。</span>
+      <span class="hint">运行时的文件工具（view_file / write_to_file）只认这个目录和 ~/.gemini；run_command 走系统权限、不受它限制。留空即可。</span>
     </div>
-    </section>
-    <section class="group">
-    <h3 class="section">会话管理与内存状态</h3>
-    <div class="field wide">
-      <div class="row" style="justify-content: space-between;">
-        <span class="hint" id="sessionSummary">内存活跃会话：读取中…</span>
-        <div class="row-actions">
-          <button id="refreshSessions" type="button" class="ghost">刷新会话</button>
-          <button id="recycleSessions" type="button" class="ghost">一键回收闲置</button>
-        </div>
+  </section>
+
+  <!-- 8. 会话管理与内存状态 -->
+  <section class="group">
+    <div class="section-header">
+      <h3 class="section">会话管理与内存状态</h3>
+      <div class="row-actions" style="margin-top:0;">
+        <button id="refreshSessions" type="button" class="ghost">刷新会话</button>
+        <button id="recycleSessions" type="button" class="ghost">一键回收闲置</button>
       </div>
-      <div id="sessionTable" style="margin-top: 8px; font-size: 11px; max-height: 180px; overflow-y: auto; background: #232326; border-radius: 6px; padding: 8px 12px; border: 1px solid #35353a;">暂无活跃会话</div>
-      <span class="hint">说明：回收闲置会话会向运行时的 worker 发送 session/close 释放内存占用；会话足迹持久保存在本地，用户继续发言时会自动 session/load 接回上下文，不丢任何历史。</span>
     </div>
-    </section>
-  </form>
+    <div class="field wide">
+      <span class="hint" id="sessionSummary">内存活跃会话：读取中…</span>
+      <div id="sessionTable" style="margin-top: 8px; font-size: 11px; max-height: 180px; overflow-y: auto; background: #161618; border: 1px solid #2a2a2e; border-radius: 6px; padding: 6px 10px; color: #a9a9b0;">读取中…</div>
+      <span class="hint" style="margin-top: 4px;">说明：回收闲置会话会向运行时的 worker 发送 session/close 释放内存占用；会话足迹持久保存在本地，用户继续发言时会自动 session/load 接回上下文，不丢任何历史。</span>
+    </div>
+  </section>
+</form>
 
-  <div class="actions">
-    <button class="primary" id="save" type="button">保存并重启网关</button>
-    <button id="reload" type="button">重新读取</button>
-    <button id="status" type="button">查看状态</button>
-    <button id="models" type="button">列出模型</button>
-    <button id="restartRuntime" type="button">重启运行时</button>
-    <button id="cleanup" type="button">清理运行时</button>
-  </div>
+<!-- 底部通用网关操作 -->
+<div class="actions">
+  <button class="primary" id="save" type="button">保存并重启网关</button>
+  <button id="reload" type="button">重新读取配置</button>
+  <button id="status" type="button">查看网关状态</button>
+  <button id="models" type="button">列出可用模型</button>
+</div>
 
-  <div class="bar" id="bar"><i id="barFill"></i></div>
-  <div class="hint" id="progress"></div>
-
-  <div class="status" id="msg"></div>
-  <div class="path">配置文件：<code id="file">（读取中）</code></div>
+<div class="status" id="msg"></div>
+<div class="path">配置文件：<code id="file">（读取中）</code></div>
 
 <script>
 (function () {
   const bridge = window.pluginBridge;
-const ids = ['port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', 'idleSessionMinutes', 'bin', 'defaultModel', 'modelCacheMinutes', 'defaultEffort', 'virtualModels',
-      'exposeVariantModels', 'concurrency', 'queueTimeoutMinutes', 'promptTimeoutMinutes', 'promptIdleSeconds', 'clientName', 'bridgeTools', 'bridgeGuidance', 'cwd'];
+  const ids = [
+    'port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', 'idleSessionMinutes', 'bin', 'defaultModel',
+    'modelCacheMinutes', 'defaultEffort', 'virtualModels', 'bridgeTools', 'cwd', 'bridgeGuidance',
+    'exposeVariantModels', 'concurrency', 'queueTimeoutMinutes', 'promptTimeoutMinutes', 'promptIdleSeconds', 'clientName'
+  ];
   const $ = (id) => document.getElementById(id);
   const msg = $('msg');
 
@@ -277,70 +380,55 @@ const ids = ['port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', '
   async function load() {
     show('正在读取配置…');
     try {
-      const view = await call('config:read');
-      for (const id of ids) {
-        if (id === 'virtualModels' || id === 'exposeVariantModels' || id === 'cancelOnDisconnect' || id === 'bridgeTools') {
-          $(id).value = view[id] === false ? 'false' : 'true';
-          continue;
+      const cfg = await call('config:get');
+      if (!cfg) throw new Error('返回为空');
+      ids.forEach((id) => {
+        const el = $(id);
+        if (!el) return;
+        const val = cfg[id];
+        if (val === undefined || val === null) return;
+        if (el.tagName === 'SELECT') {
+          el.value = String(val);
+        } else {
+          el.value = val;
         }
-        $(id).value = view[id] === undefined || view[id] === null ? '' : view[id];
+      });
+      $('binHint').textContent = cfg.bin ? '当前指定：' + cfg.bin : '（留空＝使用插件数据目录下的官方运行时）';
+      if (cfg._defaults && cfg._defaults.bridgeGuidance) {
+        $('bridgeGuidanceDefault').value = cfg._defaults.bridgeGuidance;
       }
-      const def = view.bridgeGuidanceDefault || '';
-      $('bridgeGuidanceDefault').value = def;
-      if (!view.bridgeGuidance && def) $('bridgeGuidance').value = def;
-      $('file').textContent = view.file + (view.exists ? '' : '（尚未创建）');
-      $('binHint').textContent = view.binExists ? '运行时已就绪' : '尚未安装运行时';
-      const warn = (view.warnings || []).filter(Boolean);
-      show(warn.length ? '已读取。\n' + warn.join('\n') : '已读取配置。', warn.length ? '' : 'ok');
+      $('file').textContent = cfg._file || '未知';
+      show('配置已载入', 'ok');
       await refreshRuntime();
     } catch (error) {
       show('读取失败：' + (error && error.message ? error.message : error), 'err');
     }
   }
 
-  const clearableTextIds = new Set(['proxy', 'bin', 'defaultModel', 'defaultEffort', 'clientName', 'bridgeGuidance', 'cwd']);
-  function collect() {
-    const payload = {};
-    for (const id of ids) {
-      const el = $(id);
-      if (id === 'virtualModels' || id === 'exposeVariantModels' || id === 'cancelOnDisconnect' || id === 'bridgeTools') {
-        payload[id] = el.value === 'true';
-        continue;
-      }
-      if (id === 'bridgeGuidance') {
-        const def = $('bridgeGuidanceDefault').value || '';
-        payload[id] = el.value.trim() === def.trim() ? '' : el.value;
-        continue;
-      }
-      if (el.value === '' && !clearableTextIds.has(id)) continue;
-      payload[id] = el.value;
-    }
-    return payload;
-  }
-
   async function save() {
-    const button = $('save');
-    button.disabled = true;
     show('正在保存…');
+    const data = {};
+    ids.forEach((id) => {
+      const el = $(id);
+      if (!el) return;
+      data[id] = el.value;
+    });
     try {
-      const result = await call('config:write', collect());
+      const result = await call('config:save', data);
       if (!result || result.ok !== true) {
-        show('保存失败：\n' + ((result && result.errors) || ['未知错误']).join('\n'), 'err');
+        show('保存失败：' + ((result && result.error) || '未知错误'), 'err');
         return;
       }
-      const lines = ['已保存到 ' + result.file];
-      if (result.changed && result.changed.length) lines.push('修改项：' + result.changed.join(', '));
-      if (result.port) lines.push('网关已重启，端口 ' + result.port);
-      if (result.restartError) lines.push('重启失败：' + result.restartError);
-      show(lines.join('\n'), result.restartError ? 'err' : 'ok');
-      await load().catch(function () {});
+      show('已保存并重启网关！\n' + (result.endpoint ? '服务地址：' + result.endpoint : ''), 'ok');
+      await refreshRuntime();
+      await refreshSessions();
     } catch (error) {
       show('保存失败：' + (error && error.message ? error.message : error), 'err');
-    } finally { button.disabled = false; }
+    }
   }
 
   async function status() {
-    show('正在查询…');
+    show('正在查询状态…');
     try {
       const snap = await call('gateway:status');
       if (!snap || snap.running !== true) { show('网关未运行', 'err'); return; }
@@ -355,7 +443,7 @@ const ids = ['port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', '
         '并发 ' + (limit.limit > 0 ? limit.limit + '（进行 ' + limit.active + '，排队 ' + limit.queued + '）' : '不限'),
         '工具权限 ' + (snap.toolPolicy || 'all'),
         snap.lastRequest
-          ? '最近一轮 ' + snap.lastRequest.ms + ' ms · 上下文 ' + snap.lastRequest.contextUsed + '/' + snap.lastRequest.contextSize
+          ? '最近一轮 ' + snap.lastRequest.ms + ' ms · 上下文 ' + snap.lastRequest.contextUsed + '/' + snap.lastRequest.contextSize + ' tokens'
           : '还没有请求记录',
         '代理 ' + (snap.proxy && typeof snap.proxy === 'object'
           ? ((snap.proxy.url || '直连') + '（' + snap.proxy.source + '：' + snap.proxy.note + '）')
@@ -381,35 +469,71 @@ const ids = ['port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', '
     const bar = $('bar');
     const fill = $('barFill');
     const label = $('progress');
+    const badge = $('rtBadge');
+    const summary = $('runtimeStatusSummary');
     const total = rt.total || rt.expectedBytes || 1;
     const pct = Math.max(0, Math.min(100, Math.round(((rt.received || 0) / total) * 100)));
     const elapsed = rt.startedAt ? (Date.now() - rt.startedAt) / 1000 : 0;
     const speed = elapsed > 1 && rt.received > 0 ? rt.received / elapsed : 0;
+
     bar.className = 'bar' + (rt.phase === 'done' ? ' done' : rt.phase === 'error' ? ' fail' : '');
+    
     if (rt.phase === 'downloading') {
       fill.style.width = pct + '%';
       label.textContent = '下载中 ' + pct + '% · ' + mb(rt.received) + ' / ' + mb(total) + (speed > 0 ? ' · ' + mb(speed) + '/s' : '');
+      if (badge) { badge.className = 'badge warn'; badge.textContent = '下载中 ' + pct + '%'; }
     } else if (rt.phase === 'verifying') {
       fill.style.width = '100%';
       label.textContent = '下载完成，正在校验 SHA256…';
+      if (badge) { badge.className = 'badge warn'; badge.textContent = '校验 SHA256'; }
     } else if (rt.phase === 'extracting') {
       fill.style.width = '100%';
       label.textContent = '校验通过，正在解压…';
+      if (badge) { badge.className = 'badge warn'; badge.textContent = '解压中'; }
     } else if (rt.phase === 'done') {
       fill.style.width = '100%';
       label.textContent = '已就绪 · ' + mb(rt.bytes || rt.dirBytes) + ' · SHA256 校验通过';
+      if (badge) { badge.className = 'badge ok'; badge.textContent = '已就绪'; }
     } else if (rt.phase === 'error') {
       label.textContent = '安装失败：' + (rt.error || '未知错误');
+      if (badge) { badge.className = 'badge err'; badge.textContent = '安装失败'; }
     } else {
       fill.style.width = rt.binExists ? '100%' : '0%';
       label.textContent = rt.binExists
         ? '已安装 · ' + mb(rt.dirBytes) + ' · 卸载插件不会自动删除这些文件'
         : '尚未安装运行时（约 120 MB）';
+      if (badge) {
+        if (rt.ready || rt.binExists) {
+          badge.className = 'badge ok';
+          badge.textContent = rt.ready ? '运行中 (PID ' + rt.pid + ')' : '已安装 (待命)';
+        } else {
+          badge.className = 'badge warn';
+          badge.textContent = '未安装';
+        }
+      }
     }
+
+    if (summary) {
+      if (rt.binExists) {
+        summary.innerHTML = '<span style="color:#6bd48a;font-weight:600">● 运行时文件已就绪</span> ' +
+          '<span style="color:#8f8f96">(' + mb(rt.dirBytes) + (rt.pid ? ' · 运行中 PID: ' + rt.pid : ' · 空闲待命') + ')</span>';
+      } else {
+        summary.innerHTML = '<span style="color:#ff8a80;font-weight:600">○ 尚未安装官方运行时</span> ' +
+          '<span style="color:#8f8f96">（请点击下方按钮一键下载约 120 MB）</span>';
+      }
+    }
+
     $('install').disabled = rt.busy === true;
+    if (rt.binExists) {
+      $('install').textContent = '重新下载官方运行时 (约 120 MB)';
+      $('install').className = 'primary-full';
+    } else {
+      $('install').textContent = '一键下载官方运行时 (约 120 MB)';
+      $('install').className = 'primary primary-full';
+    }
     $('cleanup').disabled = rt.busy === true || !(rt.dirBytes > 0);
     if (rt.proxy) {
-      $('proxyHint').textContent = (rt.proxy.url || '直连') + '（来源 ' + rt.proxy.source + '：' + rt.proxy.note + '）';
+      $('proxyHint').textContent = '网络代理：' + (rt.proxy.url || '直连') + '（来源 ' + rt.proxy.source + '：' + rt.proxy.note + '）';
     }
   }
 
@@ -437,7 +561,7 @@ const ids = ['port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', '
   }
 
   async function install() {
-    show('已开始下载，进度见下方进度条…');
+    show('已开始下载，进度见上方进度条…');
     try {
       const result = await call('runtime:install');
       if (!result || result.ok !== true) { show('启动下载失败：' + ((result && result.error) || '未知错误'), 'err'); return; }
@@ -457,28 +581,30 @@ const ids = ['port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', '
     } catch (error) { show('清理失败：' + (error && error.message ? error.message : error), 'err'); }
   }
 
-  $('save').addEventListener('click', save);
-  $('reload').addEventListener('click', load);
-  $('status').addEventListener('click', status);
-  $('models').addEventListener('click', models);
-  $('install').addEventListener('click', install);
-  $('cleanup').addEventListener('click', cleanup);
-  $('bridgeGuidanceReset').addEventListener('click', () => {
-    $('bridgeGuidance').value = $('bridgeGuidanceDefault').value || '';
-    show('已填入内置文案，点保存生效（与默认一致时不会固化进 config.json）。', 'ok');
-  });
-  $('restartRuntime').addEventListener('click', async () => {
-    const button = $('restartRuntime');
-    if (!window.confirm('重启运行时会结束正在进行的对话，下一次请求会自动拉起。继续？')) return;
-    button.disabled = true;
-    show('正在重启运行时…');
+  async function refreshAuth() {
+    const text = $('authStatusText');
+    const btn = $('loginGoogle');
+    const badge = $('authBadge');
     try {
-      const result = await call('runtime:restart');
-      if (!result || result.ok !== true) { show('重启失败：' + ((result && result.error) || '未知错误'), 'err'); return; }
-      show('已结束运行时进程' + (result.pid ? '（pid ' + result.pid + '）' : '') + '；下一次请求会自动拉起。\n会话足迹还在，下次发言会先尝试 session/load 接回。', 'ok');
-    } catch (error) {
-      show('重启失败：' + (error && error.message ? error.message : error), 'err');
-    } finally { button.disabled = false; }
+      const res = await call('auth:status');
+      if (res && res.loggedIn) {
+        text.innerHTML = '<span style="color:#6bd48a;font-weight:600">✓ 已登录 Google 账号</span>' +
+          (res.projectId ? ' <span style="color:#8f8f96">(' + res.projectId + ')</span>' : '');
+        if (badge) { badge.className = 'badge ok'; badge.textContent = '已授权'; }
+        btn.textContent = '重新登录 Google 账号 (调起浏览器)';
+        btn.className = 'primary-full';
+      } else {
+        text.innerHTML = '<span style="color:#ff8a80;font-weight:600">✕ 未登录 Google 账号</span> <span style="color:#8f8f96">（缺少有效的本地授权凭据）</span>';
+        if (badge) { badge.className = 'badge err'; badge.textContent = '未登录'; }
+        btn.textContent = '一键登录 Google 账号 (调起浏览器)';
+        btn.className = 'success primary-full';
+      }
+    } catch (e) {
+      text.textContent = '检查登录状态失败：' + (e && e.message ? e.message : e);
+      if (badge) { badge.className = 'badge err'; badge.textContent = '检测失败'; }
+    }
+  }
+
   async function refreshSessions() {
     const sum = $('sessionSummary');
     const table = $('sessionTable');
@@ -486,17 +612,17 @@ const ids = ['port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', '
       const res = await call('sessions:list');
       const list = (res && res.sessions) || [];
       const activeCount = list.filter((s) => !s.closed).length;
-      sum.textContent = '内存会话：共 ' + list.length + ' 个（活跃 ' + activeCount + ' 个 · 闲置已关闭 ' + (list.length - activeCount) + ' 个）';
+      sum.textContent = '内存会话总计 ' + list.length + ' 个（活跃 ' + activeCount + ' 个 · 闲置已关闭 ' + (list.length - activeCount) + ' 个）';
       if (list.length === 0) {
-        table.textContent = '暂无内存中的活跃会话。';
+        table.textContent = '当前没有活跃会话';
         return;
       }
       table.innerHTML = list.map((s) => {
-        const statusText = s.inflight > 0 ? '<span style="color:#6bd48a">进行中</span>' : (s.closed ? '<span style="color:#7c7c84">已关闭</span>' : '<span style="color:#4c7dff">活跃就绪</span>');
+        const statusText = s.inflight > 0 ? '<span style="color:#6bd48a">进行中</span>' : (s.closed ? '<span style="color:#8f8f96">已休眠</span>' : '<span style="color:#ffcc66">待命中</span>');
         const bridgedText = s.bridged ? ' [桥接]' : '';
         const keyShort = String(s.key || '').slice(0, 16) + '…';
         const sessShort = String(s.sessionId || '').slice(0, 10) + '…';
-        return '<div style="display:flex; justify-content:space-between; padding:3px 0; border-bottom:1px solid #2e2e33;">' +
+        return '<div style="display:flex; justify-content:space-between; padding:3px 0; border-bottom:1px solid #2e2e33; flex-wrap:wrap; gap:4px;">' +
           '<span><code>' + keyShort + '</code> (' + sessShort + ') ' + (s.model || '默认模型') + bridgedText + '</span>' +
           '<span>' + statusText + ' · 闲置 ' + s.ageSeconds + 's · 上下文 ' + (s.contextUsed || 0) + 't</span>' +
           '</div>';
@@ -506,22 +632,33 @@ const ids = ['port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', '
     }
   }
 
-  async function refreshAuth() {
-    const text = $('authStatusText');
-    const btn = $('loginGoogle');
+  $('save').addEventListener('click', save);
+  $('reload').addEventListener('click', load);
+  $('status').addEventListener('click', status);
+  $('models').addEventListener('click', models);
+  $('install').addEventListener('click', install);
+  $('cleanup').addEventListener('click', cleanup);
+  if ($('refreshRuntimeBtn')) $('refreshRuntimeBtn').addEventListener('click', refreshRuntime);
+
+  $('bridgeGuidanceReset').addEventListener('click', () => {
+    $('bridgeGuidance').value = $('bridgeGuidanceDefault').value || '';
+    show('已填入内置文案，点保存生效（与默认一致时不会固化进 config.json）。', 'ok');
+  });
+
+  $('restartRuntime').addEventListener('click', async () => {
+    const button = $('restartRuntime');
+    if (!window.confirm('重启运行时会结束正在进行的对话，下一次请求会自动拉起。继续？')) return;
+    button.disabled = true;
+    show('正在重启运行时…');
     try {
-      const res = await call('auth:status');
-      if (res && res.loggedIn) {
-        text.innerHTML = '<span style="color:#6bd48a;font-weight:600">✓ 已登录 Google 账号</span>' + (res.projectId ? ' <span style="color:#8f8f96">(' + res.projectId + ')</span>' : '');
-        btn.textContent = '重新登录 Google 账号';
-      } else {
-        text.innerHTML = '<span style="color:#ff8a80;font-weight:600">未登录</span> <span style="color:#8f8f96">（缺少有效的 Google 授权凭证）</span>';
-        btn.textContent = '登录 Google 账号 (调起浏览器)';
-      }
-    } catch (e) {
-      text.textContent = '检查登录状态失败：' + (e && e.message ? e.message : e);
-    }
-  }
+      const result = await call('runtime:restart');
+      if (!result || result.ok !== true) { show('重启失败：' + ((result && result.error) || '未知原因'), 'err'); return; }
+      show('已结束旧运行时子进程' + (result.pid ? '（pid ' + result.pid + '）' : '') + '，下一次请求会自动拉起。\n会话足迹仍在，下次发言优先 session/load。', 'ok');
+      await refreshRuntime();
+    } catch (error) {
+      show('重启失败：' + (error && error.message ? error.message : error), 'err');
+    } finally { button.disabled = false; }
+  });
 
   $('refreshAuth').addEventListener('click', refreshAuth);
   $('loginGoogle').addEventListener('click', async () => {
@@ -533,7 +670,7 @@ const ids = ['port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', '
     try {
       const res = await call('auth:login');
       if (res && res.ok) {
-        show('Google 授权成功！凭证已在本地就绪。', 'ok');
+        show('Google 授权成功！凭据已就绪。', 'ok');
       } else {
         show('登录未完成：' + ((res && res.error) || '未知原因'), 'err');
       }
@@ -561,6 +698,7 @@ const ids = ['port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', '
       btn.disabled = false;
     }
   });
+
   load();
   refreshAuth();
   refreshSessions();
