@@ -1016,6 +1016,80 @@ async function main() {
         gw.close();
       }
     });
+    await check('edit and retry: stopping then editing user turn resets session and feeds new content (version 2/2)', async () => {
+      const p = 43700 + Math.floor(Math.random() * 500);
+      let sessSeq = 0;
+      const createdSessions = [];
+      const closedSessions = [];
+      const promptsReceived = [];
+      const acpMock = {
+        policyBySession: new Map(),
+        modelsForApi: async () => [{ id: 'test', name: 'Test' }],
+        resolveModel: async () => 'test',
+        discover: async () => ({ raw: [{ id: 'test' }], groups: new Map() }),
+        cwdFor: async () => require('node:os').tmpdir(),
+        start: async () => {}, status: () => ({ running: true }),
+        notify: (method, params) => {},
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            const sid = `sess-edit-${++sessSeq}`;
+            createdSessions.push(sid);
+            return { sessionId: sid, models: { currentModelId: 'test' } };
+          }
+          if (method === 'session/close') {
+            closedSessions.push(params.sessionId);
+            return {};
+          }
+          if (method === 'session/prompt') {
+            promptsReceived.push({ sid: params.sessionId, prompt: params.prompt });
+            const pStr = typeof params.prompt === 'string' ? params.prompt : JSON.stringify(params.prompt);
+            if (pStr.includes('v1 question')) {
+              // 模拟第一轮较长生成
+              await new Promise((r) => setTimeout(r, 200));
+            } else if (pStr.includes('v2 modified with details')) {
+              acpMock.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'version 2 answer' } } } });
+            }
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const gw = createGateway({ acp: acpMock, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => config, log: () => {} });
+      await gw.listen([p]);
+      const tools = [{ type: 'function', function: { name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } } }];
+      try {
+        const parseChatSse = async (r) => (await r.text()).split('\n').filter((x) => x.startsWith('data: {')).map((x) => JSON.parse(x.slice(6)));
+        // 1. 发起第 1 轮
+        const ac1 = new AbortController();
+        const req1 = fetch(`http://127.0.0.1:${p}/v1/chat/completions`, {
+          method: 'POST', headers: { 'content-type': 'application/json' }, signal: ac1.signal,
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'edit-cache-key', tools, messages: [{ role: 'user', content: 'v1 question' }] }),
+        }).catch(() => {});
+        await new Promise((r) => setTimeout(r, 30));
+        // 用户点击停止（Abort）
+        ac1.abort();
+        await new Promise((r) => setTimeout(r, 50));
+
+        // 2. 用户在客户端修改上一轮提问，重新发送（生成版本 2/2）
+        const res2 = await fetch(`http://127.0.0.1:${p}/v1/chat/completions`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'edit-cache-key', tools,
+            messages: [{ role: 'user', content: 'v2 modified with details' }],
+          }),
+        });
+        assert.equal(res2.status, 200);
+        const frames2 = await parseChatSse(res2);
+        const text2 = frames2.map((f) => f.choices?.[0]?.delta?.content || '').join('');
+        assert.equal(text2, 'version 2 answer', '修改后的内容必须正确生成版本 2 回答');
+        assert.ok(createdSessions.length >= 2, '检测到历史修改时必须创建全新会话以重新生成');
+        assert.ok(closedSessions.includes('sess-edit-1'), '旧会话必须被安全 close 避免脏状态污染');
+        const v2Prompt = promptsReceived.find((p) => p.sid === createdSessions[1]);
+        assert.ok(v2Prompt && JSON.stringify(v2Prompt.prompt).includes('v2 modified with details'), '新会话必须完整收到修改补充后的提示词');
+      } finally {
+        gw.close();
+      }
+    });
     console.log(`${passed}/${passed} behavioral tests passed`);
   } finally { gateway.close(); }
 }
