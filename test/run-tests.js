@@ -13,7 +13,7 @@ const path = require('node:path');
 const root = path.resolve(__dirname, '..');
 const configLib = require(path.join(root, 'lib/config.js'));
 const { createLimiter, levelOfEffort, AcpRuntime, permissionOutcome } = require(path.join(root, 'lib/core.js'));
-const { normalizeMessages } = require(path.join(root, 'lib/server.js'));
+const { normalizeMessages, flatten, canonicalizeText } = require(path.join(root, 'lib/server.js'));
 const bridgeLib = require(path.join(root, 'lib/bridge.js'));
 const { createMcpServer } = require(path.join(root, 'lib/mcp.js'));
 const manifest = require(path.join(root, 'manifest.json'));
@@ -895,6 +895,24 @@ async function main() {
     const g2 = bt.guidanceFor(tools2);
     assert.strictEqual(g1, g2, '不同传入顺序的工具必须生成100%字节级一致的引导词前缀');
     assert.ok(g1.includes('pi-bridge_Bash') && g1.indexOf('pi-bridge_Bash') < g1.indexOf('pi-bridge_Read'), '工具必须按字母排序保证前缀稳定性');
+  });
+
+  await suite('context: flatten 结构化隔离与残缺 UTF-8 自动清洗', async () => {
+    const brokenText = '这是测试\uFFFD内容，尾部残缺';
+    const cleaned = canonicalizeText(brokenText);
+    assert.strictEqual(cleaned, '这是测试内容，尾部残缺', '必须剔除非法 Unicode 替代符');
+
+    const messages = [
+      { role: 'system', content: '你是助手' },
+      { role: 'user', content: '第一轮提问' },
+      { role: 'assistant', content: '第一轮回答：残缺尾巴\uFFFD' },
+      { role: 'user', content: '当前最新提问' },
+    ];
+    const flat = flatten(messages);
+    assert.ok(flat.includes('=== 对话历史 (Conversation Context) ==='), '必须包含历史上下文隔离标头');
+    assert.ok(flat.includes('=== 当前用户请求 (Current User Request) ==='), '必须包含当前用户请求隔离标头');
+    assert.ok(flat.endsWith('当前最新提问'), '末尾必须为当前最新用户提问');
+    assert.ok(!flat.includes('\uFFFD'), '平铺后不应残留非法替代符');
   });
   const failed = results.filter((r) => !r.ok);
   console.log(`\n结果: ${results.length - failed.length}/${results.length} 通过`);
