@@ -914,6 +914,49 @@ async function main() {
     assert.ok(flat.endsWith('当前最新提问'), '末尾必须为当前最新用户提问');
     assert.ok(!flat.includes('\uFFFD'), '平铺后不应残留非法替代符');
   });
+
+  await suite('context: 超长单条消息截断保护与总预算 64KB 保险栓', async () => {
+    const hugeToolOutput = 'A'.repeat(20000);
+    const messages = [
+      { role: 'system', content: '你是助手' },
+      { role: 'user', content: '请帮我排查' },
+      { role: 'tool', content: hugeToolOutput },
+      { role: 'user', content: '最新问题：显示器黑屏' },
+    ];
+    const flat = flatten(messages);
+    assert.ok(flat.includes('中间历史输出省略'), '单条历史超过 8000 字符必须智能省略中间部分');
+    assert.ok(flat.length < 64 * 1024 + 1000, '总长度必须严格受 64KB 预算约束');
+    assert.ok(flat.endsWith('最新问题：显示器黑屏'), '最新提问必须 100% 完整保留在最末尾');
+
+    const manyMessages = [{ role: 'system', content: '系统指令' }];
+    for (let i = 0; i < 20; i++) {
+      manyMessages.push({ role: 'tool', content: `log ${i}: ` + 'X'.repeat(7000) });
+    }
+    manyMessages.push({ role: 'user', content: '最终关键提问' });
+    const flatMany = flatten(manyMessages);
+    assert.ok(flatMany.length <= 64 * 1024 + 2000, '即使有数十条大历史，总长度也必须被截断到安全范围');
+    assert.ok(flatMany.endsWith('最终关键提问'), '无论如何截断，最新提问绝对不能丢');
+  });
+
+  await suite('context: Compaction 协同裁剪（优先保留压缩摘要，丢弃远古死数据）', async () => {
+    const messages = [
+      { role: 'system', content: '你是助手' },
+      { role: 'user', content: '远古提问：嘉立创 EDA 怎么改目录' },
+      { role: 'assistant', content: '远古回答：请修改 Cache_Data' },
+      { role: 'user', content: '# Resuming from a compaction\\n\\n<summary>\\n用户之前询问了EDA目录，已解决。现在转向显示器排查。\\n</summary>' },
+    ];
+    for (let i = 1; i <= 15; i++) {
+      messages.push({ role: 'assistant', content: `排查第 ${i} 步` });
+      messages.push({ role: 'user', content: `用户反馈 ${i}` });
+    }
+    messages.push({ role: 'user', content: '今天开机又黑屏了，怎么办？' });
+
+    const flat = flatten(messages);
+    assert.ok(!flat.includes('嘉立创 EDA 怎么改目录'), 'Compaction 之前的远古死数据必须彻底被裁剪丢弃');
+    assert.ok(flat.includes('Resuming from a compaction'), 'Compaction 摘要必须作为锚点被保留');
+    assert.ok(flat.includes('用户反馈 15'), '最近活跃对话必须被保留');
+    assert.ok(flat.endsWith('今天开机又黑屏了，怎么办？'), '当前最新提问必须完整保留');
+  });
   const failed = results.filter((r) => !r.ok);
   console.log(`\n结果: ${results.length - failed.length}/${results.length} 通过`);
   if (failed.length > 0) process.exit(1);
