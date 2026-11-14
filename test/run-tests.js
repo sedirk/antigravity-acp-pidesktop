@@ -909,7 +909,7 @@ async function main() {
       { role: 'user', content: '当前最新提问' },
     ];
     const flat = flatten(messages);
-    assert.ok(flat.includes('=== 对话历史 (Conversation Context) ==='), '必须包含历史上下文隔离标头');
+    assert.ok(flat.includes('=== 用户历史提问脉络与意图索引') || flat.includes('=== 近期活跃交互上下文'), '必须包含结构化隔离标头');
     assert.ok(flat.includes('=== 当前用户请求 (Current User Request) ==='), '必须包含当前用户请求隔离标头');
     assert.ok(flat.endsWith('当前最新提问'), '末尾必须为当前最新用户提问');
     assert.ok(!flat.includes('\uFFFD'), '平铺后不应残留非法替代符');
@@ -938,24 +938,25 @@ async function main() {
     assert.ok(flatMany.endsWith('最终关键提问'), '无论如何截断，最新提问绝对不能丢');
   });
 
-  await suite('context: Compaction 协同裁剪（优先保留压缩摘要，丢弃远古死数据）', async () => {
+  await suite('context: 用户历史提问脉络索引与 Compaction 协同（全生命周期记忆不斩断）', async () => {
     const messages = [
       { role: 'system', content: '你是助手' },
-      { role: 'user', content: '远古提问：嘉立创 EDA 怎么改目录' },
-      { role: 'assistant', content: '远古回答：请修改 Cache_Data' },
+      { role: 'user', content: '早期提问：嘉立创 EDA 怎么改目录' },
+      { role: 'assistant', content: '早期回答：请修改 Cache_Data ... 冗长日志 ...' },
       { role: 'user', content: '# Resuming from a compaction\\n\\n<summary>\\n用户之前询问了EDA目录，已解决。现在转向显示器排查。\\n</summary>' },
     ];
     for (let i = 1; i <= 15; i++) {
-      messages.push({ role: 'assistant', content: `排查第 ${i} 步` });
+      messages.push({ role: 'assistant', content: `排查第 ${i} 步详细输出日志` + 'Y'.repeat(500) });
       messages.push({ role: 'user', content: `用户反馈 ${i}` });
     }
     messages.push({ role: 'user', content: '今天开机又黑屏了，怎么办？' });
 
     const flat = flatten(messages);
-    assert.ok(!flat.includes('嘉立创 EDA 怎么改目录'), 'Compaction 之前的远古死数据必须彻底被裁剪丢弃');
-    assert.ok(flat.includes('Resuming from a compaction'), 'Compaction 摘要必须作为锚点被保留');
-    assert.ok(flat.includes('用户反馈 15'), '最近活跃对话必须被保留');
-    assert.ok(flat.endsWith('今天开机又黑屏了，怎么办？'), '当前最新提问必须完整保留');
+    assert.ok(flat.includes('=== 用户历史提问脉络与意图索引 (User Prompts Timeline & Intent Index) ==='), '必须生成用户提问脉络索引');
+    assert.ok(flat.includes('[轮次 1] 早期提问：嘉立创 EDA 怎么改目录'), '即使在 Compaction 之前的早期用户提问，也必须在提问索引中完整保留，绝不失忆');
+    assert.ok(flat.includes('用户反馈 15'), '最近活跃反馈必须被保留');
+    assert.ok(flat.endsWith('今天开机又黑屏了，怎么办？'), '当前最新提问必须完整保留在末尾');
+    assert.ok(flat.length < 64 * 1024, '总历史必须严格受控在安全预算内');
   });
   const failed = results.filter((r) => !r.ok);
   console.log(`\n结果: ${results.length - failed.length}/${results.length} 通过`);
