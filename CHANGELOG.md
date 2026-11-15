@@ -1,5 +1,17 @@
 # 变更记录
 
+## 2.2.4
+
+- **宿主系统提示词（`system` / `developer`）100% 无损保留与上下文组装去重**：
+  - **根因彻底修复**：PI-Desktop 在 `/v1/responses` 通道以 `role: "developer"` 下发宿主系统指令（含 `runtime`、`context` 插件工具目录、`skills` 与 `~/.pi/agent/AGENTS.md`，约 1 万+ 字）。旧版仅识别 `role === 'system'`，导致 `developer` 指令既被误标为 `User:` 落入历史区被按 6,000 字拦腰截断（出现 `[...中间历史输出省略 4599 字...]` 丢失插件工具描述），又在超过 12 轮或压缩重放后被彻底丢弃；同时 `role === 'system'` 时还会在「系统指令」与「近期活跃上下文」重复发送两份；
+  - **完整无损专段隔离**：新增 `isSystemRole` 统一识别 `system` 与 `developer`，所有宿主指令 100% 完整提取至 `=== 系统指令 (System Instructions) ===`（零中间省略），并从普通历史队列中剥离，杜绝首轮冗余包裹与双份拷贝；
+  - **Compaction 摘要独立保护专段**：将压缩检查点摘要移入独立的 `=== 历史阶段压缩摘要 (Compaction Summary) ===` 专段（上限提升至 24,000 字），防止被后续大体积工具输出通过 `detailedBlocks.shift()` 挤出丢失。
+- **Worker 进程膨胀治理、探测去重与主线程延迟优化**：
+  - **轻量 UI 辅助请求共享单 Worker 池**：识别 PI-Desktop 后台追问建议预测（`You predict the user's next message`）与自动标题生成请求，复用单个独立辅助会话（每 20 次自动轮换），不再写入业务 `sessions` / `sessions.json`，彻底消除每次追问预测新建残留 `localharness_external.exe`（每个 ~110MB）及挤占 `maxSessions` 业务会话槽位的问题；
+  - **模型列表被动刷新 + 6 小时缓存**：任意真实 `session/new` 自动调用 `ingestModels` 被动更新模型目录，默认 `modelCacheMs` 由 5 分钟提升至 6 小时（支持 `/v1/models?refresh=1` 强制刷新），消除每 5 分钟耗时 10~12 秒的探测阻塞与探测 worker 泄漏；
+  - **空闲高水位自动回收**：当网关完全空闲 ≥15 分钟且无任何在途/挂起请求、同时检测到残留 `localharness_external.exe` 超过高水位阈值时，自动平滑重启运行时释放数 GB 内存并预热，全部对话凭落盘足迹无感 `session/load` 恢复；
+  - **多轮工具循环 CPU 懒加载估算 + 命名空间工具名还原 + `userHistory` 持久化**：`chat` / `responses` 改为惰性按需计算 `estimateContext`（有真实 `contextUsed` 时零平铺开销）；修复 `responsesBridged` 未还原命名空间工具 `rawName` 的遗漏；`session-store` 持久化 `userHistory` 哈希指纹，跨重启依然精准识别修改重试分支。
+
 ## 2.2.3
 
 - **全生命周期用户提问脉络索引与意图记忆（User Prompts Timeline & Intent Memory）**：

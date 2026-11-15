@@ -958,6 +958,56 @@ async function main() {
     assert.ok(flat.endsWith('今天开机又黑屏了，怎么办？'), '当前最新提问必须完整保留在末尾');
     assert.ok(flat.length < 64 * 1024, '总历史必须严格受控在安全预算内');
   });
+
+  await suite('context: developer 宿主提示词无损保留（禁止中间省略、禁止重复注入、压缩后不丢失）', async () => {
+    const pluginCatalog = Array.from({ length: 200 }, (_, i) => `- plugin_tool_${i}: Detailed description for desktop plugin capability #${i}`).join('\n');
+    const agentsMd = '## ~/.pi/agent/AGENTS.md\n核心规则：绝不能被截断或遗忘的全局指令锚点';
+    const bigDeveloperPrompt = `# Runtime\nFollow strict rules.\n\n# Context & Tools\n${pluginCatalog}\n\n${agentsMd}`;
+    assert.ok(bigDeveloperPrompt.length > 9000, '构造超 9000 字的宿主 developer 系统指令');
+
+    // 1) 首轮 [developer, user]：必须 100% 完整进入 System Instructions，0 截断，且不额外生成 Recent Active Context 副本
+    const turn1 = flatten([
+      { role: 'developer', content: bigDeveloperPrompt },
+      { role: 'user', content: '简单问一句话' },
+    ]);
+    assert.ok(turn1.includes('=== 系统指令 (System Instructions) ==='), 'developer 消息必须归入系统指令专段');
+    assert.ok(!turn1.includes('中间历史输出省略'), '宿主系统指令绝不能被当成历史日志截断中间部分');
+    assert.ok(turn1.includes('plugin_tool_60: Detailed description'), '中间段插件工具描述必须 100% 完整保留');
+    assert.ok(turn1.includes(agentsMd), '尾部 AGENTS.md 必须完整保留');
+    assert.ok(!turn1.includes('=== 近期活跃交互上下文'), '纯首轮不应生成冗余的近期交互包裹块');
+
+    // 2) 超长多轮 + Compaction + 10 条大工具输出后：developer 指令与 Compaction 摘要均不得被挤掉
+    const longConv = [
+      { role: 'developer', content: bigDeveloperPrompt },
+      { role: 'user', content: '第一轮核心需求' },
+      { role: 'assistant', content: '好的' },
+      { role: 'user', content: '# Resuming from a compaction\n\n<summary>\n关键阶段压缩摘要锚点 COMPACT-ANCHOR-99\n</summary>' },
+    ];
+    for (let i = 0; i < 10; i++) {
+      longConv.push({ role: 'tool', content: `heavy_output_${i}: ` + 'Z'.repeat(6500) });
+    }
+    longConv.push({ role: 'user', content: '第 20 轮追问' });
+    const flatLong = flatten(longConv);
+    assert.ok(flatLong.includes('plugin_tool_60: Detailed description'), '超 12 轮与压缩后 developer 宿主提示词依然 100% 保留');
+    assert.ok(flatLong.includes('=== 历史阶段压缩摘要 (Compaction Summary) ==='), '压缩摘要必须拥有独立保护专段');
+    assert.ok(flatLong.includes('COMPACT-ANCHOR-99'), '即使后续有大量 6.5KB 工具输出，压缩摘要也绝不能被 shift 挤掉');
+    assert.ok(flatLong.endsWith('第 20 轮追问'), '最新提问保持在最末尾');
+  });
+
+  await suite('session-store: userHistory 指纹跨落盘与同会话增量更新保留', async () => {
+    const { createSessionStore } = require(path.join(root, 'lib/session-store.js'));
+    const dir = tempDir('sessions-uh');
+    const file = path.join(dir, 'sessions.json');
+    const store = createSessionStore({ file });
+    store.set('k-uh', { sessionId: 's-uh-1', model: 'gemini-4-carbon-high', userHistory: ['fp:1111', 'fp:2222'] });
+    // 模拟 prompt 完成后只更新 contextUsed，不传 userHistory：不得冲掉已有指纹
+    store.set('k-uh', { sessionId: 's-uh-1', model: 'gemini-4-carbon-high', contextUsed: 20480, contextSize: 1048576 });
+    store.flush();
+    const reloaded = createSessionStore({ file });
+    reloaded.load();
+    assert.deepStrictEqual(reloaded.get('k-uh').userHistory, ['fp:1111', 'fp:2222'], '同会话部分字段更新与重启重载均必须保留 userHistory');
+  });
+
   const failed = results.filter((r) => !r.ok);
   console.log(`\n结果: ${results.length - failed.length}/${results.length} 通过`);
   if (failed.length > 0) process.exit(1);

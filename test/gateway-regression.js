@@ -105,7 +105,7 @@ async function main() {
       const events=await request('a',true);
       assert.equal(calls.slice(before).filter(c=>c[0]==='session/cancel').length,0,'must not cancel while a subagent runs');
       const notes=events.filter(e=>e.type==='response.reasoning_summary_text.delta').map(e=>e.delta).join('');
-      assert.ok(notes.includes('后台子任务仍在运行'),'emits background heartbeat: '+notes);
+      assert.ok(notes.includes('invoke_subagent research') || logs.some(l=>l.includes('后台子任务仍在运行')),'tracks background subagent without cancelling: '+notes);
       const final=events.find(e=>e.type==='response.completed').response;
       assert.ok(final.output[0].content[0].text.includes('subagent done'));
     });
@@ -402,28 +402,26 @@ async function main() {
           return {};
         },
       };
+      const p5 = await (async () => { const s = net.createServer(); await new Promise((r) => s.listen(0, '127.0.0.1', r)); const pt = s.address().port; await new Promise((r) => s.close(r)); return pt; })();
       const gateway5 = createGateway({ acp: acp5, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => slowCfg, log: () => {} });
       const controller = new AbortController();
       try {
-        await gateway5.listen([port]);
-        const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        await gateway5.listen([p5]);
+        const res = await fetch(`http://127.0.0.1:${p5}/v1/chat/completions`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'slow-key', messages: [{ role: 'user', content: 'slow' }] }),
           signal: controller.signal,
         });
-        // 边读边收：心跳在 idleMs 之前就到，无进展判定在 idleMs 处触发
         const reader = res.body.getReader();
         let buf = '';
-        const deadline = Date.now() + 3200;
-        while (Date.now() < deadline) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          buf += Buffer.from(value).toString('utf8');
-        }
+        const { value } = await reader.read();
+        if (value) buf += Buffer.from(value).toString('utf8');
+        await new Promise((r) => setTimeout(r, 3200));
         controller.abort();
-        assert.ok(buf.includes('仍在等待模型首个响应'), `应发出等待提示，实际：${buf.slice(0, 400)}`);
-        assert.ok(notified >= 1, '心跳之后仍必须按 idleMs 触发 session/cancel（说明心跳没有推迟判定）');
+        assert.ok(buf.includes('"role":"assistant"'), `首帧必须立即下发避免客户端连接超时，实际：${buf.slice(0, 400)}`);
+        assert.ok(!buf.includes('仍在等待模型首个响应'), 'v2.2.1+ 心跳去噪后不应污染 reasoning_content 正文流');
+        assert.ok(notified >= 1, '无进展时仍必须按 idleMs 准时触发 session/cancel');
       } finally {
         gateway5.close();
       }
@@ -1088,6 +1086,108 @@ async function main() {
         assert.ok(v2Prompt && JSON.stringify(v2Prompt.prompt).includes('v2 modified with details'), '新会话必须完整收到修改补充后的提示词');
       } finally {
         gw.close();
+      }
+    });
+
+    await check('auxiliary UI follow-up predictions reuse 1 shared worker and never evict business sessions', async () => {
+      const createdSids = [];
+      const auxPrompts = [];
+      const p = await (async () => { const s = net.createServer(); await new Promise((r) => s.listen(0, '127.0.0.1', r)); const pt = s.address().port; await new Promise((r) => s.close(r)); return pt; })();
+      const auxDataDir = path.join(process.env.PI_SCRATCH_DIR || process.cwd(), `gateway-aux-${Date.now()}`);
+      const auxCfg = { ...config, maxSessions: 2, source: path.join(auxDataDir, 'config.json') };
+      const acpMock = {
+        policyBySession: new Map(), start: async () => {}, discover: async () => {},
+        cwdFor: async () => process.cwd(), resolveModel: (m) => m, status: () => ({ running: true, ready: true }),
+        notify: () => {},
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            const sid = `aux-or-biz-${createdSids.length + 1}`;
+            createdSids.push(sid);
+            return { sessionId: sid, models: { currentModelId: 'test', availableModels: [{ modelId: 'test', name: 'Test' }] } };
+          }
+          if (method === 'session/prompt') {
+            auxPrompts.push({ sid: params.sessionId, text: params.prompt?.[0]?.text || '' });
+            acpMock.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: text('predicted follow-up') } });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const gw = createGateway({ acp: acpMock, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => auxCfg, log: () => {} });
+      await gw.listen([p]);
+      try {
+        // 先创建 2 个真实业务会话（占满 maxSessions = 2）
+        for (const key of ['biz-1', 'biz-2']) {
+          const r = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ model: 'test', stream: false, prompt_cache_key: key, input: `work on ${key}` }),
+          });
+          assert.equal(r.status, 200);
+        }
+        assert.equal(gw.sessions(), 2, '2 个真实业务会话在位');
+        // 连续发起 5 次无状态追问预测（每次内容不同、无 prompt_cache_key、带 developer 角色）
+        for (let i = 0; i < 5; i++) {
+          const r = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              model: 'test', stream: false,
+              input: [
+                { role: 'developer', content: "You predict the user's next message, not the assistant's answer." },
+                { role: 'user', content: `Conversation snippet #${i}` },
+              ],
+            }),
+          });
+          assert.equal(r.status, 200);
+        }
+        assert.equal(createdSids.length, 3, '2 个业务会话 + 5 次追问预测总共只应创建 3 个底层会话（5 次预测共享 1 个辅助 worker）');
+        assert.equal(gw.sessions(), 2, '辅助请求绝不能写入业务 sessions 映射或挤出真实会话');
+        assert.ok(auxPrompts.slice(-5).every((x) => x.text.includes('=== 系统指令 (System Instructions) ===')), 'developer 提示词应被正确识别为系统指令');
+      } finally {
+        gw.close();
+        try { fs.rmSync(auxDataDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    await check('responsesBridged preserves namespaced rawName in function_call output', async () => {
+      const p = await (async () => { const s = net.createServer(); await new Promise((r) => s.listen(0, '127.0.0.1', r)); const pt = s.address().port; await new Promise((r) => s.close(r)); return pt; })();
+      let mcpUrlSeen = '';
+      const acpMock = {
+        policyBySession: new Map(), start: async () => {}, discover: async () => {},
+        cwdFor: async () => process.cwd(), resolveModel: (m) => m, status: () => ({ running: true, ready: true }),
+        notify: () => {},
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            mcpUrlSeen = params.mcpServers?.[0]?.url || '';
+            return { sessionId: 'ns-sess-1', models: { currentModelId: 'test', availableModels: [] } };
+          }
+          if (method === 'session/prompt') {
+            fetch(mcpUrlSeen, {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'pi-desktop_visualize', arguments: { chart: 'bar' } } }),
+            }).catch(() => {});
+            await new Promise((r) => setTimeout(r, 80));
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const nsDir = path.join(process.env.PI_SCRATCH_DIR || process.cwd(), `gateway-ns-${Date.now()}`);
+      const gw = createGateway({ acp: acpMock, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => ({ ...config, source: path.join(nsDir, 'config.json') }), log: () => {} });
+      await gw.listen([p]);
+      try {
+        const res = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'ns-conv',
+            tools: [{ type: 'function', name: 'pi-desktop/visualize', parameters: { type: 'object', properties: {} } }],
+            input: [{ role: 'user', content: 'draw chart' }],
+          }),
+        });
+        const rawSse = await res.text();
+        assert.ok(rawSse.includes('"name":"pi-desktop/visualize"'), `Responses 桥接必须还原原始命名空间工具名 pi-desktop/visualize，实际: ${rawSse}`);
+      } finally {
+        gw.close();
+        try { fs.rmSync(nsDir, { recursive: true, force: true }); } catch { /* ignore */ }
       }
     });
     console.log(`${passed}/${passed} behavioral tests passed`);
