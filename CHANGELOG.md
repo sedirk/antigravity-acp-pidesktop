@@ -1,5 +1,28 @@
 # 变更记录
 
+## 2.2.6
+
+- **长轮次防假死、协议纯净保活与上下文压缩精准协同体系**：
+  - **彻底清除假思考文本（消除假死与多重思考折叠框）**：修复等待首个响应时向流中下发伪造 `reasoning_summary_text` 文本导致界面出现多重「思考」气泡与 32s 停滞假死现象的问题；空保活帧严格只发纯协议层事件（`response.in_progress`），绝不向客户端推送虚假思考内容；在正文（`text`）输出前显式调用 `closeReasoning()`，彻底解决思考块与正文粘连和未闭合问题；
+  - **动态时间戳过滤（杜绝无故销毁重建会话）**：修复 `computeSystemSignature` 未过滤宿主每轮动态时间戳（`<ADDITIONAL_METADATA>`、`current local time`）导致正常续话被误判为指令变更而暴力调用 `closeSession` 的严重缺陷，锁定服务端 KV Cache 并杜绝重放历史产生的几十秒 TTFT 延迟；
+  - **在途状态与工具回填会话保护**：严格限制重置范围，处于工具回填（Tool Turn）或在途执行（`inflight > 0`）状态时坚决不执行会话重置，避免工具续流被截断打崩；
+  - **上报上下文窗口可调（`reportedContextWindow`）**：破除网关硬编码上报 1M（1,048,576）窗口导致的 PI-Desktop 自动压缩无法触发问题（PI-Desktop 侧需达 90% 才会触发压缩，硬编码 1M 需累积 90 万 Token）；默认上报 `200,000` Tokens，可在面板灵活设置（设为 0 可保留原生 1M），让长会话在 ~180k Tokens 时如期触发阶段性压缩与界面提示；
+  - **阶段压缩自动感知与全量无损重播**：网关在接入请求时精准识别宿主压缩标记（`<summary>`、`# Resuming from a compaction` 等），一旦检测到会话发生压缩，主动重置底层 ACP 会话并重新执行 `session/new`，将宿主包含子 Agent 准则与工具约束的完整系统指令（System Instructions）再次置顶注入，并在压缩摘要上方生成显著的 `[!IMPORTANT]` 提示，彻底解决模型在长轮次或压缩后「忘记子 Agent、丢失提示词、胡乱调用自带工具」的痛点；
+  - **防长轮次偏航与日志窥探约束**：在桥接工具引导词中严密声明会话由 PI-Desktop 统一托管，严禁模型自行编写脚本窥探本地内部 `transcript.jsonl` 日志，确保工具调用行为严格受控；
+  - **桥接挂起防死锁与自愈恢复体系（消除 `MUTATION_RETRY_BUDGET_EXHAUSTED` → `AGENT_BUSY` 死锁）**：
+    - **可挂起并发槽位租约（Suspendable Limiter Lease）**：在 `createLimiter` 中引入 `releaseForPark()` / `resumeFromPark()` 租约生命周期，工具挂起等待宿主执行期间自动让出并发配额，彻底消除 `concurrency=1` 时旁路压缩或新轮请求与挂起轮次互锁超时；
+    - **本地熔断续推无损合并（Zero-Cancel Coalescing）**：当宿主触发本地熔断（如 `MUTATION_RETRY_BUDGET_EXHAUSTED`）后用户点击「继续」时，优先匹配已就绪的 `toolResult` 并附带用户续推指令直接回填至在途 MCP 调用，避免盲目取消与流悬空导致的 `AGENT_BUSY`；
+    - **孤儿挂起看门狗与 `Concurrent receive_steps` 二阶段自愈**：挂起等待超限自动释放底层锁；遇到运行时串行尾步未收尾报错时先执行 `session/cancel` 宽限等待，仍未释放则自动 `session/close` + `session/load`（静默吞掉历史回放通知防流重影）热重载恢复；
+    - **MCP 懒加载工具契约对齐**：在 MCP `initialize.instructions` 与首轮引导词中注入稳定排序的工具参数签名摘要，明确约束 `pi-bridge_Edit(ops, path, tag)` 行锚点语法与 `pi-bridge_Task(agent, task)` 必填字段，从源头避免盲猜参数连续报错。
+
+## 2.2.5
+
+- **网关层 429 速率限制智能退避重试与长上下文防卡死体系**：
+  - **429 / 瞬时过载自动冷却重试**：在 `prompt()` 层精准识别 `429 / RESOURCE_EXHAUSTED / rateLimitExceeded / overloaded`，自动排除欠费、Key 无效或权限错误；优先解析上游返回的 `retryDelay / Retry-After` 秒数，无显式提示时按 `15s → 30s → 60s`（默认最多 3 次）对齐 Google 60s TPM 滑动窗口冷却重试，客户端断连（点击停止）时毫秒级中断退避；
+  - **真实 SSE 数据帧保活（破除宿主 180 秒静默断流）**：将默认活动看门狗阈值提升至 `5 分钟`（错开宿主 180s 流超时），并在等待首个响应或 429 冷却期间，定期通过 `reasoning_summary_text.delta` / `response.in_progress` 及 Chat chunk 下发真实协议级保活帧与冷却提示，彻底消除因仅发 `: ping` 注释帧被 PI-Desktop 180 秒强制断流并重跑的问题；
+  - **同会话失败重试幂等去重（杜绝上下文与图片重复膨胀）**：网关内部重试及宿主断流后重发相同末尾用户请求时，凭 `pendingTurnSig`（含文本与多模态附件指纹）自动转为单块轻量续推指令并剥离已发图片/文档，彻底消除重试导致同一张大图与长消息反复追加进 ACP 会话的问题；
+  - **高上下文连续高频工具回填微节流**：当会话上下文超过阈值（默认 `160,000` Tokens）且单轮连续工具回填达到 4 次及以上时，自动插入 `2.5s ~ 3.75s` 平滑间隔，从源头错开瞬时 TPM 洪峰。
+
 ## 2.2.4
 
 - **宿主系统提示词（`system` / `developer`）100% 无损保留与上下文组装去重**：

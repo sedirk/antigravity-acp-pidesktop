@@ -177,11 +177,12 @@ async function main() {
             const url = lastMcpServers?.[0]?.url;
             assert.ok(url, '需要桥接地址');
             // 宿主「执行中」：tools/call 一直挂着，不返回结果
-            fetch(url, {
+            const holdMcp = await fetch(url, {
               method: 'POST', headers: { 'content-type': 'application/json' },
               body: JSON.stringify({ jsonrpc: '2.0', id: 91, method: 'tools/call', params: { name: 'Bash', arguments: { command: 'sleep 300' } } }),
-            }).catch(() => {});
+            }).catch(() => null);
             await new Promise((r) => setTimeout(r, 4200));
+            holdMcp?.body?.cancel?.().catch(() => {});
           },
           result: { stopReason: 'end_turn' },
         });
@@ -1161,11 +1162,12 @@ async function main() {
             return { sessionId: 'ns-sess-1', models: { currentModelId: 'test', availableModels: [] } };
           }
           if (method === 'session/prompt') {
-            fetch(mcpUrlSeen, {
+            const mcpRes = await fetch(mcpUrlSeen, {
               method: 'POST', headers: { 'content-type': 'application/json' },
               body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'pi-desktop_visualize', arguments: { chart: 'bar' } } }),
-            }).catch(() => {});
-            await new Promise((r) => setTimeout(r, 80));
+            }).catch(() => null);
+            await new Promise((r) => setTimeout(r, 60));
+            mcpRes?.body?.cancel?.().catch(() => {});
             return { stopReason: 'end_turn' };
           }
           return {};
@@ -1188,6 +1190,1126 @@ async function main() {
       } finally {
         gw.close();
         try { fs.rmSync(nsDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    await check('gateway retries transient 429 with reasoning keepalive and lightweight continuation', async () => {
+      const p = await (async () => { const s = net.createServer(); await new Promise((r) => s.listen(0, '127.0.0.1', r)); const pt = s.address().port; await new Promise((r) => s.close(r)); return pt; })();
+      const seenPrompts = [];
+      let acpRef;
+      const acpMock = {
+        policyBySession: new Map(), start: async () => {}, discover: async () => {},
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        resolveModel: (m) => m, status: () => ({ running: true, ready: true }),
+        notify: () => {},
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            return { sessionId: 'rl-sess-1', models: { currentModelId: 'test', availableModels: [] } };
+          }
+          if (method === 'session/prompt') {
+            seenPrompts.push(params.prompt);
+            if (seenPrompts.length <= 2) {
+              throw Object.assign(new Error('429 RESOURCE_EXHAUSTED: TPM rate limit exceeded'), { acp: { code: 429 } });
+            }
+            acpRef.onNotification({
+              method: 'session/update',
+              params: { sessionId: 'rl-sess-1', update: { sessionUpdate: 'agent_message_chunk', content: { text: '冷却重试后成功输出' } } },
+            });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      acpRef = acpMock;
+      const rlDir = path.join(process.env.PI_SCRATCH_DIR || process.cwd(), `gateway-rl-${Date.now()}`);
+      const rlCfg = { ...config, rateLimitMaxRetries: 3, rateLimitRetryBaseMs: 80, source: path.join(rlDir, 'config.json') };
+      const gw = createGateway({ acp: acpMock, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => rlCfg, log: () => {} });
+      await gw.listen([p]);
+      try {
+        const res = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'rl-conv-1',
+            tools: [{ type: 'function', name: 'Read', parameters: { type: 'object', properties: {} } }],
+            input: [{ role: 'user', content: [{ type: 'input_text', text: '分析超长矩阵讲义 ' + 'X'.repeat(500) }, { type: 'input_image', image_url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=' }] }],
+          }),
+        });
+        const rawSse = await res.text();
+        assert.equal(seenPrompts.length, 3, '连续两次 429 后第 3 次重试成功');
+        assert.ok(seenPrompts[0].some((b) => b.type === 'image'), '首次尝试携带原始图片与完整请求');
+        assert.equal(seenPrompts[1].length, 1, '同会话内部 429 重试转为单块轻量续推，绝不重复灌入大图');
+        assert.ok(!seenPrompts[1][0].text.includes('XXXX'), '重试块不再重复长正文');
+        assert.ok(rawSse.includes('触发上游速率限制（429）'), 'SSE 思考流向前端推送了真实的 429 冷却提示保活帧');
+        assert.ok(rawSse.includes('冷却重试后成功输出'), '最终正常返回完整输出，无需宿主断流重连');
+        assert.ok(!rawSse.includes('response.failed'), '内部重试成功后不发 response.failed');
+      } finally {
+        gw.close();
+        try { fs.rmSync(rlDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    await check('host retry after interrupted turn deduplicates identical prompt and images', async () => {
+      const p = await (async () => { const s = net.createServer(); await new Promise((r) => s.listen(0, '127.0.0.1', r)); const pt = s.address().port; await new Promise((r) => s.close(r)); return pt; })();
+      const seenPrompts = [];
+      let acpRef;
+      const acpMock = {
+        policyBySession: new Map(), start: async () => {}, discover: async () => {},
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        resolveModel: (m) => m, status: () => ({ running: true, ready: true }),
+        notify: () => {},
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            return { sessionId: 'dedup-sess-1', models: { currentModelId: 'test', availableModels: [] } };
+          }
+          if (method === 'session/prompt') {
+            seenPrompts.push(params.prompt);
+            if (seenPrompts.length === 1) {
+              throw new Error('upstream transient socket reset');
+            }
+            acpRef.onNotification({
+              method: 'session/update',
+              params: { sessionId: 'dedup-sess-1', update: { sessionUpdate: 'agent_message_chunk', content: { text: '宿主重连后秒回' } } },
+            });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      acpRef = acpMock;
+      const ddDir = path.join(process.env.PI_SCRATCH_DIR || process.cwd(), `gateway-dd-${Date.now()}`);
+      const ddCfg = { ...config, rateLimitMaxRetries: 0, source: path.join(ddDir, 'config.json') };
+      const gw = createGateway({ acp: acpMock, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => ddCfg, log: () => {} });
+      await gw.listen([p]);
+      const payload = {
+        model: 'test', stream: true, prompt_cache_key: 'dd-conv-1',
+        tools: [{ type: 'function', name: 'Read', parameters: { type: 'object', properties: {} } }],
+        input: [{ role: 'user', content: [{ type: 'input_text', text: '请检查这张图里的公式推导 ' + 'M'.repeat(600) }, { type: 'input_image', image_url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=' }] }],
+      };
+      try {
+        const res1 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const sse1 = await res1.text();
+        assert.ok(sse1.includes('response.failed'), '首轮遇到非 429 网络异常正常失败');
+
+        // 模拟宿主自动用完全相同的消息 + 图片重发重试
+        const res2 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const sse2 = await res2.text();
+        assert.ok(sse2.includes('宿主重连后秒回'), '第二次宿主重试正常完成');
+        assert.equal(seenPrompts.length, 2);
+        assert.ok(seenPrompts[0].some((b) => b.type === 'image'), '第一轮发送了图片与完整正文');
+        assert.ok(!seenPrompts[1].some((b) => b.type === 'image'), '第二轮宿主重发同一失败轮次时自动剥离重复图片');
+        assert.ok(!seenPrompts[1][0].text.includes('MMMM'), '第二轮自动转为轻量续推指令，不再把 600 字正文重复塞进 ACP 会话');
+      } finally {
+        gw.close();
+        try { fs.rmSync(ddDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    await check('high-context consecutive tool bursts apply smooth pacing to prevent TPM 429', async () => {
+      const p = await (async () => { const s = net.createServer(); await new Promise((r) => s.listen(0, '127.0.0.1', r)); const pt = s.address().port; await new Promise((r) => s.close(r)); return pt; })();
+      let mcpUrlSeen = '';
+      let acpRef;
+      const logs = [];
+      const acpMock = {
+        policyBySession: new Map(), start: async () => {}, discover: async () => {},
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        resolveModel: (m) => m, status: () => ({ running: true, ready: true }),
+        notify: () => {},
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            mcpUrlSeen = params.mcpServers?.[0]?.url || '';
+            return { sessionId: 'pace-sess-1', models: { currentModelId: 'test', availableModels: [] } };
+          }
+          if (method === 'session/prompt') {
+            acpRef.onNotification({
+              method: 'session/update',
+              params: { sessionId: 'pace-sess-1', update: { sessionUpdate: 'usage_update', used: 220000, size: 1048576 } },
+            });
+            for (let i = 1; i <= 4; i += 1) {
+              const toolResp = await fetch(mcpUrlSeen, {
+                method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id: i, method: 'tools/call', params: { name: 'Read', arguments: { step: i } } }),
+              });
+              await toolResp.text();
+            }
+            acpRef.onNotification({
+              method: 'session/update',
+              params: { sessionId: 'pace-sess-1', update: { sessionUpdate: 'agent_message_chunk', content: { text: '四轮工具微节流完成' } } },
+            });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      acpRef = acpMock;
+      const pcDir = path.join(process.env.PI_SCRATCH_DIR || process.cwd(), `gateway-pc-${Date.now()}`);
+      const pcCfg = { ...config, promptTimeoutMs: 15000, promptIdleTimeoutMs: 15000, highContextThrottleTokens: 160000, highContextThrottleMs: 260, source: path.join(pcDir, 'config.json') };
+      const gw = createGateway({ acp: acpMock, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => pcCfg, log: (m) => logs.push(m) });
+      await gw.listen([p]);
+      try {
+        const input = [{ role: 'user', content: '连续调用工具测试' }];
+        const tools = [{ type: 'function', name: 'Read', parameters: { type: 'object', properties: {} } }];
+        for (let round = 0; round < 5; round += 1) {
+          const r = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'pace-conv', tools, input }),
+          });
+          const sse = await r.text();
+          if (round < 4) {
+            const matches = [...sse.matchAll(/"call_id":"([^"]+)"/g)];
+            assert.ok(matches.length > 0, `第 ${round + 1} 轮应返回 function_call，实际: ${sse.slice(-300)}`);
+            const cid = matches[matches.length - 1][1];
+            input.push({ type: 'function_call', call_id: cid, name: 'Read', arguments: '{}' });
+            input.push({ type: 'function_call_output', call_id: cid, output: `ok-${round + 1}` });
+          } else {
+            assert.ok(sse.includes('四轮工具微节流完成'), '最终轮正常输出汇总文本');
+          }
+        }
+        assert.ok(logs.some((l) => l.includes('桥接微节流：高上下文（220000 tokens，连续第 4 轮工具回填）')), `第 4 次连续高上下文工具回填必须触发微节流日志，实际日志: ${logs.join(' | ')}`);
+      } finally {
+        gw.close();
+        try { fs.rmSync(pcDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    await check('bridged multi-tool burst recovers from post-tool 429 via cooldown and lightweight continuation', async () => {
+      const p = await (async () => { const s = net.createServer(); await new Promise((r) => s.listen(0, '127.0.0.1', r)); const pt = s.address().port; await new Promise((r) => s.close(r)); return pt; })();
+      let mcpUrlSeen = '';
+      let acpRef;
+      const seenPrompts = [];
+      const acpMock = {
+        policyBySession: new Map(), start: async () => {}, discover: async () => {},
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        resolveModel: (m) => m, status: () => ({ running: true, ready: true }),
+        notify: () => {},
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            mcpUrlSeen = params.mcpServers?.[0]?.url || '';
+            return { sessionId: 'post-tool-429', models: { currentModelId: 'test', availableModels: [] } };
+          }
+          if (method === 'session/prompt') {
+            seenPrompts.push(params.prompt);
+            if (seenPrompts.length === 1) {
+              acpRef.onNotification({
+                method: 'session/update',
+                params: { sessionId: 'post-tool-429', update: { sessionUpdate: 'agent_message_chunk', content: { text: '先读取文件排查' } } },
+              });
+              for (let i = 1; i <= 5; i += 1) {
+                acpRef.onNotification({
+                  method: 'session/update',
+                  params: { sessionId: 'post-tool-429', update: { sessionUpdate: 'tool_call', toolCallId: `tc-${i}`, kind: 'read', title: `Read ${i}` } },
+                });
+                const r = await fetch(mcpUrlSeen, {
+                  method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' },
+                  body: JSON.stringify({ jsonrpc: '2.0', id: i, method: 'tools/call', params: { name: 'Read', arguments: { step: i } } }),
+                });
+                await r.text();
+              }
+              throw Object.assign(new Error('429 RESOURCE_EXHAUSTED: tokens per minute exceeded'), { acp: { code: 429 } });
+            }
+            acpRef.onNotification({
+              method: 'session/update',
+              params: { sessionId: 'post-tool-429', update: { sessionUpdate: 'agent_message_chunk', content: { text: '五轮工具后冷却恢复完成' } } },
+            });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      acpRef = acpMock;
+      const dir = path.join(process.env.PI_SCRATCH_DIR || process.cwd(), `gateway-pt429-${Date.now()}`);
+      const cfgPt = { ...config, rateLimitMaxRetries: 2, rateLimitRetryBaseMs: 80, highContextThrottleTokens: 0, source: path.join(dir, 'config.json') };
+      const gw = createGateway({ acp: acpMock, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => cfgPt, log: () => {} });
+      await gw.listen([p]);
+      try {
+        const input = [{ role: 'user', content: '执行五步连续读取' }];
+        const tools = [{ type: 'function', name: 'Read', parameters: { type: 'object', properties: {} } }];
+        let finalSse = '';
+        for (let round = 0; round < 6; round += 1) {
+          const r = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'pt429-conv', tools, input }),
+          });
+          const sse = await r.text();
+          if (round < 5) {
+            const matches = [...sse.matchAll(/"call_id":"([^"]+)"/g)];
+            assert.ok(matches.length > 0, `round ${round + 1} expected tool call, got: ${sse.slice(-300)}`);
+            const cid = matches[matches.length - 1][1];
+            input.push({ type: 'function_call', call_id: cid, name: 'Read', arguments: '{}' });
+            input.push({ type: 'function_call_output', call_id: cid, output: `res-${round + 1}` });
+          } else {
+            finalSse = sse;
+          }
+        }
+        assert.equal(seenPrompts.length, 2, '5 次工具回填后撞 429 必须进入冷却并自动续推');
+        assert.ok(finalSse.includes('触发上游速率限制（429）'), '续流 HTTP 响应包含 429 冷却提示');
+        assert.ok(finalSse.includes('五轮工具后冷却恢复完成'), '冷却重试后正常返回最终答案');
+        assert.ok(!finalSse.includes('response.failed'), '不应向宿主输出 response.failed');
+      } finally {
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    await check('deduplication preserves state across stopReason=cancelled and revokes state on pre-dispatch queue cancel', async () => {
+      const p = await (async () => { const s = net.createServer(); await new Promise((r) => s.listen(0, '127.0.0.1', r)); const pt = s.address().port; await new Promise((r) => s.close(r)); return pt; })();
+      const seenPrompts = [];
+      let releaseBlocker;
+      const blockerGate = new Promise((r) => { releaseBlocker = r; });
+      let blockerEntered;
+      const blockerStarted = new Promise((r) => { blockerEntered = r; });
+      let cancelResolve;
+      let acpRef;
+      const acpMock = {
+        policyBySession: new Map(), start: async () => {}, discover: async () => {},
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        resolveModel: (m) => m, status: () => ({ running: true, ready: true }),
+        notify: (method) => {
+          if (method === 'session/cancel' && cancelResolve) cancelResolve();
+        },
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            return { sessionId: `s-${Math.random().toString(36).slice(2, 8)}`, models: { currentModelId: 'test', availableModels: [] } };
+          }
+          if (method === 'session/prompt') {
+            const text0 = params.prompt?.[0]?.text || '';
+            if (text0.includes('BLOCKER_TURN')) {
+              blockerEntered();
+              await blockerGate;
+              acpRef.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { text: 'ok' } } } });
+              return { stopReason: 'end_turn' };
+            }
+            seenPrompts.push({ sid: params.sessionId, prompt: params.prompt });
+            if (text0.includes('CANCEL_RESOLVE_TEST') && seenPrompts.filter((x) => x.sid === params.sessionId).length === 1) {
+              await new Promise((r) => { cancelResolve = r; });
+              return { stopReason: 'cancelled' };
+            }
+            acpRef.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { text: 'done' } } } });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      acpRef = acpMock;
+      // 串行限流器（concurrency = 1）验证排队中取消不会误标已投递
+      let chain = Promise.resolve();
+      const serialLimiter = {
+        run: (fn) => {
+          const next = chain.then(() => fn());
+          chain = next.catch(() => {});
+          return next;
+        },
+        stats: () => ({ active: 1 }),
+      };
+      const dir = path.join(process.env.PI_SCRATCH_DIR || process.cwd(), `gateway-qcancel-${Date.now()}`);
+      const gw = createGateway({ acp: acpMock, limiter: serialLimiter, getConfig: () => ({ ...config, source: path.join(dir, 'config.json') }), log: () => {} });
+      await gw.listen([p]);
+      const imgUrl = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+      try {
+        // 1) 排队期间被取消（ACP 收到 0 次该请求的 prompt）→ 重试时必须发完整正文与图片
+        const bReq = fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'blocker-k', input: 'BLOCKER_TURN' }),
+        }).then((r) => r.text());
+        await blockerStarted;
+        const qAbort = new AbortController();
+        const qBody = {
+          model: 'test', stream: true, prompt_cache_key: 'queued-conv',
+          input: [{ role: 'user', content: [{ type: 'input_text', text: 'QUEUED_ORIGINAL_BODY_' + 'Q'.repeat(200) }, { type: 'input_image', image_url: imgUrl }] }],
+        };
+        const qResp = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', signal: qAbort.signal, headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(qBody),
+        });
+        const qReading = qResp.text().catch(() => {});
+        await new Promise((r) => setTimeout(r, 50));
+        qAbort.abort();
+        await qReading;
+        await new Promise((r) => setTimeout(r, 60));
+        releaseBlocker();
+        await bReq;
+        await new Promise((r) => setTimeout(r, 50));
+        assert.equal(seenPrompts.length, 0, '排队取消的请求不应向 ACP 发送任何 prompt');
+
+        const retryQueued = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(qBody),
+        }).then((r) => r.text());
+        assert.ok(retryQueued.includes('done'));
+        assert.equal(seenPrompts.length, 1);
+        assert.ok(seenPrompts[0].prompt.some((b) => b.type === 'image'), '排队取消后重试必须完整发送原始图片');
+        assert.ok(seenPrompts[0].prompt.some((b) => (b.text || '').includes('QUEUED_ORIGINAL_BODY_')), '排队取消后重试必须完整发送原始正文');
+
+        // 2) HTTP 断连 → session/cancel → ACP 正常 resolve { stopReason: 'cancelled' } → 宿主原样重试必须去重
+        const cBody = {
+          model: 'test', stream: true, prompt_cache_key: 'cancel-resolve-conv',
+          input: [{ role: 'user', content: [{ type: 'input_text', text: 'CANCEL_RESOLVE_TEST_' + 'C'.repeat(200) }, { type: 'input_image', image_url: imgUrl }] }],
+        };
+        const cAbort = new AbortController();
+        const cFetch = fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', signal: cAbort.signal, headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(cBody),
+        }).then((r) => r.text()).catch(() => {});
+        await new Promise((r) => setTimeout(r, 60));
+        cAbort.abort();
+        await cFetch;
+        await new Promise((r) => setTimeout(r, 60));
+
+        const cRetry = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(cBody),
+        }).then((r) => r.text());
+        assert.ok(cRetry.includes('done'));
+        const cancelPrompts = seenPrompts.slice(1);
+        assert.equal(cancelPrompts.length, 2);
+        assert.ok(cancelPrompts[0].prompt.some((b) => b.type === 'image'), '首次尝试携带图片');
+        assert.ok(!cancelPrompts[1].prompt.some((b) => b.type === 'image'), 'stopReason=cancelled 后原样重试必须剥离重复图片');
+        assert.ok(!(cancelPrompts[1].prompt[0].text || '').includes('CCCC'), 'stopReason=cancelled 后原样重试必须转为轻量续推');
+      } finally {
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    await check('steering during 429 cooldown and disconnect during micro-throttle abort immediately without stale execution', async () => {
+      const p = await (async () => { const s = net.createServer(); await new Promise((r) => s.listen(0, '127.0.0.1', r)); const pt = s.address().port; await new Promise((r) => s.close(r)); return pt; })();
+      let mcpUrlSeen = '';
+      let acpRef;
+      const callOrder = [];
+      const cancelledSids = [];
+      let modelContinuedAfterThrottleAbort = false;
+      const acpMock = {
+        policyBySession: new Map(), start: async () => {}, discover: async () => {},
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        resolveModel: (m) => m, status: () => ({ running: true, ready: true }),
+        notify: (method, params) => {
+          if (method === 'session/cancel' && params?.sessionId) cancelledSids.push(params.sessionId);
+        },
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            mcpUrlSeen = params.mcpServers?.[0]?.url || '';
+            return { sessionId: `st-${callOrder.length + 1}`, models: { currentModelId: 'test', availableModels: [] } };
+          }
+          if (method === 'session/prompt') {
+            const txt = params.prompt?.map((b) => b.text || '').join('') || '';
+            callOrder.push(txt);
+            if (txt.includes('OLD_429_REQUEST')) {
+              throw Object.assign(new Error('429 rate limit exceeded, retry after 3s'), { acp: { code: 429 } });
+            }
+            if (txt.includes('THROTTLE_ABORT_TEST')) {
+              acpRef.onNotification({
+                method: 'session/update',
+                params: { sessionId: params.sessionId, update: { sessionUpdate: 'usage_update', used: 220000, size: 1048576 } },
+              });
+              for (let i = 1; i <= 4; i += 1) {
+                const r = await fetch(mcpUrlSeen, {
+                  method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' },
+                  body: JSON.stringify({ jsonrpc: '2.0', id: i, method: 'tools/call', params: { name: 'Read', arguments: { step: i } } }),
+                });
+                const raw = await r.text();
+                if (i === 4 && raw.includes('"result"') && !raw.includes('"isError":true')) {
+                  modelContinuedAfterThrottleAbort = true;
+                }
+              }
+              return { stopReason: 'cancelled' };
+            }
+            acpRef.onNotification({
+              method: 'session/update',
+              params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { text: 'NEW_STEER_OK' } } },
+            });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      acpRef = acpMock;
+      const dir = path.join(process.env.PI_SCRATCH_DIR || process.cwd(), `gateway-steer-cool-${Date.now()}`);
+      const cfgSc = { ...config, rateLimitMaxRetries: 3, rateLimitRetryBaseMs: 3000, highContextThrottleTokens: 160000, highContextThrottleMs: 1200, source: path.join(dir, 'config.json') };
+      const gw = createGateway({ acp: acpMock, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => cfgSc, log: () => {} });
+      await gw.listen([p]);
+      const tools = [{ type: 'function', name: 'Read', parameters: { type: 'object', properties: {} } }];
+      try {
+        // A) 429 冷却等待期间发来新 Steering 指令：必须立即打断旧冷却，绝不能先跑「请继续完成上一条请求」
+        const oldReq = fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'steer-cool-1', tools, input: [{ role: 'user', content: 'OLD_429_REQUEST' }] }),
+        }).then((r) => r.text()).catch(() => '');
+        await new Promise((r) => setTimeout(r, 120));
+        const t0 = Date.now();
+        const steerRes = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'steer-cool-1', tools, input: [{ role: 'user', content: 'OLD_429_REQUEST' }, { role: 'user', content: 'NEW_STEER_DIRECTIVE' }] }),
+        }).then((r) => r.text());
+        const steerElapsed = Date.now() - t0;
+        await oldReq;
+        assert.ok(steerRes.includes('NEW_STEER_OK'), 'Steering 新请求正常完成');
+        assert.ok(steerElapsed < 1500, `Steering 必须立即唤醒并终止 3s 冷却，实际耗时 ${steerElapsed}ms`);
+        assert.equal(callOrder.length, 2, `上游调用顺序只能是 [旧请求, 新请求]，不能出现旧请求续推: ${JSON.stringify(callOrder)}`);
+        assert.ok(callOrder[1].includes('NEW_STEER_DIRECTIVE'));
+
+        // B) 第 4 轮高上下文工具回填进入 1.2s 微节流期间客户端点击停止：不得回填结果继续模型，且必须下发 session/cancel
+        const tInput = [{ role: 'user', content: 'THROTTLE_ABORT_TEST' }];
+        for (let round = 0; round < 3; round += 1) {
+          const r = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'throttle-abort-conv', tools, input: tInput }),
+          });
+          const sse = await r.text();
+          const cid = [...sse.matchAll(/"call_id":"([^"]+)"/g)].pop()[1];
+          tInput.push({ type: 'function_call', call_id: cid, name: 'Read', arguments: '{}' });
+          tInput.push({ type: 'function_call_output', call_id: cid, output: `r-${round + 1}` });
+        }
+        // 第 4 轮刚收到第 4 个 tool_call，现回填第 4 个结果并在微节流期间断开
+        const r4 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'throttle-abort-conv', tools, input: tInput }),
+        });
+        const sse4 = await r4.text();
+        const cid4 = [...sse4.matchAll(/"call_id":"([^"]+)"/g)].pop()[1];
+        tInput.push({ type: 'function_call', call_id: cid4, name: 'Read', arguments: '{}' });
+        tInput.push({ type: 'function_call_output', call_id: cid4, output: 'r-4-should-not-resolve' });
+
+        cancelledSids.length = 0;
+        const abort4 = new AbortController();
+        const resume4 = fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', signal: abort4.signal, headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'throttle-abort-conv', tools, input: tInput }),
+        }).then((r) => r.text()).catch(() => {});
+        await new Promise((r) => setTimeout(r, 90));
+        abort4.abort();
+        await resume4;
+        await new Promise((r) => setTimeout(r, 80));
+        assert.equal(modelContinuedAfterThrottleAbort, false, '微节流期间断连绝不能把工具结果正常 resolve 给模型继续跑');
+        assert.ok(cancelledSids.length >= 1, '微节流期间断连必须向 ACP 发送 session/cancel');
+      } finally {
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    await check('modified inline document after failure is not misclassified as duplicate and config panel binds all new fields', async () => {
+      const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'config.html'), 'utf8');
+      for (const fieldId of ['rateLimitMaxRetries', 'rateLimitRetryBaseSeconds', 'highContextThrottleTokens', 'highContextThrottleMs']) {
+        assert.ok(html.includes(`id="${fieldId}"`), `config.html 缺少控件 #${fieldId}`);
+        assert.ok(html.includes(`'${fieldId}'`), `config.html 读写 ids 列表缺少 ${fieldId}`);
+      }
+      assert.ok(html.includes('默认 300'), 'config.html 应更新无进展判定默认值为 300 秒');
+
+      const p = await (async () => { const s = net.createServer(); await new Promise((r) => s.listen(0, '127.0.0.1', r)); const pt = s.address().port; await new Promise((r) => s.close(r)); return pt; })();
+      const seenBlocks = [];
+      let acpRef;
+      const acpMock = {
+        policyBySession: new Map(), start: async () => {}, discover: async () => {},
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        resolveModel: (m) => m, status: () => ({ running: true, ready: true }),
+        notify: () => {},
+        request: async (method, params) => {
+          if (method === 'session/new') return { sessionId: `doc-s-${seenBlocks.length + 1}`, models: { currentModelId: 'test', availableModels: [] } };
+          if (method === 'session/prompt') {
+            seenBlocks.push(params.prompt);
+            if (seenBlocks.length === 1) throw new Error('network glitch');
+            acpRef.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { text: 'updated doc read' } } } });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      acpRef = acpMock;
+      const dir = path.join(process.env.PI_SCRATCH_DIR || process.cwd(), `gateway-docfp-${Date.now()}`);
+      const gw = createGateway({ acp: acpMock, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => ({ ...config, source: path.join(dir, 'config.json') }), log: () => {} });
+      await gw.listen([p]);
+      try {
+        const sendDoc = (inlineContent) => fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'doc-edit-conv',
+            input: [{
+              role: 'user',
+              content: [
+                { type: 'input_text', text: '请审阅这份同名规范' },
+                { type: 'input_file', filename: 'spec.md', file_data: `data:text/markdown;base64,${Buffer.from(inlineContent, 'utf8').toString('base64')}` },
+              ],
+            }],
+          }),
+        }).then((r) => r.text());
+        const r1 = await sendDoc('版本一内容：旧阈值 100');
+        assert.ok(r1.includes('response.failed'));
+        const r2 = await sendDoc('版本二内容：新阈值 999');
+        assert.ok(r2.includes('updated doc read'));
+        assert.equal(seenBlocks.length, 2);
+        const secondAllText = JSON.stringify(seenBlocks[1]);
+        assert.ok(!secondAllText.includes('请继续完成上一条请求'), '修改同名内联文档内容后绝不能误判为相同请求去重');
+        assert.ok(seenBlocks[1].some((b) => b.type === 'resource_link' || (b.text || '').includes('版本二内容')), `修改后的文档必须实际投递给 ACP，实际 blocks: ${secondAllText}`);
+      } finally {
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    await check('SSE protocol keepalive continues emitting data frames after partial text without masking real stalls', async () => {
+      const p = await (async () => { const s = net.createServer(); await new Promise((r) => s.listen(0, '127.0.0.1', r)); const pt = s.address().port; await new Promise((r) => s.close(r)); return pt; })();
+      let acpRef;
+      const acpMock = {
+        policyBySession: new Map(), start: async () => {}, discover: async () => {},
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        resolveModel: (m) => m, status: () => ({ running: true, ready: true }),
+        notify: () => {},
+        request: async (method, params) => {
+          if (method === 'session/new') return { sessionId: `ka-s-${Math.random().toString(36).slice(2, 7)}`, models: { currentModelId: 'test', availableModels: [] } };
+          if (method === 'session/prompt') {
+            acpRef.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { text: '先说半句…' } } } });
+            await new Promise((r) => setTimeout(r, 230));
+            acpRef.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { text: '后半句完成' } } } });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      acpRef = acpMock;
+      const dir = path.join(process.env.PI_SCRATCH_DIR || process.cwd(), `gateway-pka-${Date.now()}`);
+      const gw = createGateway({ acp: acpMock, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => ({ ...config, protocolKeepaliveMs: 80, source: path.join(dir, 'config.json') }), log: () => {} });
+      await gw.listen([p]);
+      try {
+        const respSse = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'pka-resp', input: '测 responses 半途静默保活' }),
+        }).then((r) => r.text());
+        const inProgCount = [...respSse.matchAll(/event:\s*response\.in_progress/g)].length;
+        assert.ok(inProgCount >= 2, `吐过正文后静默期仍应持续下发 response.in_progress 协议帧，实际次数=${inProgCount}`);
+        assert.ok(respSse.includes('后半句完成'));
+
+        const chatSse = await fetch(`http://127.0.0.1:${p}/v1/chat/completions`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, user: 'pka-chat', messages: [{ role: 'user', content: '测 chat 半途静默保活' }] }),
+        }).then((r) => r.text());
+        const emptyDeltaCount = [...chatSse.matchAll(/"delta":\{\},"finish_reason":null/g)].length;
+        assert.ok(emptyDeltaCount >= 1, `Chat 流吐过正文后静默期应下发空 delta 协议保活帧，实际次数=${emptyDeltaCount}`);
+        assert.ok(chatSse.includes('后半句完成'));
+      } finally {
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    await check('compaction resets session and re-injects full system instructions and compaction summary', async () => {
+      const p = await (async () => { const s = net.createServer(); await new Promise((r) => s.listen(0, '127.0.0.1', r)); const pt = s.address().port; await new Promise((r) => s.close(r)); return pt; })();
+      const seenSids = [];
+      const seenPrompts = [];
+      let acpRef;
+      const acpMock = {
+        policyBySession: new Map(), start: async () => {}, discover: async () => {},
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        resolveModel: (m) => m, status: () => ({ running: true, ready: true }),
+        notify: () => {},
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            const sid = `comp-s-${seenSids.length + 1}`;
+            seenSids.push(sid);
+            return { sessionId: sid, models: { currentModelId: 'test', availableModels: [] } };
+          }
+          if (method === 'session/prompt') {
+            seenPrompts.push({ sid: params.sessionId, prompt: params.prompt });
+            acpRef.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { text: `resp-${seenPrompts.length}` } } } });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      acpRef = acpMock;
+      const dir = path.join(process.env.PI_SCRATCH_DIR || process.cwd(), `gateway-comp-${Date.now()}`);
+      const gw = createGateway({ acp: acpMock, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => ({ ...config, source: path.join(dir, 'config.json') }), log: () => {} });
+      await gw.listen([p]);
+      try {
+        const sys = '## System Instructions\nYou are PI-Desktop. Available subagents: research, reviewer-gpt.';
+        // Round 1: 初次提问，必须包含完整系统指令
+        const r1 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'comp-conv', instructions: sys, input: 'Round 1 question' }),
+        }).then((r) => r.text());
+        assert.ok(r1.includes('resp-1'));
+        assert.equal(seenSids.length, 1);
+        const p1Text = JSON.stringify(seenPrompts[0].prompt);
+        assert.ok(p1Text.includes('System Instructions'), '第一轮必须注入系统指令');
+        assert.ok(p1Text.includes('reviewer-gpt'), '第一轮必须包含子 Agent 说明');
+
+        // Round 2: 宿主发生 Compaction 压缩，带上 <summary> 块并保留系统指令
+        const compSummary = 'The conversation history before this point was compacted into the following summary:\n\n<summary>\nRound 1 was about testing system prompt retention.\n</summary>';
+        const r2 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'comp-conv', instructions: sys,
+            input: [
+              { role: 'user', content: compSummary },
+              { role: 'user', content: 'Round 2 question after compact' },
+            ],
+          }),
+        }).then((r) => r.text());
+        assert.ok(r2.includes('resp-2'));
+        // 关键断言：检测到 Compaction 后必须重置底层会话（新建 session/new，不污染旧会话）
+        assert.equal(seenSids.length, 2, '压缩后必须新建会话重置底层状态');
+        assert.notEqual(seenPrompts[1].sid, seenPrompts[0].sid, '压缩后的新轮次必须使用全新 session ID');
+        const p2Text = JSON.stringify(seenPrompts[1].prompt);
+        assert.ok(p2Text.includes('System Instructions'), '压缩后必须重新注入完整系统指令');
+        assert.ok(p2Text.includes('reviewer-gpt'), '压缩后必须重新注入子 Agent 说明');
+        assert.ok(p2Text.includes('Compaction Summary'), '压缩后必须包含压缩摘要专段');
+        assert.ok(p2Text.includes('Round 1 was about testing'), '压缩后必须包含具体摘要内容');
+        assert.ok(p2Text.includes('Round 2 question after compact'), '压缩后必须包含当前提问');
+
+        // Round 3: 系统指令变更（如动态启用新 Skill/Agent），必须再次重置会话并刷新指令
+        const updatedSys = '## System Instructions V2\nUpdated subagent: security-auditor.';
+        const r3 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'comp-conv', instructions: updatedSys,
+            input: [
+              { role: 'user', content: compSummary },
+              { role: 'user', content: 'Round 3 question with new system' },
+            ],
+          }),
+        }).then((r) => r.text());
+        assert.ok(r3.includes('resp-3'));
+        assert.equal(seenSids.length, 3, '系统指令变更后必须重新建会话');
+        const p3Text = JSON.stringify(seenPrompts[2].prompt);
+        assert.ok(p3Text.includes('security-auditor'), '系统指令变更后必须注入新指令');
+      } finally {
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    await check('reportedContextWindow regulates context_window in modelsForApi and binds to config panel', async () => {
+      const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'config.html'), 'utf8');
+      assert.ok(html.includes('id="reportedContextWindow"'), 'config.html 必须包含 #reportedContextWindow 控件');
+      assert.ok(html.includes("'reportedContextWindow'"), 'config.html ids 数组必须包含 reportedContextWindow');
+
+      const { AcpRuntime } = require('../lib/core.js');
+      const rt1 = new AcpRuntime({ getConfig: () => ({ reportedContextWindow: 200000, virtualModels: true }) });
+      rt1.ingestModels([
+        { modelId: 'gemini-4-carbon-high', name: 'gemini-4-carbon (high)' },
+      ]);
+      rt1.discover = async () => rt1.discovery;
+      const list1 = await rt1.modelsForApi();
+      const m1 = list1.find((x) => x.id === 'gemini-4-carbon');
+      assert.ok(m1, '找到 gemini-4-carbon');
+      assert.equal(m1.context_window, 200000, '必须正确返回上报的 200000 context_window');
+
+      const rt2 = new AcpRuntime({ getConfig: () => ({ reportedContextWindow: 0, virtualModels: true }) });
+      rt2.ingestModels([
+        { modelId: 'gemini-4-carbon-high', name: 'gemini-4-carbon (high)' },
+      ]);
+      rt2.discover = async () => rt2.discovery;
+      const list2 = await rt2.modelsForApi();
+      const m2 = list2.find((x) => x.id === 'gemini-4-carbon');
+      assert.equal(m2.context_window, 1048576, '配置为 0 时回退原生 1048576 context_window');
+    });
+
+    await check('MUTATION_RETRY_BUDGET_EXHAUSTED: parked tool error + user continuation coalesces without cancel and never deadlocks concurrency=1 compaction', async () => {
+      const p = await (async () => { const s = net.createServer(); await new Promise((r) => s.listen(0, '127.0.0.1', r)); const pt = s.address().port; await new Promise((r) => s.close(r)); return pt; })();
+      const dir = path.join(process.env.PI_SCRATCH_DIR || process.cwd(), `gw-mut-budget-${Date.now()}`);
+      const { createLimiter } = require('../lib/core.js');
+      const lim = createLimiter({ limit: 1, maxQueue: 4, queueTimeoutMs: 350 });
+      const createdSids = [];
+      const cancelsSent = [];
+      const promptCalls = [];
+      const mcpToolOutputs = [];
+      let acpRef;
+      const acpMock = {
+        policyBySession: new Map(), start: async () => {}, discover: async () => {},
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        resolveModel: (m) => m, status: () => ({ running: true, ready: true }),
+        notify: (method, params) => {
+          if (method === 'session/cancel') cancelsSent.push(params.sessionId);
+        },
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            const sid = `mut-sid-${createdSids.length + 1}`;
+            createdSids.push({ sid, mcpUrl: params.mcpServers?.[0]?.url || '' });
+            return { sessionId: sid, models: { currentModelId: 'test', availableModels: [] } };
+          }
+          if (method === 'session/close') return {};
+          if (method === 'session/prompt') {
+            const sid = params.sessionId;
+            promptCalls.push({ sid, prompt: params.prompt });
+            const entry = createdSids.find((x) => x.sid === sid);
+            const pText = JSON.stringify(params.prompt);
+            if (pText.includes('context summarization assistant') || pText.includes('Summarize the entire conversation')) {
+              acpRef.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '## Goal\nRefactor limiter safely' } } },
+              });
+              return { stopReason: 'end_turn' };
+            }
+            if (entry && entry.mcpUrl && promptCalls.filter((x) => x.sid === sid).length === 1) {
+              const sseRes = await fetch(entry.mcpUrl, {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'Edit', arguments: { path: 'lib/core.js' } } }),
+              });
+              const rawToolReply = await sseRes.text();
+              mcpToolOutputs.push({ sid, rawToolReply });
+              if (rawToolReply.includes('继续修复')) {
+                acpRef.onNotification({
+                  method: 'session/update',
+                  params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '已重新读取并使用窄锚点修复成功' } } },
+                });
+              }
+              return { stopReason: 'end_turn' };
+            }
+            acpRef.onNotification({
+              method: 'session/update',
+              params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '后续轮次正常续接' } } },
+            });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      acpRef = acpMock;
+      const gw = createGateway({
+        acp: acpMock, limiter: lim,
+        getConfig: () => ({ ...config, concurrency: 1, source: path.join(dir, 'config.json') }),
+        log: () => {},
+      });
+      await gw.listen([p]);
+      const tools = [{
+        type: 'function', name: 'Edit',
+        parameters: { type: 'object', required: ['path', 'tag', 'ops'], properties: { path: { type: 'string' }, tag: { type: 'string' }, ops: { type: 'string' } } },
+      }];
+      try {
+        // 场景 A：第 3 次 Edit 失败触发宿主本地中止（MUTATION_RETRY_BUDGET_EXHAUSTED），用户点击「继续」
+        const r1 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'mut-key-a', tools, input: [{ role: 'user', content: '修改 core.js' }] }),
+        }).then((r) => r.text());
+        const callIdMatch = /"call_id":"(call_[^"]+)"/.exec(r1);
+        assert.ok(callIdMatch, `首轮应挂起并返回 Edit function_call，实际: ${r1}`);
+        const callId1 = callIdMatch[1];
+        assert.equal(lim.stats().active, 0, '挂起等待宿主期间必须释放 limiter 并发槽位');
+
+        // 宿主附带本地失败的 tool_output + 用户「继续修复」消息发起新一轮请求
+        const r2 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'mut-key-a', tools,
+            input: [
+              { role: 'user', content: '修改 core.js' },
+              { type: 'function_call', call_id: callId1, name: 'Edit', arguments: '{"path":"lib/core.js"}' },
+              { type: 'function_call_output', call_id: callId1, output: 'Stopped after 3 failed Edit attempts on D:/tools/antigravity-acp/lib/core.js. Last error: INVALID_ARGUMENT.' },
+              { role: 'user', content: '继续修复' },
+            ],
+          }),
+        }).then((r) => r.text());
+        assert.ok(r2.includes('已重新读取并使用窄锚点修复成功'), `合并续推应直接返回模型修复结果，实际: ${r2}`);
+        assert.equal(cancelsSent.length, 0, '无损合并续推不得发送 session/cancel');
+        assert.equal(createdSids.length, 1, '合并续推应复用同一在途会话');
+        assert.ok(mcpToolOutputs[0].rawToolReply.includes('INVALID_ARGUMENT') && mcpToolOutputs[0].rawToolReply.includes('继续修复'), '底层 MCP 工具响应必须同时携带报错详情与用户继续指令');
+
+        // 紧接着下一轮普通提问，验证 userHistory 已同步，不会误判为历史篡改重建会话
+        const r3 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'mut-key-a', tools,
+            input: [
+              { role: 'user', content: '修改 core.js' },
+              { type: 'function_call', call_id: callId1, name: 'Edit', arguments: '{"path":"lib/core.js"}' },
+              { type: 'function_call_output', call_id: callId1, output: 'Stopped after 3 failed Edit attempts' },
+              { role: 'user', content: '继续修复' },
+              { role: 'assistant', content: '已重新读取并使用窄锚点修复成功' },
+              { role: 'user', content: '再确认一下状态' },
+            ],
+          }),
+        }).then((r) => r.text());
+        assert.ok(r3.includes('后续轮次正常续接'));
+        assert.equal(createdSids.length, 1, '后续提问不得误触发分支重置');
+
+        // 场景 B：单并发（limit=1）下挂起后触发阈值自动压缩（且压缩请求未携带 prompt_cache_key），绝不死锁报 AGENT_BUSY
+        const rb1 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'mut-key-b', tools, input: [{ role: 'user', content: 'refactor core limiter lease safely' }] }),
+        }).then((r) => r.text());
+        assert.ok(rb1.includes('"call_id":"call_'), '会话 B 挂起在工具调用上');
+        assert.equal(lim.stats().active, 0, '会话 B 挂起时单并发槽位必须空闲');
+
+        const compactRes = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: false,
+            instructions: 'You are a context summarization assistant.',
+            input: [{ role: 'user', content: 'Summarize the entire conversation:\nUser: refactor core limiter lease safely\nAssistant: Edit failed 3 times' }],
+          }),
+        });
+        assert.equal(compactRes.status, 200, '单并发下挂起期间发起自动压缩绝不能排队超时或死锁');
+        const compactJson = await compactRes.json();
+        assert.ok(JSON.stringify(compactJson).includes('Refactor limiter safely'));
+        assert.equal(lim.stats().active, 0);
+      } finally {
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    await check('orphaned parked turn watchdog releases lock and Concurrent receive_steps self-heals via cancel and session/load', async () => {
+      const p = await (async () => { const s = net.createServer(); await new Promise((r) => s.listen(0, '127.0.0.1', r)); const pt = s.address().port; await new Promise((r) => s.close(r)); return pt; })();
+      const dir = path.join(process.env.PI_SCRATCH_DIR || process.cwd(), `gw-orphan-recv-${Date.now()}`);
+      const { createLimiter } = require('../lib/core.js');
+      const lim = createLimiter({ limit: 1, maxQueue: 4, queueTimeoutMs: 2000 });
+      let acpRef;
+      let mcpUrlOrphan = '';
+      let orphanCancelled = false;
+      let recvConflictCount = 0;
+      let loadCalled = 0;
+      let closeCalled = 0;
+      const acpMock = {
+        policyBySession: new Map(), start: async () => {}, discover: async () => {},
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        resolveModel: (m) => m, status: () => ({ running: true, ready: true }),
+        notify: (method, params) => {
+          if (method === 'session/cancel' && params.sessionId === 'orphan-sid') orphanCancelled = true;
+        },
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            if (!mcpUrlOrphan && params.mcpServers?.[0]?.url) {
+              mcpUrlOrphan = params.mcpServers[0].url;
+              return { sessionId: 'orphan-sid', models: { currentModelId: 'test', availableModels: [] } };
+            }
+            return { sessionId: 'recv-sid', models: { currentModelId: 'test', availableModels: [] } };
+          }
+          if (method === 'session/close') { closeCalled += 1; return {}; }
+          if (method === 'session/load') {
+            loadCalled += 1;
+            // 模拟 ACP session/load 重放历史正文：不得泄漏污染当前回答
+            acpRef.onNotification({
+              method: 'session/update',
+              params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'OLD_HISTORY_NOT_CURRENT_ANSWER' } } },
+            });
+            return { models: { currentModelId: 'test' } };
+          }
+          if (method === 'session/set_model') return {};
+          if (method === 'session/prompt') {
+            if (params.sessionId === 'orphan-sid') {
+              const sseRes = await fetch(mcpUrlOrphan, {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'Bash', arguments: { command: 'echo hi' } } }),
+              });
+              await sseRes.text();
+              return { stopReason: 'cancelled' };
+            }
+            if (params.sessionId === 'recv-sid') {
+              if (recvConflictCount < 2) {
+                recvConflictCount += 1;
+                throw new Error('Concurrent receive_steps() calls are not supported on this connection');
+              }
+              acpRef.onNotification({
+                method: 'session/update',
+                params: { sessionId: 'recv-sid', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'recovered from receive_steps conflict' } } },
+              });
+              return { stopReason: 'end_turn' };
+            }
+          }
+          return {};
+        },
+      };
+      acpRef = acpMock;
+      const gw = createGateway({
+        acp: acpMock, limiter: lim,
+        getConfig: () => ({ ...config, parkedTimeoutMs: 140, promptIdleTimeoutMs: 4000, source: path.join(dir, 'config.json') }),
+        log: () => {},
+      });
+      await gw.listen([p]);
+      try {
+        // 1. 孤儿挂起自动超时释放锁
+        const rOrphan = await fetch(`http://127.0.0.1:${p}/v1/chat/completions`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'orphan-conv',
+            tools: [{ type: 'function', function: { name: 'Bash', parameters: { type: 'object', properties: { command: { type: 'string' } } } } }],
+            messages: [{ role: 'user', content: 'run bash' }],
+          }),
+        }).then((r) => r.text());
+        assert.ok(rOrphan.includes('Bash'));
+        assert.equal(gw.listSessions().find((s) => s.sessionId === 'orphan-sid')?.inflight, 1, '刚挂起时会话处于在途等待态');
+        await new Promise((r) => setTimeout(r, 340));
+        assert.equal(orphanCancelled, true, '超过 parkedTimeoutMs 未回填必须自动发送 session/cancel');
+        assert.equal(gw.listSessions().find((s) => s.sessionId === 'orphan-sid')?.inflight, 0, '孤儿挂起回收后必须彻底释放在途计数与会话锁');
+
+        // 2. Concurrent receive_steps 二阶自愈（第 1 次 cancel 等待重试，第 2 次 close + session/load 热重载恢复）
+        const rRecv = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: false, prompt_cache_key: 'recv-conv', input: 'hello after race' }),
+        });
+        assert.equal(rRecv.status, 200);
+        const jRecv = await rRecv.json();
+        const outText = JSON.stringify(jRecv);
+        assert.ok(outText.includes('recovered from receive_steps conflict'));
+        assert.ok(!outText.includes('OLD_HISTORY_NOT_CURRENT_ANSWER'), 'session/load 热重载期间重放的旧历史绝不能污染当前回答');
+        assert.equal(recvConflictCount, 2);
+        assert.equal(closeCalled, 1, '二次冲突应自动 close 旧 worker');
+        assert.equal(loadCalled, 1, '二次冲突应自动 session/load 原地热重载会话');
+      } finally {
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    await check('parked resume guards against duplicate concurrent resume, underlying crash slot leak, and multi-user trailing attachments', async () => {
+      const p = await (async () => { const s = net.createServer(); await new Promise((r) => s.listen(0, '127.0.0.1', r)); const pt = s.address().port; await new Promise((r) => s.close(r)); return pt; })();
+      const dir = path.join(process.env.PI_SCRATCH_DIR || process.cwd(), `gw-p1-guards-${Date.now()}`);
+      const { createLimiter } = require('../lib/core.js');
+      const lim = createLimiter({ limit: 1, maxQueue: 6, queueTimeoutMs: 400 });
+      let acpRef;
+      const sids = [];
+      const promptsSeen = [];
+      let rejectCrashSession = null;
+      const acpMock = {
+        policyBySession: new Map(), start: async () => {}, discover: async () => {},
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        resolveModel: (m) => m, status: () => ({ running: true, ready: true }),
+        notify: () => {},
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            const sid = `guard-sid-${sids.length + 1}`;
+            sids.push({ sid, mcpUrl: params.mcpServers?.[0]?.url || '' });
+            return { sessionId: sid, models: { currentModelId: 'test', availableModels: [] } };
+          }
+          if (method === 'session/close') return {};
+          if (method === 'session/prompt') {
+            const sid = params.sessionId;
+            promptsSeen.push({ sid, prompt: params.prompt });
+            const entry = sids.find((x) => x.sid === sid);
+            if (sid === 'guard-sid-1') {
+              const sseRes = await fetch(entry.mcpUrl, {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'Read', arguments: { path: 'a.txt' } } }),
+              });
+              await sseRes.text();
+              acpRef.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'dup-safe-ok' } } },
+              });
+              return { stopReason: 'end_turn' };
+            }
+            if (sid === 'guard-sid-2') {
+              const hold = await fetch(entry.mcpUrl, {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'Read', arguments: { path: 'b.txt' } } }),
+              }).catch(() => null);
+              await new Promise((_, rej) => { rejectCrashSession = rej; });
+              hold?.body?.cancel?.().catch(() => {});
+              return { stopReason: 'end_turn' };
+            }
+            if (sid === 'guard-sid-3') {
+              if (promptsSeen.filter((x) => x.sid === sid).length === 1) {
+                const sseRes = await fetch(entry.mcpUrl, {
+                  method: 'POST', headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'Edit', arguments: { path: 'c.js' } } }),
+                });
+                await sseRes.text();
+                return { stopReason: 'cancelled' };
+              }
+              acpRef.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'doc-preserved-ok' } } },
+              });
+              return { stopReason: 'end_turn' };
+            }
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      acpRef = acpMock;
+      const gw = createGateway({
+        acp: acpMock, limiter: lim,
+        getConfig: () => ({ ...config, concurrency: 1, source: path.join(dir, 'config.json') }),
+        log: () => {},
+      });
+      await gw.listen([p]);
+      const tools = [{ type: 'function', name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } },
+                     { type: 'function', name: 'Edit', parameters: { type: 'object', properties: { path: { type: 'string' } } } }];
+      try {
+        // 1. 同一挂起工具并发收到两个重复回填请求（且并发槽暂时被占）：绝不泄漏槽位、绝不挂死 HTTP 流
+        const g1 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'dup-k1', tools, input: [{ role: 'user', content: 'r1' }] }),
+        }).then((r) => r.text());
+        const cid1 = /"call_id":"(call_[^"]+)"/.exec(g1)[1];
+        let releaseSlot1;
+        const hold1 = lim.run(() => new Promise((r) => { releaseSlot1 = r; }));
+        await new Promise((r) => setTimeout(r, 15));
+        const resumeBody1 = JSON.stringify({
+          model: 'test', stream: true, prompt_cache_key: 'dup-k1', tools,
+          input: [
+            { role: 'user', content: 'r1' },
+            { type: 'function_call', call_id: cid1, name: 'Read', arguments: '{"path":"a.txt"}' },
+            { type: 'function_call_output', call_id: cid1, output: 'file-a' },
+          ],
+        });
+        const dupReqA = fetch(`http://127.0.0.1:${p}/v1/responses`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: resumeBody1 }).then((r) => r.text());
+        await new Promise((r) => setTimeout(r, 20));
+        const dupReqB = fetch(`http://127.0.0.1:${p}/v1/responses`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: resumeBody1 }).then((r) => r.text());
+        await new Promise((r) => setTimeout(r, 20));
+        releaseSlot1();
+        const [outA, outB] = await Promise.all([dupReqA, dupReqB, hold1]);
+        assert.ok(outA.includes('dup-safe-ok') || outB.includes('dup-safe-ok'), '主恢复请求必须正常完成');
+        assert.equal(lim.stats().active, 0, '重复并发回填后 active 必须归零');
+
+        // 2. 回填请求排队等待并发槽期间，原底层 ACP prompt 异常退出：立即释放且 active=0
+        const g2 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'crash-k2', tools, input: [{ role: 'user', content: 'r2' }] }),
+        }).then((r) => r.text());
+        const cid2 = /"call_id":"(call_[^"]+)"/.exec(g2)[1];
+        let releaseSlot2;
+        const hold2 = lim.run(() => new Promise((r) => { releaseSlot2 = r; }));
+        await new Promise((r) => setTimeout(r, 15));
+        const crashResume = fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'crash-k2', tools,
+            input: [
+              { role: 'user', content: 'r2' },
+              { type: 'function_call', call_id: cid2, name: 'Read', arguments: '{"path":"b.txt"}' },
+              { type: 'function_call_output', call_id: cid2, output: 'file-b' },
+            ],
+          }),
+        }).then((r) => r.text());
+        await new Promise((r) => setTimeout(r, 25));
+        rejectCrashSession(new Error('worker crashed unexpectedly'));
+        await new Promise((r) => setTimeout(r, 25));
+        releaseSlot2();
+        await Promise.all([crashResume, hold2]);
+        assert.equal(lim.stats().active, 0, '原 prompt 崩溃后并发槽位绝不能泄漏');
+
+        // 3. 多条新增 user 消息中前一条含文档附件、末条为纯文本「继续」：不得误走纯文本合并而丢弃文档
+        const g3 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'doc-k3', tools, input: [{ role: 'user', content: 'edit c.js' }] }),
+        }).then((r) => r.text());
+        const cid3 = /"call_id":"(call_[^"]+)"/.exec(g3)[1];
+        const docData = Buffer.from('spec-line-anchor-rules', 'utf8').toString('base64');
+        const g3Cont = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'doc-k3', tools,
+            input: [
+              { role: 'user', content: 'edit c.js' },
+              { type: 'function_call', call_id: cid3, name: 'Edit', arguments: '{"path":"c.js"}' },
+              { type: 'function_call_output', call_id: cid3, output: 'INVALID_ARGUMENT' },
+              { role: 'user', content: [{ type: 'input_text', text: '参考这份规范' }, { type: 'input_file', filename: 'spec.txt', file_data: `data:text/plain;base64,${docData}` }] },
+              { role: 'user', content: '继续' },
+            ],
+          }),
+        }).then((r) => r.text());
+        assert.ok(g3Cont.includes('doc-preserved-ok'));
+        const secondSid3Prompt = JSON.stringify(promptsSeen.filter((x) => x.sid === 'guard-sid-3')[1]?.prompt || '');
+        assert.ok(secondSid3Prompt.includes('spec-line-anchor-rules') && secondSid3Prompt.includes('INVALID_ARGUMENT'), '多条新增用户消息含附件时必须走完整块发送并保留文档与工具结果');
+      } finally {
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
       }
     });
     console.log(`${passed}/${passed} behavioral tests passed`);

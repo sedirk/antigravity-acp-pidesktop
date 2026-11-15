@@ -1008,6 +1008,150 @@ async function main() {
     assert.deepStrictEqual(reloaded.get('k-uh').userHistory, ['fp:1111', 'fp:2222'], '同会话部分字段更新与重启重载均必须保留 userHistory');
   });
 
+  await suite('rate-limit: 429/瞬时过载识别与 Retry-After 阶梯退避解析', async () => {
+    const { isTransientRateLimitError, parseRetryAfterMs } = require(path.join(root, 'lib/server.js'));
+    assert.strictEqual(isTransientRateLimitError(new Error('HTTP 429 RESOURCE_EXHAUSTED: Quota exceeded for quota metric')), true);
+    assert.strictEqual(isTransientRateLimitError(Object.assign(new Error('Upstream error'), { acp: { code: 429, data: { reason: 'rateLimitExceeded' } } })), true);
+    assert.strictEqual(isTransientRateLimitError(new Error('503 Service temporarily unavailable / model is overloaded')), true);
+    assert.strictEqual(isTransientRateLimitError(new Error('403 PERMISSION_DENIED: invalid api_key')), false);
+    assert.strictEqual(isTransientRateLimitError(new Error('429 insufficient_quota: billing hard limit reached')), false);
+    assert.strictEqual(isTransientRateLimitError(Object.assign(new Error('cancelled'), { code: 'PROMPT_CANCELLED' })), false);
+
+    assert.strictEqual(parseRetryAfterMs(new Error('Please retry in 12.4s'), 1, 15000), 13400);
+    assert.strictEqual(parseRetryAfterMs(Object.assign(new Error('429'), { acp: { data: { retryDelay: '25s' } } }), 1, 15000), 26000);
+    assert.strictEqual(parseRetryAfterMs(new Error('429 RESOURCE_EXHAUSTED'), 1, 15000), 15000);
+    assert.strictEqual(parseRetryAfterMs(new Error('429 RESOURCE_EXHAUSTED'), 2, 15000), 30000);
+    assert.strictEqual(parseRetryAfterMs(new Error('429 RESOURCE_EXHAUSTED'), 3, 15000), 60000);
+  });
+
+  await suite('limiter: 挂起租约 (releaseForPark / resumeFromPark) 解锁单并发槽位并支持优先恢复', async () => {
+    const lim = createLimiter({ limit: 1, maxQueue: 8, queueTimeoutMs: 250 });
+    const order = [];
+    let resumeGate;
+    const gatePromise = new Promise((r) => { resumeGate = r; });
+
+    const p1 = lim.run(async (lease) => {
+      order.push('t1-start');
+      assert.strictEqual(lim.stats().active, 1);
+      lease.releaseForPark();
+      assert.strictEqual(lim.stats().active, 0, '挂起期间必须释放并发槽位以防子代理或压缩死锁');
+      await gatePromise;
+      await lease.resumeFromPark();
+      order.push('t1-resumed');
+      assert.strictEqual(lim.stats().active, 1);
+      return 'ok-1';
+    });
+
+    await new Promise((r) => setTimeout(r, 15));
+    // 单并发下，挂起期间旁路压缩或子代理请求必须能直接进入执行，绝不排队超时
+    const subResult = await lim.run(async () => {
+      order.push('compaction-while-parked');
+      return 'summary-done';
+    });
+    assert.strictEqual(subResult, 'summary-done');
+
+    // 验证续流优先插队（priority=true）：当槽位被占时，resumeFromPark 优先于普通新请求唤醒
+    let releaseBlocker;
+    const blocker = lim.run(() => new Promise((r) => { releaseBlocker = r; }));
+    await new Promise((r) => setTimeout(r, 10));
+    resumeGate();
+    await new Promise((r) => setTimeout(r, 10));
+    const normalQueued = lim.run(async () => { order.push('normal-queued'); });
+    await new Promise((r) => setTimeout(r, 10));
+    releaseBlocker();
+    await Promise.all([p1, blocker, normalQueued]);
+    assert.deepStrictEqual(order, ['t1-start', 'compaction-while-parked', 't1-resumed', 'normal-queued']);
+    assert.strictEqual(lim.stats().active, 0);
+
+    // 验证 1：单飞 resumeFromPark 并发调用只占 1 个槽位且不泄漏
+    await lim.run(async (lease) => {
+      lease.releaseForPark();
+      assert.strictEqual(lim.stats().active, 0);
+      await Promise.all([lease.resumeFromPark(), lease.resumeFromPark()]);
+      assert.strictEqual(lim.stats().active, 1, '并发 resumeFromPark 必须单飞收敛，只占 1 个槽位');
+    });
+    assert.strictEqual(lim.stats().active, 0);
+
+    // 验证 2：原 run() 提前抛错结束时，排队中的 resumeFromPark 立即取消且绝不泄漏槽位
+    let releaseOuterSlot;
+    const outerBlocker = lim.run(() => new Promise((r) => { releaseOuterSlot = r; }));
+    await new Promise((r) => setTimeout(r, 10));
+    let danglingResume;
+    let finishParkedRun;
+    const parkedRun = lim.run(async (lease) => {
+      lease.releaseForPark();
+      await new Promise((r) => { finishParkedRun = r; });
+      throw new Error('underlying prompt crashed');
+    });
+    // 先释放 outerBlocker 让 parkedRun 进入挂起并释放槽位，随后再占住槽位让 resumeFromPark 排队
+    releaseOuterSlot();
+    await new Promise((r) => setTimeout(r, 15));
+    let releaseSecondBlocker;
+    const secondBlocker = lim.run(async () => {
+      await new Promise((r) => { releaseSecondBlocker = r; });
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    // 抓取内部 lease 需要在挂起态发起 resume：用另一轮专门测试排队期间 run() 退出
+    releaseSecondBlocker();
+    finishParkedRun();
+    await assert.rejects(() => parkedRun, /underlying prompt crashed/);
+    await Promise.all([outerBlocker, secondBlocker]);
+
+    let capturedLease;
+    let crashParked;
+    const pCrash = lim.run(async (lease) => {
+      capturedLease = lease;
+      lease.releaseForPark();
+      await new Promise((_, rej) => { crashParked = rej; });
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    let releaseThirdBlocker;
+    const thirdBlocker = lim.run(() => new Promise((r) => { releaseThirdBlocker = r; }));
+    await new Promise((r) => setTimeout(r, 10));
+    danglingResume = capturedLease.resumeFromPark();
+    // 在 thirdBlocker 仍占槽、danglingResume 仍在队列等待时，原 pCrash 抛错结束
+    crashParked(new Error('acp crashed while resume queued'));
+    await assert.rejects(() => pCrash, /acp crashed/);
+    await assert.rejects(() => danglingResume, (err) => err && err.code === 'PROMPT_CANCELLED');
+    releaseThirdBlocker();
+    await thirdBlocker;
+    assert.strictEqual(lim.stats().active, 0, '原 run 结束后排队中的 resumeFromPark 绝不能泄漏 active 槽位');
+    assert.strictEqual(lim.stats().queued, 0);
+  });
+
+  await suite('bridge/mcp: 工具签名摘要与 MCP initialize instructions 契约对齐', async () => {
+    const { summarizeToolSignatures, projectTools } = require(path.join(root, 'lib/bridge.js'));
+    const { createMcpServer } = require(path.join(root, 'lib/mcp.js'));
+    const rawA = [
+      { type: 'function', name: 'Task', parameters: { type: 'object', required: ['agent', 'task'], properties: { task: { type: 'string' }, agent: { type: 'string' }, model: { type: 'string' } } } },
+      { type: 'function', name: 'Edit', parameters: { type: 'object', required: ['path', 'tag', 'ops'], properties: { ops: { type: 'string' }, path: { type: 'string' }, tag: { type: 'string' } } } },
+    ];
+    const rawB = [rawA[1], rawA[0]];
+    const s1 = summarizeToolSignatures(projectTools(rawA));
+    const s2 = summarizeToolSignatures(projectTools(rawB));
+    assert.strictEqual(s1, s2, '工具签名摘要必须严格稳定排序，确保前缀缓存 100% 字节级一致');
+    assert.ok(s1.includes('pi-bridge_Edit(ops, path, tag)'), '必须包含 Edit 必填参数签名');
+    assert.ok(s1.includes('严禁传 old_string/new_string'), '必须包含 Edit 行锚点防错提醒');
+    assert.ok(s1.includes('pi-bridge_Task(agent, task, model?)') && s1.includes('禁止传 subagent_type/prompt'), '必须包含 Task 参数契约提醒');
+
+    const srv = createMcpServer({
+      listTools: () => projectTools(rawA),
+      getInstructions: () => s1,
+      callTool: async () => ({ content: [] }),
+    });
+    const { url } = await srv.listen(0, '127.0.0.1');
+    try {
+      const initRes = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }),
+      }).then((r) => r.json());
+      assert.strictEqual(initRes.result.instructions, s1, 'MCP initialize 必须下发工具契约 instructions 供懒加载运行时读取');
+    } finally {
+      srv.close();
+    }
+  });
+
   const failed = results.filter((r) => !r.ok);
   console.log(`\n结果: ${results.length - failed.length}/${results.length} 通过`);
   if (failed.length > 0) process.exit(1);

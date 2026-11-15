@@ -302,7 +302,7 @@
       <span class="hint">0 = 不设上限（推荐）。长任务可以一直跑，真正的止损是「无进展判定」。</span>
     </div>
     <div class="field">
-      <label for="promptIdleSeconds">无进展判定（秒，默认 180）</label>
+      <label for="promptIdleSeconds">无进展判定（秒，默认 300）</label>
       <input id="promptIdleSeconds" type="number" min="30" max="3600">
       <span class="hint">连续这么久收不到任何进展才取消本轮；只要运行时还在报工具进展就不会被砍</span>
     </div>
@@ -331,6 +331,31 @@
       <label for="idleSessionMinutes">会话空闲回收（分钟）</label>
       <input id="idleSessionMinutes" type="number" min="1" max="240">
       <span class="hint">到点用 session/close 释放运行时的 worker；下次发言优先 session/resume 接回</span>
+    </div>
+    <div class="field">
+      <label for="rateLimitMaxRetries">429 限流自动重试次数（默认 3）</label>
+      <input id="rateLimitMaxRetries" type="number" min="0" max="10">
+      <span class="hint">设为 0 关闭网关层 429 自动冷却续推</span>
+    </div>
+    <div class="field">
+      <label for="rateLimitRetryBaseSeconds">429 初始冷却时间（秒，默认 15）</label>
+      <input id="rateLimitRetryBaseSeconds" type="number" min="1" max="120">
+      <span class="hint">未返回 Retry-After 时按 1×/2×/4× 指数退避等待滑动窗口释放</span>
+    </div>
+    <div class="field">
+      <label for="highContextThrottleTokens">微节流上下文阈值（Token，默认 160000）</label>
+      <input id="highContextThrottleTokens" type="number" min="0" max="2000000" step="10000">
+      <span class="hint">0 = 关闭；长上下文连续 ≥4 轮工具回填时自动平滑缓冲防 TPM 限流</span>
+    </div>
+    <div class="field">
+      <label for="highContextThrottleMs">微节流最小间隔（毫秒，默认 2500）</label>
+      <input id="highContextThrottleMs" type="number" min="0" max="30000" step="100">
+      <span class="hint">连续高频工具回填之间的最小目标间隔（≥7 轮自动放大 1.5 倍）</span>
+    </div>
+    <div class="field">
+      <label for="reportedContextWindow">上报宿主的上下文窗口大小（Token，默认 200000）</label>
+      <input id="reportedContextWindow" type="number" min="0" max="2000000" step="10000">
+      <span class="hint">控制 PI-Desktop 自动触发上下文压缩（Compaction）的水位；宿主会在达到 90%（默认约 18 万 Token）时触发压缩并生成阶段摘要；设为 0 则上报模型原生 100 万 Token（需累积至 90 万 Token 才压缩）</span>
     </div>
   </section>
 
@@ -393,7 +418,8 @@
   const ids = [
     'port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', 'idleSessionMinutes', 'bin', 'defaultModel',
     'modelCacheMinutes', 'defaultEffort', 'virtualModels', 'bridgeTools', 'cwd', 'bridgeGuidance',
-    'exposeVariantModels', 'concurrency', 'queueTimeoutMinutes', 'promptTimeoutMinutes', 'promptIdleSeconds', 'clientName'
+    'exposeVariantModels', 'concurrency', 'queueTimeoutMinutes', 'promptTimeoutMinutes', 'promptIdleSeconds', 'clientName',
+    'rateLimitMaxRetries', 'rateLimitRetryBaseSeconds', 'highContextThrottleTokens', 'highContextThrottleMs', 'reportedContextWindow'
   ];
   const $ = (id) => document.getElementById(id);
   const msg = $('msg');
