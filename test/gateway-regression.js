@@ -900,7 +900,7 @@ async function main() {
         assert.ok(done2, `续流轮应正常 completed，实际事件: ${JSON.stringify(turn2)}`);
         const fc2 = done2.data.response.output.find((o) => o.type === 'function_call');
         assert.ok(fc2, '续流轮应挂起返回第二个 function_call');
-        assert.equal(done2.data.response.usage.input_tokens, 128945, '第 2+ 次 park 必须继续上报运行时真实 contextUsed，不能退化成虚高本地估算');
+        assert.ok(done2.data.response.usage.input_tokens > 128945 && done2.data.response.usage.input_tokens < 129100, `第 2+ 次 park 应在真实 contextUsed(128945) 基础上叠加无放大工具步增量，绝不退化成虚高本地估算（实际: ${done2.data.response.usage.input_tokens}）`);
         assert.equal(done2.data.response.usage.estimated, false);
 
         // Step 3: 此时 main-bridged-sess 正挂在第二个 Read 上！
@@ -3650,6 +3650,559 @@ async function main() {
         assert.equal(aMsg4, 'CONV_A_REBUILT_CLEAN');
       } finally {
         finishConvB();
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    await check('bridged /v1/responses tracks real-time un-amplified mid-turn tool watermarks, unfolds 1.5.0 multi-call PromptResponse.usage & folded usage_update, and writes back owner.contextUsed', async () => {
+      const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'ag-watermark-232-'));
+      let mcpUrl = '';
+      let promptCount = 0;
+      const acpWm = {
+        policyBySession: new Map(),
+        onNotification: null,
+        start: async () => {},
+        discover: async () => ({ groups: new Map(), raw: [] }),
+        cwdFor: async () => dir,
+        resolveModel: async (m) => m,
+        status: () => ({ running: true, ready: true }),
+        notify: () => {},
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            mcpUrl = (params.mcpServers && params.mcpServers[0] && params.mcpServers[0].url) || '';
+            return { sessionId: 'wm-sess-1', models: { currentModelId: 'gemini-4-hydrogen', availableModels: [] } };
+          }
+          if (method === 'session/close') return {};
+          if (method === 'session/prompt') {
+            promptCount += 1;
+            const sid = params.sessionId;
+            const callRead = (id, file) => fetch(mcpUrl, {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'Read', arguments: { path: file } } }),
+            }).then((r) => r.text());
+
+            if (promptCount === 1) {
+              // 第 1 轮：种下 187,300 基准上下文占用
+              acpWm.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'usage_update', used: 187300, size: 1000000 } },
+              });
+              acpWm.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'seeded baseline' } } },
+              });
+              return { stopReason: 'end_turn', usage: { inputTokens: 7300, cachedReadTokens: 180000, outputTokens: 50, thoughtTokens: 10, totalTokens: 187350 } };
+            }
+            if (promptCount === 2) {
+              // 第 2 轮：模拟 1.5.0 连续 3 步 MCP 工具调用且轮中零 usage_update，结束时返回 4 次调用累加的 PromptResponse.usage
+              acpWm.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Inspecting step 1 files carefully.' } } },
+              });
+              await callRead(1, 'alpha.js');
+              acpWm.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Inspecting step 2 files carefully.' } } },
+              });
+              await callRead(2, 'beta.js');
+              acpWm.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Inspecting step 3 files carefully.' } } },
+              });
+              await callRead(3, 'gamma.js');
+              acpWm.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'All 3 files analyzed.' } } },
+              });
+              // 4 次模型调用累计输入：187.4k + 188.5k + 190.6k + 192.2k = 758,700
+              return {
+                stopReason: 'end_turn',
+                usage: { inputTokens: 38700, cachedReadTokens: 720000, outputTokens: 480, thoughtTokens: 160, totalTokens: 759180 },
+              };
+            }
+            if (promptCount === 3) {
+              // 第 3 轮：验证：
+              // (a) item.resolve 后紧跟上一步模型调用的 usage_update 不得抹掉刚回填的 4,000 字大工具结果；
+              // (b) 1.5.0 漏读 WebSocket Message 2 导致下一步 usage_update 叠成 2 倍 (396,000) 时自动展开还原单次水位
+              await callRead(4, 'delta.js');
+              // 模拟 _stream_live_step 在工具返回后立刻报出上一步模型调用的 usage_update(193000)
+              acpWm.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'usage_update', used: 193000, size: 1000000 } },
+              });
+              acpWm.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Processing delta.js output.' } } },
+              });
+              await callRead(5, 'epsilon.js');
+              acpWm.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Done with folded check.' } } },
+              });
+              // 模拟两拍合并翻倍的 usage_update (2 * ~198k = 396000)
+              acpWm.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'usage_update', used: 396000, size: 1000000 } },
+              });
+              return { stopReason: 'end_turn' };
+            }
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const gw = createGateway({
+        acp: acpWm,
+        limiter: { run: (f) => f(), stats: () => ({}) },
+        getConfig: () => ({ ...config, source: path.join(dir, 'config.json') }),
+        log: () => {},
+      });
+      const p = await gw.listen([0]);
+      const tools = [{ type: 'function', name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } }];
+      const postResp = async (input) => {
+        const raw = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'gemini-4-hydrogen', stream: true, prompt_cache_key: 'wm-conv-232', tools, input }),
+        }).then((r) => r.text());
+        const evs = raw.split('\n\n').filter(Boolean).map((blk) => {
+          const ev = /^event: (.+)$/m.exec(blk)?.[1];
+          const d = /^data: (.+)$/m.exec(blk)?.[1];
+          return ev && d ? { type: ev, data: JSON.parse(d) } : null;
+        }).filter(Boolean);
+        return evs.find((e) => e.type === 'response.completed').data.response;
+      };
+      try {
+        const r0 = await postResp([{ role: 'user', content: 'seed' }]);
+        assert.equal(r0.usage.input_tokens, 187300);
+
+        const hist = [
+          { role: 'user', content: 'seed' },
+          { role: 'assistant', content: 'seeded baseline' },
+          { role: 'user', content: 'audit alpha, beta, gamma' },
+        ];
+        const p1 = await postResp(hist);
+        const fc1 = p1.output.find((o) => o.type === 'function_call');
+        assert.ok(p1.usage.input_tokens > 187300 && p1.usage.input_tokens < 188000, `park1 应平滑微增而非死锁在 187300（实际: ${p1.usage.input_tokens}）`);
+
+        hist.push({ type: 'function_call', call_id: fc1.call_id, name: 'Read', arguments: fc1.arguments });
+        hist.push({ type: 'function_call_output', call_id: fc1.call_id, output: 'A'.repeat(4000) }); // ~1000 tokens
+        const p2 = await postResp(hist);
+        const fc2 = p2.output.find((o) => o.type === 'function_call');
+        assert.ok(p2.usage.input_tokens >= p1.usage.input_tokens + 950 && p2.usage.input_tokens < p1.usage.input_tokens + 1300, `park2 应按真实无放大增量涨约 1000 tokens（p1=${p1.usage.input_tokens}, p2=${p2.usage.input_tokens}）`);
+
+        hist.push({ type: 'function_call', call_id: fc2.call_id, name: 'Read', arguments: fc2.arguments });
+        hist.push({ type: 'function_call_output', call_id: fc2.call_id, output: 'B'.repeat(8000) }); // ~2000 tokens
+        const p3 = await postResp(hist);
+        const fc3 = p3.output.find((o) => o.type === 'function_call');
+        assert.ok(p3.usage.input_tokens >= p2.usage.input_tokens + 1950 && p3.usage.input_tokens < p2.usage.input_tokens + 2300, `park3 应按真实无放大增量涨约 2000 tokens（p2=${p2.usage.input_tokens}, p3=${p3.usage.input_tokens}）`);
+
+        hist.push({ type: 'function_call', call_id: fc3.call_id, name: 'Read', arguments: fc3.arguments });
+        hist.push({ type: 'function_call_output', call_id: fc3.call_id, output: 'C'.repeat(6000) }); // ~1500 tokens
+        const fin2 = await postResp(hist);
+        assert.ok(fin2.usage.input_tokens > 190000 && fin2.usage.input_tokens < 196000, `多步累计 PromptResponse.usage(758700) 必须展开为单轮真实水位 ~192k 并回写（实际: ${fin2.usage.input_tokens}）`);
+        assert.ok(fin2.usage.input_tokens_details.cached_tokens < fin2.usage.input_tokens, 'cached_tokens 必须按比例缩放而非顶满 100%');
+
+        // Turn 3：验证 owner.contextUsed 已继承 ~192k，且工具返回后上一步 usage_update(193000) 保留刚回填的 3000 token 工具增量，终态 2 倍折叠值 (396000) 自动展开
+        hist.push({ role: 'assistant', content: 'All 3 files analyzed.' });
+        hist.push({ role: 'user', content: 'now inspect delta and epsilon' });
+        const t3p1 = await postResp(hist);
+        const fc4 = t3p1.output.find((o) => o.type === 'function_call');
+        assert.ok(t3p1.usage.input_tokens > fin2.usage.input_tokens, `下一轮挂起必须继承已回写的 ${fin2.usage.input_tokens} 水位并继续递增（实际: ${t3p1.usage.input_tokens}）`);
+
+        hist.push({ type: 'function_call', call_id: fc4.call_id, name: 'Read', arguments: fc4.arguments });
+        hist.push({ type: 'function_call_output', call_id: fc4.call_id, output: 'D'.repeat(12000) }); // ~3000 tokens
+        const t3p2 = await postResp(hist);
+        const fc5 = t3p2.output.find((o) => o.type === 'function_call');
+        assert.ok(t3p2.usage.input_tokens >= 195800 && t3p2.usage.input_tokens < 197500, `item.resolve 后的上一步 usage_update(193000) 必须保留刚回填的 3000 tokens 工具结果，严禁倒退回 193000（实际: ${t3p2.usage.input_tokens}）`);
+
+        hist.push({ type: 'function_call', call_id: fc5.call_id, name: 'Read', arguments: fc5.arguments });
+        hist.push({ type: 'function_call_output', call_id: fc5.call_id, output: 'E'.repeat(2000) }); // ~500 tokens
+        const fin3 = await postResp(hist);
+        assert.ok(fin3.usage.input_tokens > 196000 && fin3.usage.input_tokens < 205000, `1.5.0 漏帧导致的 2 倍叠加 usage_update(396000) 必须自动展开还原 ~199k（实际: ${fin3.usage.input_tokens}）`);
+      } finally {
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    await check('false-positive content filter triggers in-session safe continuation and rotates poisoned session cleanly', async () => {
+      const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'ag-filter-232-'));
+      let sidSeq = 0;
+      const closedSids = [];
+      const promptsBySid = [];
+      const acpFlt = {
+        policyBySession: new Map(),
+        onNotification: null,
+        start: async () => {},
+        discover: async () => ({ groups: new Map(), raw: [] }),
+        cwdFor: async () => dir,
+        resolveModel: async (m) => m,
+        status: () => ({ running: true, ready: true }),
+        notify: () => {},
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            sidSeq += 1;
+            return { sessionId: `flt-sess-${sidSeq}`, models: { currentModelId: 'gemini-4-hydrogen', availableModels: [] } };
+          }
+          if (method === 'session/close') {
+            closedSids.push(params.sessionId);
+            return {};
+          }
+          if (method === 'session/prompt') {
+            const text = params.prompt.map((b) => b.text || '').join('\n');
+            promptsBySid.push({ sid: params.sessionId, text });
+            if (params.sessionId === 'flt-sess-1') {
+              // 模拟旧会话轨迹中毒：首次调用与会话内重试均被 PROHIBITED_CONTENT 拦截，触发桥接层轮换新会话脱敏挽救
+              throw new Error('Candidate was blocked due to finish_reason: PROHIBITED_CONTENT');
+            }
+            acpFlt.onNotification({
+              method: 'session/update',
+              params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'SALVAGED_CLEAN_RESPONSE' } } },
+            });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const gw = createGateway({
+        acp: acpFlt,
+        limiter: { run: (f) => f(), stats: () => ({}) },
+        getConfig: () => ({ ...config, source: path.join(dir, 'config.json'), contentFilterMaxRetries: 2 }),
+        log: () => {},
+      });
+      const p = await gw.listen([0]);
+      const tools = [{ type: 'function', name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } }];
+      try {
+        const raw = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-hydrogen', stream: true, prompt_cache_key: 'flt-conv-1', tools,
+            input: [
+              { role: 'user', content: 'audit prompt injection and reverse shell guardrails in security module' },
+            ],
+          }),
+        }).then((r) => r.text());
+        const evs = raw.split('\n\n').filter(Boolean).map((blk) => {
+          const ev = /^event: (.+)$/m.exec(blk)?.[1];
+          const d = /^data: (.+)$/m.exec(blk)?.[1];
+          return ev && d ? { type: ev, data: JSON.parse(d) } : null;
+        }).filter(Boolean);
+        const done = evs.find((e) => e.type === 'response.completed').data.response;
+        assert.equal(done.output.find((o) => o.type === 'message').content[0].text, 'SALVAGED_CLEAN_RESPONSE');
+        assert.equal(promptsBySid.filter((x) => x.sid === 'flt-sess-1').length, 2, '中毒会话应先执行 1 次会话内安全声明重试，共 2 次请求');
+        assert.ok(closedSids.includes('flt-sess-1'), '轮换纯净会话时必须关闭已中毒的旧会话');
+        const salvagedCall = promptsBySid.find((x) => x.sid === 'flt-sess-2');
+        assert.ok(salvagedCall && !/reverse shell/i.test(salvagedCall.text), '挽救会话提示词应对敏感触发词脱敏');
+      } finally {
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+    await check('fresh-session multi-step watermarks unfold accurately without 31% inflation, post-tool usage_update keeps result delta, filter retry after tool uses continuation, and compaction retains userTimeline', async () => {
+      const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'ag-fresh-wm-232-'));
+      let mcpUrl = '';
+      let sidCounter = 0;
+      const promptsLog = [];
+      const acpFresh = {
+        policyBySession: new Map(),
+        onNotification: null,
+        start: async () => {},
+        discover: async () => ({ groups: new Map(), raw: [] }),
+        cwdFor: async () => dir,
+        resolveModel: async (m) => m,
+        status: () => ({ running: true, ready: true }),
+        notify: () => {},
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            sidCounter += 1;
+            mcpUrl = (params.mcpServers && params.mcpServers[0] && params.mcpServers[0].url) || mcpUrl;
+            return { sessionId: `fresh-sid-${sidCounter}`, models: { currentModelId: 'gemini-4-hydrogen', availableModels: [] } };
+          }
+          if (method === 'session/close') return {};
+          if (method === 'session/prompt') {
+            const sid = params.sessionId;
+            const pText = params.prompt.map((b) => b.text || '').join('\n');
+            promptsLog.push({ sid, pText });
+            const callRead = (id, file) => fetch(mcpUrl, {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'Read', arguments: { path: file } } }),
+            }).then((r) => r.text());
+
+            // Case 1: 新建会话（baseUsed=0），初始约 20k tokens，3 次模型调用，结尾收到 3 倍折叠 usage_update(63999)
+            if (sid === 'fresh-sid-1') {
+              await callRead(1, 'f1.js');
+              await callRead(2, 'f2.js');
+              acpFresh.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'FRESH_FOLDED_OK' } } },
+              });
+              acpFresh.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'usage_update', used: 63999, size: 1000000 } },
+              });
+              return { stopReason: 'end_turn' };
+            }
+            // Case 2: 新建会话（baseUsed=0），初始约 20k tokens，4 次模型调用无中间 usage_update，仅返回累计 PromptResponse.usage(87350)
+            if (sid === 'fresh-sid-2') {
+              await callRead(11, 'g1.js');
+              await callRead(12, 'g2.js');
+              await callRead(13, 'g3.js');
+              acpFresh.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'FRESH_CUMULATIVE_OK' } } },
+              });
+              return {
+                stopReason: 'end_turn',
+                usage: { inputTokens: 27350, cachedReadTokens: 60000, outputTokens: 200, thoughtTokens: 50, totalTokens: 87550 },
+              };
+            }
+            // Case 3: Post-tool 100,000 -> 1,000 result -> 102,000 preceding usage_update -> next park >= 103,000
+            if (sid === 'fresh-sid-3') {
+              if (promptsLog.filter((x) => x.sid === sid).length === 1) {
+                acpFresh.onNotification({
+                  method: 'session/update',
+                  params: { sessionId: sid, update: { sessionUpdate: 'usage_update', used: 100000, size: 1000000 } },
+                });
+                await callRead(21, 'stepA.js');
+                // Preceding call usage_update arrives at 102,000 (within 1.5x of 101,000!), must NOT wipe 1,000-token result delta!
+                acpFresh.onNotification({
+                  method: 'session/update',
+                  params: { sessionId: sid, update: { sessionUpdate: 'usage_update', used: 102000, size: 1000000 } },
+                });
+                await callRead(22, 'stepB.js');
+                acpFresh.onNotification({
+                  method: 'session/update',
+                  params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'POST_TOOL_OK' } } },
+                });
+                return { stopReason: 'end_turn' };
+              }
+            }
+            // Case 4: 新建会话完成一步工具后触发误判拦截，会话内重试必须发 continuation 而非重发初始完整任务
+            if (sid === 'fresh-sid-4') {
+              const attemptNo = promptsLog.filter((x) => x.sid === sid).length;
+              if (attemptNo === 1) {
+                await callRead(31, 'once.js');
+                throw new Error('Candidate was blocked due to finish_reason: SAFETY');
+              }
+              acpFresh.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'CONT_AFTER_TOOL_OK' } } },
+              });
+              return { stopReason: 'end_turn' };
+            }
+            // Case 5 & 6: Compaction 携带保留的 assistant 消息时不得被误判成 branchRevision 清空早期 userTimeline
+            acpFresh.onNotification({
+              method: 'session/update',
+              params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'TIMELINE_OK' } } },
+            });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const gw = createGateway({
+        acp: acpFresh,
+        limiter: { run: (f) => f(), stats: () => ({}) },
+        getConfig: () => ({ ...config, source: path.join(dir, 'config.json'), contentFilterMaxRetries: 2 }),
+        log: () => {},
+      });
+      const p = await gw.listen([0]);
+      const tools = [{ type: 'function', name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } }];
+      const postR = async (key, input) => {
+        const raw = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'gemini-4-hydrogen', stream: true, prompt_cache_key: key, tools, input }),
+        }).then((r) => r.text());
+        const evs = raw.split('\n\n').filter(Boolean).map((blk) => {
+          const ev = /^event: (.+)$/m.exec(blk)?.[1];
+          const d = /^data: (.+)$/m.exec(blk)?.[1];
+          return ev && d ? { type: ev, data: JSON.parse(d) } : null;
+        }).filter(Boolean);
+        return evs.find((e) => e.type === 'response.completed').data.response;
+      };
+      try {
+        // Verify Case 1 (fresh session folded usage_update=63999 across 3 calls -> ~22k, NOT 63999)
+        const init20k = 'P'.repeat(78000); // ~19,500 tokens + tool guidance ≈ 20,300 tokens
+        const c1Hist = [{ role: 'user', content: init20k }];
+        const c1p1 = await postR('fresh-case-1', c1Hist);
+        const c1fc1 = c1p1.output.find((o) => o.type === 'function_call');
+        c1Hist.push({ type: 'function_call', call_id: c1fc1.call_id, name: 'Read', arguments: c1fc1.arguments });
+        c1Hist.push({ type: 'function_call_output', call_id: c1fc1.call_id, output: 'R'.repeat(4000) });
+        const c1p2 = await postR('fresh-case-1', c1Hist);
+        const c1fc2 = c1p2.output.find((o) => o.type === 'function_call');
+        c1Hist.push({ type: 'function_call', call_id: c1fc2.call_id, name: 'Read', arguments: c1fc2.arguments });
+        c1Hist.push({ type: 'function_call_output', call_id: c1fc2.call_id, output: 'S'.repeat(4000) });
+        const c1Fin = await postR('fresh-case-1', c1Hist);
+        assert.ok(c1Fin.usage.input_tokens >= 21000 && c1Fin.usage.input_tokens <= 24000, `新建会话 3 拍折叠 usage_update(63999) 必须展开回 ~22k（实际: ${c1Fin.usage.input_tokens}）`);
+
+        // Verify Case 2 (fresh session 4 calls cumulative PromptResponse.usage=87350 -> ~23k, NOT ~30.6k)
+        const c2Hist = [{ role: 'user', content: init20k }];
+        const c2p1 = await postR('fresh-case-2', c2Hist);
+        const c2fc1 = c2p1.output.find((o) => o.type === 'function_call');
+        c2Hist.push({ type: 'function_call', call_id: c2fc1.call_id, name: 'Read', arguments: c2fc1.arguments });
+        c2Hist.push({ type: 'function_call_output', call_id: c2fc1.call_id, output: 'X'.repeat(4000) });
+        const c2p2 = await postR('fresh-case-2', c2Hist);
+        const c2fc2 = c2p2.output.find((o) => o.type === 'function_call');
+        c2Hist.push({ type: 'function_call', call_id: c2fc2.call_id, name: 'Read', arguments: c2fc2.arguments });
+        c2Hist.push({ type: 'function_call_output', call_id: c2fc2.call_id, output: 'Y'.repeat(4000) });
+        const c2p3 = await postR('fresh-case-2', c2Hist);
+        const c2fc3 = c2p3.output.find((o) => o.type === 'function_call');
+        c2Hist.push({ type: 'function_call', call_id: c2fc3.call_id, name: 'Read', arguments: c2fc3.arguments });
+        c2Hist.push({ type: 'function_call_output', call_id: c2fc3.call_id, output: 'Z'.repeat(4000) });
+        const c2Fin = await postR('fresh-case-2', c2Hist);
+        assert.ok(c2Fin.usage.input_tokens >= 21500 && c2Fin.usage.input_tokens <= 25000, `新建会话 4 拍累计输入不得把初始提示词当成增长虚胖至 30k+（实际: ${c2Fin.usage.input_tokens}）`);
+
+        // Verify Case 3 (100,000 -> +1,000 result -> 102,000 preceding usage_update -> next park >= 103,000)
+        const c3Hist = [{ role: 'user', content: 'start 100k test' }];
+        const c3p1 = await postR('fresh-case-3', c3Hist);
+        const c3fc1 = c3p1.output.find((o) => o.type === 'function_call');
+        c3Hist.push({ type: 'function_call', call_id: c3fc1.call_id, name: 'Read', arguments: c3fc1.arguments });
+        c3Hist.push({ type: 'function_call_output', call_id: c3fc1.call_id, output: 'M'.repeat(4000) }); // 1,000 tokens
+        const c3p2 = await postR('fresh-case-3', c3Hist);
+        const c3fc2 = c3p2.output.find((o) => o.type === 'function_call');
+        assert.ok(c3p2.usage.input_tokens >= 103000, `上一步延迟 usage_update(102000) 绝不能吞掉刚回填的 1000 token 工具结果（实际: ${c3p2.usage.input_tokens}）`);
+        c3Hist.push({ type: 'function_call', call_id: c3fc2.call_id, name: 'Read', arguments: c3fc2.arguments });
+        c3Hist.push({ type: 'function_call_output', call_id: c3fc2.call_id, output: 'done' });
+        await postR('fresh-case-3', c3Hist);
+
+        // Verify Case 4 (filter retry after completed tool on fresh session sends continuation, NOT original prompt)
+        const c4Hist = [{ role: 'user', content: 'UNIQUE_INITIAL_NON_IDEMPOTENT_TASK_8821' }];
+        const c4p1 = await postR('fresh-case-4', c4Hist);
+        const c4fc1 = c4p1.output.find((o) => o.type === 'function_call');
+        c4Hist.push({ type: 'function_call', call_id: c4fc1.call_id, name: 'Read', arguments: c4fc1.arguments });
+        c4Hist.push({ type: 'function_call_output', call_id: c4fc1.call_id, output: 'ONCE_RESULT' });
+        const c4Fin = await postR('fresh-case-4', c4Hist);
+        assert.equal(c4Fin.output.find((o) => o.type === 'message').content[0].text, 'CONT_AFTER_TOOL_OK');
+        const sid4Calls = promptsLog.filter((x) => x.sid === 'fresh-sid-4');
+        assert.equal(sid4Calls.length, 2);
+        assert.ok(!sid4Calls[1].pText.includes('UNIQUE_INITIAL_NON_IDEMPOTENT_TASK_8821'), '工具已执行后触发会话内过滤重试时严禁重发初始任务原文');
+
+        // Verify Case 5 (Compaction with retained assistant message preserves ORIGINAL_USER_INTENT_KEEP in timeline)
+        await postR('fresh-case-5', [{ role: 'user', content: 'ORIGINAL_USER_INTENT_KEEP' }]);
+        await postR('fresh-case-5', [
+          { role: 'user', content: '# Resuming from a compaction\n\n<summary>\nCOMPACTED_STATE\n</summary>' },
+          { role: 'assistant', content: 'Retained recent assistant reply' },
+          { role: 'user', content: 'NEXT_POST_COMPACTION_STEP' },
+        ]);
+        const rebuiltCall = promptsLog.find((x) => x.sid === 'fresh-sid-6');
+        assert.ok(rebuiltCall && rebuiltCall.pText.includes('ORIGINAL_USER_INTENT_KEEP'), '带保留 assistant 历史的阶段压缩重建后不得丢失早期用户意图脉络');
+      } finally {
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    await check('steering during async getAllowedRoots lookup never corrupts replacement turn stats or steals its response', async () => {
+      const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'ag-steer-roots-232-'));
+      let mcpUrl = '';
+      let pauseCwd = false;
+      let releaseCwd = null;
+      let cwdPausedResolve = null;
+      const cwdPausedPromise = new Promise((r) => { cwdPausedResolve = r; });
+      let promptSeq = 0;
+      const acpSteer = {
+        policyBySession: new Map(),
+        onNotification: null,
+        start: async () => {},
+        discover: async () => ({ groups: new Map(), raw: [] }),
+        cwdFor: async () => {
+          if (pauseCwd) {
+            pauseCwd = false;
+            if (cwdPausedResolve) cwdPausedResolve();
+            await new Promise((r) => { releaseCwd = r; });
+          }
+          return dir;
+        },
+        resolveModel: async (m) => m,
+        status: () => ({ running: true, ready: true }),
+        notify: () => {},
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            mcpUrl = (params.mcpServers && params.mcpServers[0] && params.mcpServers[0].url) || mcpUrl;
+            return { sessionId: 'steer-root-sid', models: { currentModelId: 'gemini-4-hydrogen', availableModels: [] } };
+          }
+          if (method === 'session/close') return {};
+          if (method === 'session/prompt') {
+            promptSeq += 1;
+            if (promptSeq === 1) {
+              await fetch(mcpUrl, {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'Read', arguments: { path: 'slow.js' } } }),
+              }).then((r) => r.text());
+              return { stopReason: 'cancelled' };
+            }
+            // Replacement turn after steering: wait until old getAllowedRoots finishes, then answer!
+            await new Promise((r) => setTimeout(r, 60));
+            acpSteer.onNotification({
+              method: 'session/update',
+              params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'STEERED_NEW_ANSWER' } } },
+            });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const gw = createGateway({
+        acp: acpSteer,
+        limiter: { run: (f) => f(), stats: () => ({}) },
+        getConfig: () => ({ ...config, source: path.join(dir, 'config.json') }),
+        log: () => {},
+      });
+      const p = await gw.listen([0]);
+      const tools = [{ type: 'function', name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } }];
+      const parseResp = (raw) => {
+        const evs = raw.split('\n\n').filter(Boolean).map((blk) => {
+          const ev = /^event: (.+)$/m.exec(blk)?.[1];
+          const d = /^data: (.+)$/m.exec(blk)?.[1];
+          return ev && d ? { type: ev, data: JSON.parse(d) } : null;
+        }).filter(Boolean);
+        return evs.find((e) => e.type === 'response.completed')?.data?.response;
+      };
+      try {
+        const r1Raw = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'gemini-4-hydrogen', stream: true, prompt_cache_key: 'steer-root-conv', tools, input: [{ role: 'user', content: 'step 1' }] }),
+        }).then((r) => r.text());
+        const fc = parseResp(r1Raw).output.find((o) => o.type === 'function_call');
+
+        // Pause getAllowedRoots inside tool resume
+        pauseCwd = true;
+        const oldResumePromise = fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-hydrogen', stream: true, prompt_cache_key: 'steer-root-conv', tools,
+            input: [
+              { role: 'user', content: 'step 1' },
+              { type: 'function_call', call_id: fc.call_id, name: 'Read', arguments: fc.arguments },
+              { type: 'function_call_output', call_id: fc.call_id, output: 'L'.repeat(4000) },
+            ],
+          }),
+        }).then((r) => r.text());
+
+        await cwdPausedPromise;
+        // Now start a new user steering turn while old tool resume is suspended in getAllowedRoots!
+        const steerPromise = fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-hydrogen', stream: true, prompt_cache_key: 'steer-root-conv', tools,
+            input: [
+              { role: 'user', content: 'step 1' },
+              { role: 'user', content: 'hi' },
+            ],
+          }),
+        }).then((r) => r.text());
+
+        await new Promise((r) => setTimeout(r, 25));
+        if (releaseCwd) releaseCwd();
+        const [oldRaw, steerRaw] = await Promise.all([oldResumePromise, steerPromise]);
+        const steerResp = parseResp(steerRaw);
+        assert.ok(steerResp, '新打断轮次必须正常完成结算');
+        assert.equal(steerResp.output.find((o) => o.type === 'message')?.content?.[0]?.text, 'STEERED_NEW_ANSWER', '新回答必须交付给新打断请求而非旧挂起请求');
+        assert.ok(!oldRaw.includes('STEERED_NEW_ANSWER'), '被接管的旧请求不得窃取新轮次回答');
+        assert.ok(steerResp.usage.input_tokens < 500, `旧挂起工具的 1000 tokens 不得污染新打断轮次统计（实际: ${steerResp.usage.input_tokens}）`);
+      } finally {
+        if (releaseCwd) releaseCwd();
         gw.close();
         try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
       }

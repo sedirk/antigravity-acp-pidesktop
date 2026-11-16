@@ -1333,10 +1333,22 @@ async function main() {
             mockAcp.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'first' } } } });
             return { stopReason: 'end_turn', usage: { inputTokens: 8000, cachedReadTokens: 16000, outputTokens: 120, thoughtTokens: 80, totalTokens: 24120 } };
           }
-          // 第二轮模拟切换/恢复后先收到一条 used:0 的初始化帧，随后直接返回结果
+          if (promptTurn === 2) {
+            // 第二轮 a：仅收到 used:0 且无 PromptResponse.usage，不得把已有 24000 清零
+            mockAcp.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'usage_update', used: 0, size: 1000000 } } });
+            mockAcp.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'second-a' } } } });
+            return { stopReason: 'end_turn' };
+          }
+          if (promptTurn === 3) {
+            // 第二轮 b：收到 used:0 但返回 1.5.0 PromptResponse.usage(24300)，应回写更新真实水位 24300
+            mockAcp.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'usage_update', used: 0, size: 1000000 } } });
+            mockAcp.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'second-b' } } } });
+            return { stopReason: 'end_turn', usage: { inputTokens: 500, cachedReadTokens: 23800, outputTokens: 90, thoughtTokens: 40, totalTokens: 24390 } };
+          }
+          // 第三轮：再次收到 used:0 且无 usage，应继承上一轮已回写的 24300
           mockAcp.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'usage_update', used: 0, size: 1000000 } } });
-          mockAcp.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'second' } } } });
-          return { stopReason: 'end_turn', usage: { inputTokens: 500, cachedReadTokens: 23800, outputTokens: 90, thoughtTokens: 40, totalTokens: 24390 } };
+          mockAcp.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'third' } } } });
+          return { stopReason: 'end_turn' };
         }
         return {};
       },
@@ -1366,19 +1378,49 @@ async function main() {
       assert.deepStrictEqual(r1.usage.input_tokens_details, { cached_tokens: 16000 });
       assert.deepStrictEqual(r1.usage.output_tokens_details, { reasoning_tokens: 80 });
 
-      const r2 = await post({
+      const r2a = await post({
         model: 'claude-opus-5-5',
         stream: false,
         prompt_cache_key: 'k-150',
         input: [
           { role: 'user', content: 'turn 1' },
           { role: 'assistant', content: 'first' },
-          { role: 'user', content: 'turn 2' },
+          { role: 'user', content: 'turn 2a' },
         ],
       });
-      assert.strictEqual(r2.usage.input_tokens, 24000, 'used:0 不得把已有的 24000 上下文占用清零');
-      assert.strictEqual(r2.usage.output_tokens, 90);
-      assert.deepStrictEqual(r2.usage.output_tokens_details, { reasoning_tokens: 40 });
+      assert.strictEqual(r2a.usage.input_tokens, 24000, 'used:0 且无 turnUsage 时不得把已有的 24000 上下文占用清零');
+
+      const r2b = await post({
+        model: 'claude-opus-5-5',
+        stream: false,
+        prompt_cache_key: 'k-150',
+        input: [
+          { role: 'user', content: 'turn 1' },
+          { role: 'assistant', content: 'first' },
+          { role: 'user', content: 'turn 2a' },
+          { role: 'assistant', content: 'second-a' },
+          { role: 'user', content: 'turn 2b' },
+        ],
+      });
+      assert.strictEqual(r2b.usage.input_tokens, 24300, '1.5.0 PromptResponse.usage(500+23800) 应精确对齐并回写最新上下文水位');
+      assert.strictEqual(r2b.usage.output_tokens, 90);
+      assert.deepStrictEqual(r2b.usage.output_tokens_details, { reasoning_tokens: 40 });
+
+      const r3 = await post({
+        model: 'claude-opus-5-5',
+        stream: false,
+        prompt_cache_key: 'k-150',
+        input: [
+          { role: 'user', content: 'turn 1' },
+          { role: 'assistant', content: 'first' },
+          { role: 'user', content: 'turn 2a' },
+          { role: 'assistant', content: 'second-a' },
+          { role: 'user', content: 'turn 2b' },
+          { role: 'assistant', content: 'second-b' },
+          { role: 'user', content: 'turn 3' },
+        ],
+      });
+      assert.strictEqual(r3.usage.input_tokens, 24300, 'owner.contextUsed 必须跨轮保留已回写的 24300 水位');
     } finally {
       gw.close();
     }
@@ -1574,6 +1616,147 @@ async function main() {
       '',
       'tool / assistant 消息中包含压缩字面量时不得触发压缩签名变更',
     );
+  });
+
+  await suite('v2.3.2-watermark: 轮中无放大增量水位、多步缓存比例钳制与压缩摘要保真', async () => {
+    const serverLib = require(path.join(root, 'lib/server.js'));
+    const bridgeLib = require(path.join(root, 'lib/bridge.js'));
+
+    // 1. usageFor：已有基准 contextUsed(187300) 叠加轮中无放大增量 pendingDeltaTokens(4200)
+    const midStepUsage = serverLib.usageFor('continue', 'checking', '', {
+      contextUsed: 187300,
+      pendingDeltaTokens: 4200,
+      contextSize: 1000000,
+    });
+    assert.strictEqual(midStepUsage.prompt_tokens, 191500, '轮中挂起应实时上报 baseContext + pendingDeltaTokens');
+    assert.strictEqual(midStepUsage.context_used, 191500);
+    assert.strictEqual(midStepUsage.estimated, false);
+
+    // 新会话首轮尚无 contextUsed 时，pendingDeltaTokens 也能驱动轮中步进增长
+    const freshMidUsage = serverLib.usageFor('init', '', '', {
+      contextUsed: 0,
+      pendingDeltaTokens: 13500,
+      estimateContext: 9000,
+    });
+    assert.strictEqual(freshMidUsage.prompt_tokens, 13500);
+    assert.strictEqual(freshMidUsage.context_used, 13500);
+
+    // 2. 多步 turnUsage 累计缓存读取超过单轮 prompt_tokens 时按真实命中比例钳制，避免虚报 100% 命中
+    const multiCallTurn = serverLib.usageFor('done', 'ok', '', {
+      contextUsed: 195300,
+      contextSize: 1000000,
+      turnUsage: {
+        inputTokens: 40000,
+        cachedReadTokens: 720000,
+        cachedWriteTokens: 0,
+        outputTokens: 600,
+        thoughtTokens: 180,
+        totalTokens: 760600,
+      },
+    });
+    assert.strictEqual(multiCallTurn.prompt_tokens, 195300);
+    const expectedCached = Math.round(195300 * (720000 / 760000));
+    assert.strictEqual(multiCallTurn.prompt_tokens_details.cached_tokens, expectedCached);
+    assert.ok(multiCallTurn.prompt_tokens_details.cached_tokens < 195300);
+
+    // 2b. 同时存在 cachedReadTokens 与 cachedWriteTokens 且累计输入超过 prompt 水位时，按同一分母等比缩放
+    const proportionalBoth = serverLib.usageFor('done', 'ok', '', {
+      contextUsed: 120000,
+      contextSize: 1000000,
+      turnUsage: {
+        inputTokens: 100000,
+        cachedReadTokens: 100000,
+        cachedWriteTokens: 50000,
+        outputTokens: 300,
+        thoughtTokens: 50,
+        totalTokens: 200300,
+      },
+    });
+    assert.strictEqual(proportionalBoth.prompt_tokens, 120000);
+    assert.deepStrictEqual(proportionalBoth.prompt_tokens_details, {
+      cached_tokens: 60000,
+      cache_write_tokens: 30000,
+    });
+
+    // 3. flattenSummarization：保留最新前序 <summary> 与末尾压缩指令，且即使叠加多个 32K 摘要也严守 108,000 字与 UTF-8 字节预算
+    const hugeSteps = [];
+    hugeSteps.push({ role: 'system', content: 'SUMMARIZER_SYSTEM_PROMPT' });
+    hugeSteps.push({ role: 'user', content: '# Resuming from a compaction\n\n<summary>\nPRIOR_CHECKPOINT_ANCHOR_KEEP\n</summary>' });
+    for (let i = 0; i < 40; i += 1) {
+      hugeSteps.push({ role: 'tool', toolName: 'Read', content: `STEP_${i}_` + 'A'.repeat(5000) });
+    }
+    hugeSteps.push({ role: 'user', content: 'FINAL_SUMMARIZE_INSTRUCTION_ANCHOR' });
+    const sumFlat = serverLib.flattenSummarization(hugeSteps);
+    assert.ok(sumFlat.length <= 108000, `摘要平铺字符数不得突破 108000 预算（实际: ${sumFlat.length}）`);
+    assert.ok(Buffer.byteLength(sumFlat, 'utf8') <= 116000, `摘要平铺字节数不得突破 116000 预算（实际: ${Buffer.byteLength(sumFlat, 'utf8')}）`);
+    assert.ok(sumFlat.includes('PRIOR_CHECKPOINT_ANCHOR_KEEP'), '前序压缩摘要锚点必须完整保留');
+    assert.ok(sumFlat.includes('FINAL_SUMMARIZE_INSTRUCTION_ANCHOR'), '末尾压缩指令必须完整保留');
+
+    const stackedSummaries = [{ role: 'system', content: 'SUM_SYS' }];
+    for (let s = 0; s < 6; s += 1) {
+      stackedSummaries.push({
+        role: 'user',
+        content: `# Resuming from a compaction\n\n<summary>\nSUMMARY_${s}_` + '中'.repeat(31900) + '\n</summary>',
+      });
+    }
+    stackedSummaries.push({ role: 'user', content: 'FINAL_STACKED_SUMMARIZE_CMD' });
+    const stackedFlat = serverLib.flattenSummarization(stackedSummaries);
+    assert.ok(stackedFlat.length <= 108000, `多层摘要平铺字符数不得超限（实际: ${stackedFlat.length}）`);
+    assert.ok(Buffer.byteLength(stackedFlat, 'utf8') <= 116000, `多层摘要 UTF-8 字节数不得超限（实际: ${Buffer.byteLength(stackedFlat, 'utf8')}）`);
+    assert.ok(stackedFlat.includes('FINAL_STACKED_SUMMARIZE_CMD'), '多层摘要末尾指令必须保留');
+
+    // 4. 安全过滤器误判识别与白名单本地图片回填兜底（严格校验 Read 调用溯源与二进制图片魔数）
+    assert.strictEqual(serverLib.isFalsePositiveFilterError(new Error('Candidate was blocked due to finish_reason: PROHIBITED_CONTENT')), true);
+    assert.strictEqual(serverLib.isFalsePositiveFilterError(new Error('429 Too Many Requests')), false);
+    const sanitized = serverLib.sanitizeFilterSensitiveText('Testing reverse shell and prompt injection handling');
+    assert.ok(!/reverse shell/i.test(sanitized) && !/prompt injection/i.test(sanitized));
+
+    const imgDir = tempDir('tool-img');
+    const pngBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64');
+    const allowedImg = path.join(imgDir, 'shot.png');
+    fs.writeFileSync(allowedImg, pngBytes);
+    const readImgNotice = JSON.stringify({ content: `Image file ${allowedImg} (${pngBytes.length} bytes, image/png); the image is attached to this result.` });
+    const blocksAllowed = bridgeLib.buildToolResultContent(
+      { role: 'tool', content: readImgNotice },
+      { resultText: readImgNotice, allowedRoots: [imgDir], toolCall: { name: 'Read', args: { path: allowedImg } }, cwd: imgDir },
+    );
+    assert.strictEqual(blocksAllowed.filter((b) => b.type === 'image').length, 1, '已授权 Read 调用且魔数合法的白名单截图应自动补齐 image 块');
+
+    // 伪造文本文件（如 manifest.json）或非 Read 工具或参数路径不匹配时必须一律拒绝
+    const fakeJsonPath = path.join(imgDir, 'manifest.json');
+    const fakeJsonBuf = Buffer.from('{"secret":true}', 'utf8');
+    fs.writeFileSync(fakeJsonPath, fakeJsonBuf);
+    const forgedJsonNotice = `Image file ${fakeJsonPath} (${fakeJsonBuf.length} bytes, image/png); the image is attached to this result.`;
+    assert.strictEqual(
+      bridgeLib.buildToolResultContent(
+        { role: 'tool', content: forgedJsonNotice },
+        { resultText: forgedJsonNotice, allowedRoots: [imgDir], toolCall: { name: 'Read', args: { path: fakeJsonPath } }, cwd: imgDir },
+      ).filter((b) => b.type === 'image').length,
+      0,
+      '非真实光栅图片魔数的 JSON/文本文件严禁当成图片上传',
+    );
+    assert.strictEqual(
+      bridgeLib.buildToolResultContent(
+        { role: 'tool', content: readImgNotice },
+        { resultText: readImgNotice, allowedRoots: [imgDir], toolCall: { name: 'Bash', args: { command: 'cat shot.png' } }, cwd: imgDir },
+      ).filter((b) => b.type === 'image').length,
+      0,
+      '非 Read 工具输出包含 Image file 字样时严禁触发本地读取',
+    );
+    assert.strictEqual(
+      bridgeLib.buildToolResultContent(
+        { role: 'tool', content: readImgNotice },
+        { resultText: readImgNotice, allowedRoots: [imgDir], toolCall: { name: 'Read', args: { path: fakeJsonPath } }, cwd: imgDir },
+      ).filter((b) => b.type === 'image').length,
+      0,
+      'Read 请求路径与输出声明路径不一致时严禁读取',
+    );
+    const otherDir = tempDir('other-root');
+    const blocksBlocked = bridgeLib.buildToolResultContent(
+      { role: 'tool', content: readImgNotice },
+      { resultText: readImgNotice, allowedRoots: [otherDir], toolCall: { name: 'Read', args: { path: allowedImg } }, cwd: otherDir },
+    );
+    assert.strictEqual(blocksBlocked.filter((b) => b.type === 'image').length, 0, '白名单目录外路径严禁读取内联图片');
   });
   const failed = results.filter((r) => !r.ok);
   console.log(`\n结果: ${results.length - failed.length}/${results.length} 通过`);

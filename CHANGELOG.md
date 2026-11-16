@@ -1,5 +1,17 @@
 # 变更记录
 
+## 2.3.2
+
+- **轮中多步工具实时无放大水位追踪与官方 `1.5.0` 水位回写对齐（修复右下角上下文标签“一动不动”与宿主校准器 `4.0x` 虚警）**：
+  - **桥接轮中每步实时平滑递增（零人为倍率放大）**：在 `session/prompt` 挂起执行多步宿主工具期间，网关实时按真实无放大 Token 数累加本轮输入提示词、模型思考/正文/工具参数及宿主回填的工具输出（含多模态图片增量），并在每次 `park()` / 流式增量 / `finish()` 时实时上报 `baseContext + pendingDeltaTokens`（严禁在插件侧乘任何校准倍率，彻底避免 `sidecar.js` `recordContextCalibration` 正反馈爆炸）；
+  - **两阶段工具结果增量保护（杜绝回填后水位倒退）**：区分“调用前待定增量”与“刚回填待下一拍消费的工具输出增量”，当 `1.5.0` `_stream_live_step` 在 `item.resolve` 后延迟吐出上一拍模型调用的 `usage_update` 时，精准对齐上一拍基准并保留刚回填的工具输出增量，杜绝下一步 `park()` 水位回退；
+  - **`1.5.0` 终态 `PromptResponse.usage` 与漏帧折叠 `usage_update` 自动展开及持久化回写**：当 `session/prompt` 完结返回 `PromptResponse.usage` 或因 WebSocket Message 2 竞态触发多拍累加的 `usage_update`（如两拍叠成 `380K`）时，结合本轮实际模型调用拍数自动展开还原为单轮真实上下文水位，立即写回 `stats.contextUsed`、`owner.contextUsed` 与 `sessions.json`，使宿主 `trailingRatio` 稳定保持在健康的 `1.0x ~ 1.3x`；
+  - **多步累计 `cached_tokens` 真实命中率比例钳制**：当多步回合累计 `cachedReadTokens` 超过单轮 `prompt_tokens` 水位时，按 `cachedReadTokens / turnInputTotal` 真实命中比例缩放钳制，避免虚报 100% 缓存命中。
+- **上下文连续性、工具多模态回填与上游误判自愈增强**：
+  - **专用高保真压缩摘要序列化器（`flattenSummarization`）**：为宿主上下文压缩请求提供独立 `108,000` 字符预算的高保真平铺通道，完整保留前序 `<summary>` 检查点与末尾压缩指令；跨多次压缩持久化保留用户历史提问脉络（`userTimeline`）；
+  - **工具回填本地截图白名单兜底与 HTTP 会话亲和增强**：当子代理/模型未勾选视觉导致工具图片退化为 `Image file <path>` 占位文本时，在受控工作区与粘贴缓存白名单内安全补齐图片块；支持 HTTP 会话亲和头与 `configuration_update` 动态思考档位切换；
+  - **上游安全分类器误判双层自愈**：对本地工程调试指令触发的上游误判拦截（如 `PROHIBITED_CONTENT`），自动执行会话内安全工程声明重试，若历史轨迹持续中毒则自动轮换纯净会话并脱敏续接。
+
 ## 2.3.1
 
 > **⚠️ 旧版（≤ v2.3.0）升级必读：刷新 PI-Desktop 模型列表中的旧 `200,000` 上下文缓存**
