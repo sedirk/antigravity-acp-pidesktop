@@ -3106,6 +3106,554 @@ async function main() {
         try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
       }
     });
+
+    await check('mid-turn compaction with real <summary> resets bloated session, clears stale contextUsed, and stops infinite compaction loop', async () => {
+      const dir = path.join(process.env.PI_SCRATCH_DIR || process.cwd(), `gw-mid-compact-reset-${Date.now()}`);
+      let mcpUrl = '';
+      let bridgedSessionSeq = 0;
+      let sumSeq = 0;
+      const closedSids = [];
+      const seenPrompts = [];
+      const acpLoopFix = {
+        policyBySession: new Map(),
+        discover: async () => {},
+        resolveModel: (m) => m,
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        start: async () => {},
+        status: () => ({ running: true, ready: true }),
+        notify: () => {},
+        abandon: () => 0,
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            if (params.mcpServers && params.mcpServers.length > 0) {
+              mcpUrl = params.mcpServers[0].url;
+              bridgedSessionSeq += 1;
+              return { sessionId: `bridged-sess-${bridgedSessionSeq}` };
+            }
+            sumSeq += 1;
+            return { sessionId: `sum-sess-${sumSeq}` };
+          }
+          if (method === 'session/close') {
+            closedSids.push(params.sessionId);
+            return {};
+          }
+          if (method === 'session/prompt') {
+            const sid = params.sessionId;
+            const promptText = params.prompt.map((b) => b.text || '').join('\n');
+            seenPrompts.push({ sid, promptText });
+            if (sid.startsWith('sum-sess-')) {
+              acpLoopFix.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '<summary>compacted history</summary>' } } },
+              });
+              return { stopReason: 'end_turn' };
+            }
+            if (sid === 'bridged-sess-1') {
+              // 旧会话已膨胀到 920,000 tokens（超过 1M 的 90%），挂起请求 Read 工具
+              acpLoopFix.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'usage_update', used: 920000, size: 1000000 } } },
+              );
+              await fetch(mcpUrl, {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id: 101, method: 'tools/call', params: { name: 'Read', arguments: { path: 'heavy.ts' } } }),
+              }).then((r) => r.text());
+              return { stopReason: 'cancelled' };
+            }
+            if (sid === 'bridged-sess-2') {
+              // 压缩重建后的全新会话：首次调工具前仅发了初始化 used: 0，尚未推送新非零 used，验证绝不残留旧会话的 920000！
+              acpLoopFix.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'usage_update', used: 0, size: 1000000 } } },
+              );
+              const editRes = await fetch(mcpUrl, {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id: 102, method: 'tools/call', params: { name: 'Bash', arguments: { command: 'echo ok' } } }),
+              }).then((r) => r.text());
+              assert.ok(editRes.includes('echo-done'), `新会话第二次工具应顺利回填: ${editRes}`);
+              acpLoopFix.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'usage_update', used: 14200, size: 1000000 } } },
+              );
+              acpLoopFix.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'all done on fresh compacted session' } } },
+              });
+              return { stopReason: 'end_turn', usage: { inputTokens: 2200, cachedReadTokens: 12000, outputTokens: 60, thoughtTokens: 20, totalTokens: 14260 } };
+            }
+          }
+          return {};
+        },
+      };
+      const gw = createGateway({
+        acp: acpLoopFix,
+        limiter: { run: (f) => f(), stats: () => ({}) },
+        getConfig: () => ({ ...config, source: path.join(dir, 'config.json') }),
+        log: () => {},
+      });
+      const p = await gw.listen([0]);
+      const tools = [
+        { type: 'function', name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } },
+        { type: 'function', name: 'Bash', parameters: { type: 'object', properties: { command: { type: 'string' } } } },
+      ];
+      const parseResp = async (r) => {
+        const raw = await r.text();
+        return raw.split('\n\n').filter(Boolean).map((blk) => {
+          const ev = /^event: (.+)$/m.exec(blk)?.[1];
+          const d = /^data: (.+)$/m.exec(blk)?.[1];
+          return ev && d ? { type: ev, data: JSON.parse(d) } : null;
+        }).filter(Boolean);
+      };
+      try {
+        // 1. 第一步：旧会话上下文高达 920,000 tokens，挂起返回 Read 调用
+        const t1 = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'claude-opus-4-6-thinking', stream: true, prompt_cache_key: 'loop-fix-key',
+            instructions: 'KEEP_SYS_PROMPT_V1', tools,
+            input: [{ role: 'user', content: 'refactor heavy.ts' }],
+          }),
+        }));
+        const d1 = t1.find((e) => e.type === 'response.completed');
+        const fcRead = d1.data.response.output.find((o) => o.type === 'function_call');
+        assert.equal(d1.data.response.usage.input_tokens, 920000);
+
+        // 2. 第二步：宿主检测到 920,000 达阈值，在回传 Read 结果前发起旁路自动压缩请求
+        const sumRes = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'claude-opus-4-6-thinking', stream: false, prompt_cache_key: 'loop-fix-key',
+            instructions: 'You are a context summarization assistant.',
+            input: [{ role: 'user', content: 'Summarize the entire conversation:\nUser: refactor heavy.ts' }],
+          }),
+        });
+        assert.equal(sumRes.status, 200);
+
+        // 3. 第三步：宿主带着真实 <summary> 与刚执行完的 Read function_call_output（末尾为 tool！）续跑
+        const t2 = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'claude-opus-4-6-thinking', stream: true, prompt_cache_key: 'loop-fix-key',
+            instructions: 'KEEP_SYS_PROMPT_V1', tools,
+            input: [
+              { role: 'user', content: '# Resuming from a compaction\n\n<summary>\nUser asked to refactor heavy.ts.\n</summary>' },
+              { type: 'function_call', call_id: fcRead.call_id, name: 'Read', arguments: fcRead.arguments },
+              { type: 'function_call_output', call_id: fcRead.call_id, output: 'HEAVY_TS_FILE_BODY_AFTER_COMPACT' },
+            ],
+          }),
+        }));
+        const d2 = t2.find((e) => e.type === 'response.completed');
+        const fcBash = d2.data.response.output.find((o) => o.type === 'function_call');
+        assert.ok(fcBash, '压缩重置后的新会话应正常挂起下一个工具 Bash');
+        assert.ok(closedSids.includes('bridged-sess-1'), '工具轮中途触发真实 Compaction 时必须关闭膨胀的旧会话 bridged-sess-1');
+        assert.equal(bridgedSessionSeq, 2, '必须创建全新的底层会话 bridged-sess-2');
+        assert.ok(d2.data.response.usage.input_tokens < 50000, `新会话首次挂起绝不能残留旧会话的 920000 水位（实际: ${d2.data.response.usage.input_tokens}），否则会触发无限连环压缩`);
+        const sess2Prompt = seenPrompts.find((x) => x.sid === 'bridged-sess-2');
+        assert.ok(sess2Prompt.promptText.includes('KEEP_SYS_PROMPT_V1'), '重建的新会话必须包含完整系统指令');
+        assert.ok(sess2Prompt.promptText.includes('User asked to refactor heavy.ts'), '重建的新会话必须包含压缩摘要');
+        assert.ok(sess2Prompt.promptText.includes('HEAVY_TS_FILE_BODY_AFTER_COMPACT'), '重建的新会话必须包含压缩点后的尾部工具输出');
+
+        // 4. 第四步：回填 Bash 工具输出，收到新会话真实低水位 14,200 tokens 并正常完结
+        const t3 = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'claude-opus-4-6-thinking', stream: true, prompt_cache_key: 'loop-fix-key',
+            instructions: 'KEEP_SYS_PROMPT_V1', tools,
+            input: [
+              { role: 'user', content: '# Resuming from a compaction\n\n<summary>\nUser asked to refactor heavy.ts.\n</summary>' },
+              { type: 'function_call', call_id: fcBash.call_id, name: 'Bash', arguments: fcBash.arguments },
+              { type: 'function_call_output', call_id: fcBash.call_id, output: 'echo-done' },
+            ],
+          }),
+        }));
+        const d3 = t3.find((e) => e.type === 'response.completed');
+        assert.equal(d3.data.response.usage.input_tokens, 14200, '压缩后新会话应回落至真实低水位 14200');
+        assert.equal(d3.data.response.output.find((o) => o.type === 'message').content[0].text, 'all done on fresh compacted session');
+        assert.deepEqual(d3.data.response.usage.input_tokens_details, { cached_tokens: 12000 }, '续流终态应携带本轮真实 cached_tokens');
+        assert.deepEqual(d3.data.response.usage.output_tokens_details, { reasoning_tokens: 20 }, '续流终态应携带本轮真实 reasoning_tokens');
+      } finally {
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    await check('parked Task mid-turn compaction (or external summarizer) resets bloated session and isolates turnUsage across user turns', async () => {
+      const dir = path.join(process.env.PI_SCRATCH_DIR || process.cwd(), `gw-task-compact-reset-${Date.now()}`);
+      let mcpUrl = '';
+      let sessSeq = 0;
+      const closedSids = [];
+      const seenPrompts = [];
+      let sess2TurnCount = 0;
+      const acpTaskCompact = {
+        policyBySession: new Map(),
+        discover: async () => {},
+        resolveModel: (m) => m,
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        start: async () => {},
+        status: () => ({ running: true, ready: true }),
+        notify: () => {},
+        abandon: () => 0,
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            if (params.mcpServers && params.mcpServers.length > 0) {
+              mcpUrl = params.mcpServers[0].url;
+              sessSeq += 1;
+              return { sessionId: `task-sess-${sessSeq}` };
+            }
+            return { sessionId: 'aux-sum-sess' };
+          }
+          if (method === 'session/close') {
+            closedSids.push(params.sessionId);
+            return {};
+          }
+          if (method === 'session/prompt') {
+            const sid = params.sessionId;
+            const promptText = params.prompt.map((b) => b.text || '').join('\n');
+            seenPrompts.push({ sid, promptText });
+            if (sid === 'aux-sum-sess') {
+              acpTaskCompact.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '<summary>task compacted</summary>' } } },
+              });
+              return { stopReason: 'end_turn' };
+            }
+            if (sid === 'task-sess-1') {
+              // 父会话已膨胀至 890,000 tokens，并发起挂起 Task 工具调用（summarize 期间因 Task 保护不会提前抢占）
+              acpTaskCompact.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'usage_update', used: 890000, size: 1000000 } },
+              });
+              await fetch(mcpUrl, {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id: 201, method: 'tools/call', params: { name: 'Task', arguments: { agent: 'nuaa-zxh', task: 'audit repo' } } }),
+              }).then((r) => r.text());
+              return { stopReason: 'cancelled' };
+            }
+            if (sid === 'task-sess-2') {
+              sess2TurnCount += 1;
+              if (sess2TurnCount === 1) {
+                acpTaskCompact.onNotification({
+                  method: 'session/update',
+                  params: { sessionId: sid, update: { sessionUpdate: 'usage_update', used: 15800, size: 1000000 } },
+                });
+                acpTaskCompact.onNotification({
+                  method: 'session/update',
+                  params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'task summary integrated cleanly' } } },
+                });
+                return { stopReason: 'end_turn', usage: { inputTokens: 3800, cachedReadTokens: 12000, outputTokens: 180, thoughtTokens: 90, totalTokens: 15980 } };
+              }
+              // 下一轮新用户提问：挂起 Read 工具时本轮 session/prompt 尚未返回，不得残留上一轮的 cached_tokens / reasoning_tokens / outputTokens
+              acpTaskCompact.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'usage_update', used: 16400, size: 1000000 } },
+              });
+              await fetch(mcpUrl, {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id: 202, method: 'tools/call', params: { name: 'Read', arguments: { path: 'next.js' } } }),
+              }).then((r) => r.text());
+              acpTaskCompact.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'turn 2 done' } } },
+              });
+              return { stopReason: 'end_turn', usage: { inputTokens: 1400, cachedReadTokens: 15000, outputTokens: 40, thoughtTokens: 10, totalTokens: 16440 } };
+            }
+          }
+          return {};
+        },
+      };
+      const gw = createGateway({
+        acp: acpTaskCompact,
+        limiter: { run: (f) => f(), stats: () => ({}) },
+        getConfig: () => ({ ...config, source: path.join(dir, 'config.json') }),
+        log: () => {},
+      });
+      const p = await gw.listen([0]);
+      const tools = [
+        { type: 'function', name: 'Task', parameters: { type: 'object', required: ['agent', 'task'], properties: { agent: { type: 'string' }, task: { type: 'string' } } } },
+        { type: 'function', name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } },
+      ];
+      const parseResp = async (r) => {
+        const raw = await r.text();
+        return raw.split('\n\n').filter(Boolean).map((blk) => {
+          const ev = /^event: (.+)$/m.exec(blk)?.[1];
+          const d = /^data: (.+)$/m.exec(blk)?.[1];
+          return ev && d ? { type: ev, data: JSON.parse(d) } : null;
+        }).filter(Boolean);
+      };
+      try {
+        // 1) 父会话膨胀到 890k 并挂起 Task
+        const r1 = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-hydrogen', stream: true, prompt_cache_key: 'task-compact-pk',
+            instructions: 'PARENT_SYS_V1', tools,
+            input: [{ role: 'user', content: 'delegate full audit' }],
+          }),
+        }));
+        const fcTask = r1.find((e) => e.type === 'response.completed').data.response.output.find((o) => o.type === 'function_call');
+        assert.ok(fcTask && fcTask.name === 'Task');
+
+        // 2) 宿主甚至可能通过外部摘要模型直接完成压缩（网关未收到 ::sum 抢占），随即带 <summary> 与 Task 输出恢复父会话
+        const r2 = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-hydrogen', stream: true, prompt_cache_key: 'task-compact-pk',
+            instructions: 'PARENT_SYS_V1', tools,
+            input: [
+              { role: 'user', content: '# Resuming from a compaction\n\n<summary>\nParent delegated full audit.\n</summary>' },
+              { type: 'function_call', call_id: fcTask.call_id, name: 'Task', arguments: fcTask.arguments },
+              { type: 'function_call_output', call_id: fcTask.call_id, output: 'SUBAGENT_AUDIT_REPORT_PAYLOAD' },
+            ],
+          }),
+        }));
+        const done2 = r2.find((e) => e.type === 'response.completed').data.response;
+        assert.ok(closedSids.includes('task-sess-1'), '挂起 Task 期间父会话自身完成压缩后必须关闭旧膨胀会话 task-sess-1');
+        assert.equal(sessSeq, 2, '必须切换到重建的清洁会话 task-sess-2');
+        assert.equal(done2.usage.input_tokens, 15800, '水位必须从 890000 降至新会话真实 15800，根除连环压缩');
+        const rebuiltPrompt = seenPrompts.find((x) => x.sid === 'task-sess-2');
+        assert.ok(rebuiltPrompt.promptText.includes('SUBAGENT_AUDIT_REPORT_PAYLOAD'), '重建会话必须完整保留 Task 工具返回报告');
+
+        // 3) 下一轮新提问挂起 Read 时，验证上一轮的 turnUsage 明细绝不串染到本轮半途挂起包
+        const r3 = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-hydrogen', stream: true, prompt_cache_key: 'task-compact-pk',
+            instructions: 'PARENT_SYS_V1', tools,
+            input: [
+              { role: 'user', content: '# Resuming from a compaction\n\n<summary>\nParent delegated full audit.\n</summary>' },
+              { role: 'assistant', content: 'task summary integrated cleanly' },
+              { role: 'user', content: 'now inspect next.js' },
+            ],
+          }),
+        }));
+        const park3 = r3.find((e) => e.type === 'response.completed').data.response;
+        const fcRead = park3.output.find((o) => o.type === 'function_call');
+        assert.ok(fcRead && fcRead.name === 'Read');
+        assert.equal(park3.usage.input_tokens, 16400);
+        assert.equal(park3.usage.input_tokens_details, undefined, '新一轮挂起期间不得串染上一轮的 cached_tokens');
+        assert.equal(park3.usage.output_tokens_details, undefined, '新一轮挂起期间不得串染上一轮的 reasoning_tokens');
+        assert.ok(park3.usage.output_tokens < 50, `新一轮挂起期间不得串染上一轮的 outputTokens=180（实际: ${park3.usage.output_tokens}）`);
+
+        // 回填 Read 收尾清理
+        const r4 = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-hydrogen', stream: true, prompt_cache_key: 'task-compact-pk',
+            instructions: 'PARENT_SYS_V1', tools,
+            input: [
+              { role: 'user', content: '# Resuming from a compaction\n\n<summary>\nParent delegated full audit.\n</summary>' },
+              { role: 'assistant', content: 'task summary integrated cleanly' },
+              { role: 'user', content: 'now inspect next.js' },
+              { type: 'function_call', call_id: fcRead.call_id, name: 'Read', arguments: fcRead.arguments },
+              { type: 'function_call_output', call_id: fcRead.call_id, output: 'export default 1;' },
+            ],
+          }),
+        }));
+        const done4 = r4.find((e) => e.type === 'response.completed').data.response;
+        assert.deepEqual(done4.usage.input_tokens_details, { cached_tokens: 15000 });
+      } finally {
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    await check('tool outputs with <summary> never trigger false compaction, and slow-cancel compaction preemption strictly isolates ?k= bridges across concurrent conversations', async () => {
+      const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'ag-iso-compact-'));
+      let sessSeq = 0;
+      const closedSids = [];
+      const mcpBySid = new Map();
+      const pendingPrompts = new Map();
+      let releaseConvB;
+      const convBReady = new Promise((r) => { releaseConvB = r; });
+      let finishConvB;
+      const convBHold = new Promise((r) => { finishConvB = r; });
+
+      const acpIso = {
+        policyBySession: new Map(),
+        onNotification: null,
+        start: async () => {},
+        discover: async () => ({ groups: new Map(), raw: [] }),
+        cwdFor: async () => dir,
+        resolveModel: async (m) => m,
+        status: () => ({ running: true, ready: true }),
+        notify: () => {
+          // 故意忽略 session/cancel，逼迫 waitPromptIdle 走 1.5s 超时 + acp.abandon 分支
+        },
+        abandon: (method, reason, targetSid = '') => {
+          if (method !== 'session/prompt') return 0;
+          const p = pendingPrompts.get(targetSid);
+          if (!p) return 0;
+          pendingPrompts.delete(targetSid);
+          p.reject(Object.assign(new Error(reason || 'ACP session/prompt 已放弃'), { code: 'ACP_ABANDONED' }));
+          return 1;
+        },
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            sessSeq += 1;
+            const sid = `iso-sess-${sessSeq}`;
+            mcpBySid.set(sid, params.mcpServers?.[0]?.url || '');
+            return { sessionId: sid, models: { currentModelId: 'gemini-4-hydrogen', availableModels: [] } };
+          }
+          if (method === 'session/close') {
+            closedSids.push(params.sessionId);
+            return {};
+          }
+          if (method === 'session/prompt') {
+            const sid = params.sessionId;
+            const mcpUrl = mcpBySid.get(sid);
+            if (sid === 'iso-sess-1') {
+              // 第 1 步：调 Read 读取含 C# XML <summary> 与压缩字面量的文件；第 2 步：调 Task 后挂死不响应 cancel
+              const readRes = await fetch(mcpUrl, {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id: 301, method: 'tools/call', params: { name: 'Read', arguments: { path: 'Fixture.cs' } } }),
+              }).then((r) => r.text());
+              assert.ok(readRes.includes('<summary>Builds a fixture</summary>'), '第一次 Read 必须在原会话内正常收到 C# <summary> 内容');
+              const taskCall = fetch(mcpUrl, {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id: 302, method: 'tools/call', params: { name: 'Task', arguments: { agent: 'nuaa-zxh', task: 'audit' } } }),
+              }).catch(() => {});
+              return await new Promise((resolve, reject) => {
+                pendingPrompts.set(sid, { resolve, reject, taskCall });
+              });
+            }
+            if (sid === 'iso-sess-2') {
+              // 对话 B 正在等待（bridgeB.waiting === true），尚未发起任何工具调用
+              releaseConvB(mcpUrl);
+              await convBHold;
+              acpIso.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'CONV_B_CLEAN_REPLY' } } },
+              });
+              return { stopReason: 'end_turn' };
+            }
+            if (sid === 'iso-sess-3') {
+              // 对话 A 压缩重建后的新会话：连续并发发起 2 个 Read，必须全部落回对话 A 自身，绝不串进等待中的对话 B
+              const [resA1, resA2] = await Promise.all([
+                fetch(mcpUrl, {
+                  method: 'POST', headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ jsonrpc: '2.0', id: 303, method: 'tools/call', params: { name: 'Read', arguments: { path: 'A_ONLY_PRIVATE_1.cs' } } }),
+                }).then((r) => r.text()),
+                fetch(mcpUrl, {
+                  method: 'POST', headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ jsonrpc: '2.0', id: 304, method: 'tools/call', params: { name: 'Read', arguments: { path: 'A_ONLY_PRIVATE_2.cs' } } }),
+                }).then((r) => r.text()),
+              ]);
+              assert.ok(resA1.includes('A1_OK') && resA2.includes('A2_OK'));
+              acpIso.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'CONV_A_REBUILT_CLEAN' } } },
+              });
+              return { stopReason: 'end_turn' };
+            }
+          }
+          return {};
+        },
+      };
+      const gw = createGateway({
+        acp: acpIso,
+        limiter: { run: (f) => f(), stats: () => ({}) },
+        getConfig: () => ({ ...config, source: path.join(dir, 'config.json') }),
+        log: () => {},
+      });
+      const p = await gw.listen([0]);
+      const tools = [
+        { type: 'function', name: 'Task', parameters: { type: 'object', required: ['agent', 'task'], properties: { agent: { type: 'string' }, task: { type: 'string' } } } },
+        { type: 'function', name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } },
+      ];
+      const parseResp = async (r) => {
+        const raw = await r.text();
+        return raw.split('\n\n').filter(Boolean).map((blk) => {
+          const ev = /^event: (.+)$/m.exec(blk)?.[1];
+          const d = /^data: (.+)$/m.exec(blk)?.[1];
+          return ev && d ? { type: ev, data: JSON.parse(d) } : null;
+        }).filter(Boolean);
+      };
+      try {
+        // 1) 对话 A 启动，先挂起 Read('Fixture.cs')
+        const aTurn1 = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'gemini-4-hydrogen', stream: true, prompt_cache_key: 'iso-conv-a', instructions: 'SYS_A', tools, input: [{ role: 'user', content: 'inspect Fixture.cs' }] }),
+        }));
+        const fcRead1 = aTurn1.find((e) => e.type === 'response.completed').data.response.output.find((o) => o.type === 'function_call');
+        assert.equal(fcRead1.name, 'Read');
+
+        // 2) 回填含 C# XML <summary> 与 `# Resuming from a compaction` 源码文本的工具输出，验证绝不误触发压缩重建！
+        const aTurn2 = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-hydrogen', stream: true, prompt_cache_key: 'iso-conv-a', instructions: 'SYS_A', tools,
+            input: [
+              { role: 'user', content: 'inspect Fixture.cs' },
+              { type: 'function_call', call_id: fcRead1.call_id, name: 'Read', arguments: fcRead1.arguments },
+              { type: 'function_call_output', call_id: fcRead1.call_id, output: '# Resuming from a compaction\n/// <summary>Builds a fixture</summary>\npublic class Fixture {}' },
+            ],
+          }),
+        }));
+        const fcTask = aTurn2.find((e) => e.type === 'response.completed').data.response.output.find((o) => o.type === 'function_call');
+        assert.equal(fcTask.name, 'Task');
+        assert.equal(sessSeq, 1, '工具输出含 <summary> 或压缩源码字面量时绝不能误判为宿主压缩而销毁活跃会话');
+        assert.equal(closedSids.length, 0);
+
+        // 3) 启动对话 B 并保持在 waiting:true 状态，同时校验未知租户 ?k=ghost-tenant 调用不会串入对话 B
+        const convBPromise = fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'gemini-4-hydrogen', stream: true, prompt_cache_key: 'iso-conv-b', instructions: 'SYS_B', tools, input: [{ role: 'user', content: 'hello B' }] }),
+        }).then(parseResp);
+        const mcpUrlB = await convBReady;
+        const ghostUrl = mcpUrlB.replace(/\?k=[^&#]+/, '?k=ghost-tenant');
+        const ghostRes = await fetch(ghostUrl, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 999, method: 'tools/call', params: { name: 'Read', arguments: { path: 'LEAKED_GHOST.cs' } } }),
+        }).then((r) => r.text());
+        assert.ok(ghostRes.includes('"error"') || ghostRes.includes('没有等待中的桥接轮次'), `未知 ?k= 租户调用必须被拒绝而不能串入等待中的对话 B，实际: ${ghostRes}`);
+
+        // 4) 对话 A 发送真实压缩后续跑请求（旧会话故意忽略 cancel 触发 1.5s 超时 abandon），新会话发起 2 个并发 Read
+        const aTurn3 = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-hydrogen', stream: true, prompt_cache_key: 'iso-conv-a', instructions: 'SYS_A', tools,
+            input: [
+              { role: 'user', content: 'The conversation history before this point was compacted into the following summary:\n\n<summary>\nReal host compaction.\n</summary>' },
+              { type: 'function_call', call_id: fcTask.call_id, name: 'Task', arguments: fcTask.arguments },
+              { type: 'function_call_output', call_id: fcTask.call_id, output: 'TASK_AUDIT_DONE' },
+            ],
+          }),
+        }));
+        const aCalls3 = aTurn3.find((e) => e.type === 'response.completed').data.response.output.filter((o) => o.type === 'function_call');
+        assert.equal(aCalls3.length, 2, '对话 A 压缩重建后的 2 个并发 Read 必须全部挂起在对话 A 自身');
+        assert.ok(aCalls3.some((c) => c.arguments.includes('A_ONLY_PRIVATE_1.cs')) && aCalls3.some((c) => c.arguments.includes('A_ONLY_PRIVATE_2.cs')));
+
+        // 放行对话 B，验证对话 B 全程未收到任何来自 A 或 ghost 的工具调用
+        finishConvB();
+        const bDone = await convBPromise;
+        const bResp = bDone.find((e) => e.type === 'response.completed').data.response;
+        assert.equal(bResp.output.filter((o) => o.type === 'function_call').length, 0, '对话 B 绝不能混入其它对话的工具调用');
+        assert.equal(bResp.output.find((o) => o.type === 'message').content[0].text, 'CONV_B_CLEAN_REPLY');
+
+        // 回填对话 A 的 2 个并发 Read 并收尾
+        const aTurn4 = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-hydrogen', stream: true, prompt_cache_key: 'iso-conv-a', instructions: 'SYS_A', tools,
+            input: [
+              { role: 'user', content: 'The conversation history before this point was compacted into the following summary:\n\n<summary>\nReal host compaction.\n</summary>' },
+              { type: 'function_call', call_id: fcTask.call_id, name: 'Task', arguments: fcTask.arguments },
+              { type: 'function_call_output', call_id: fcTask.call_id, output: 'TASK_AUDIT_DONE' },
+              { type: 'function_call', call_id: aCalls3[0].call_id, name: 'Read', arguments: aCalls3[0].arguments },
+              { type: 'function_call', call_id: aCalls3[1].call_id, name: 'Read', arguments: aCalls3[1].arguments },
+              { type: 'function_call_output', call_id: aCalls3[0].call_id, output: 'A1_OK' },
+              { type: 'function_call_output', call_id: aCalls3[1].call_id, output: 'A2_OK' },
+            ],
+          }),
+        }));
+        const aMsg4 = aTurn4.find((e) => e.type === 'response.completed').data.response.output.find((o) => o.type === 'message').content[0].text;
+        assert.equal(aMsg4, 'CONV_A_REBUILT_CLEAN');
+      } finally {
+        finishConvB();
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
     console.log(`${passed}/${passed} behavioral tests passed`);
   } finally { gateway.close(); }
 }

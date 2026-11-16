@@ -182,22 +182,29 @@
 
     <div class="field wide" style="line-height: 1.6; font-size: 12px; color: #cfcfd6;">
       <div style="margin-bottom: 8px;">
-        <span style="color: #60a5fa; font-weight: 600;">步骤 ①</span>：打开 PI-Desktop 左侧栏或设置中的「模型」面板，点击「添加自定义提供商 / 模型」。
+        <span style="color: #60a5fa; font-weight: 600;">步骤 ①</span>：打开 PI-Desktop「设置 → 模型」，点击「添加服务 / 自定义端点」。
       </div>
       <div style="margin-bottom: 8px;">
-        <span style="color: #60a5fa; font-weight: 600;">步骤 ②</span>：协议选择 <b>OpenAI（Chat Completions）</b>，填入本地端点与留空密钥：
+        <span style="color: #60a5fa; font-weight: 600;">步骤 ②</span>：接口格式强烈推荐选择 <b>OpenAI Responses</b>（兼容 Chat Completions），填入本地端点后点击右侧<b>「获取列表」</b>，从左侧发现列表勾选模型并点击<b>「保存服务」</b>：
         <div style="margin: 6px 0; padding: 8px 10px; background: rgba(0,0,0,0.3); border-radius: 6px; border: 1px solid rgba(255,255,255,0.08); font-family: monospace;">
           API 端点：<span id="endpointPreview" style="color: #4ade80;">http://127.0.0.1:41910/v1</span>
           <button id="copyEndpointBtn" type="button" class="ghost" style="padding: 2px 8px; margin-left: 8px; font-size: 11px;">复制端点</button><br>
-          API 密钥：<span style="color: #94a3b8;">留空（或随意填写任意字符）</span>
+          API 密钥：<span style="color: #94a3b8;">sk-local（留空或填写任意字符均可）</span>
+        </div>
+        <div style="margin: 6px 0 0; padding: 8px 10px; background: rgba(76, 125, 255, 0.08); border-radius: 6px; border: 1px solid rgba(76, 125, 255, 0.25); font-size: 11.5px; color: #cbd5e1; line-height: 1.65;">
+          💡 <b>模型列表上下文与自动压缩（Compaction）推荐设置</b>：网关默认如实上报原生窗口（Gemini <code>1,048,576</code>、Claude <code>1,000,000</code>），压缩水位完全交由 PI-Desktop 模型列表控制：<br>
+          • <b>满血超长上下文（默认，不提前压缩）</b>：通过「获取列表」勾选模型即可直接使用原生 <code>1M</code> 窗口（扣除输出预留后约在 78 万～88 万 Token 才触发压缩）。<br>
+          • <b>均衡省流防慢（日常长任务推荐）</b>：若希望长对话自动阶段精简以降低延迟与 429 概率，可在 PI-Desktop <b>模型列表展开该模型高级设置，将上下文窗口设为 <code>262144</code>（256K，约 17.7 万水位压缩）或 <code>200000</code>（200K，约 13.5 万水位压缩）</b>，宿主生成摘要后网关将自动重置底层会话并无损续接。
         </div>
       </div>
       <div>
-        <span style="color: #60a5fa; font-weight: 600;">步骤 ③</span>：输入所需虚拟模型 ID，即可在对话中直接选用：
+        <span style="color: #60a5fa; font-weight: 600;">步骤 ③</span>：同步列表后即可直接选用，或点击下方快捷复制虚拟模型 ID：
         <div style="margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap;">
-          <button type="button" class="ghost copy-model-btn" data-model="gemini-2.5-pro" style="padding: 2px 8px; font-size: 11px;">📋 gemini-2.5-pro</button>
-          <button type="button" class="ghost copy-model-btn" data-model="gemini-2.5-flash" style="padding: 2px 8px; font-size: 11px;">📋 gemini-2.5-flash</button>
-          <button type="button" class="ghost copy-model-btn" data-model="claude-3-7-sonnet" style="padding: 2px 8px; font-size: 11px;">📋 claude-3-7-sonnet</button>
+          <button type="button" class="ghost copy-model-btn" data-model="gemini-4-hydrogen" style="padding: 2px 8px; font-size: 11px;">📋 gemini-4-hydrogen</button>
+          <button type="button" class="ghost copy-model-btn" data-model="gemini-4-carbon" style="padding: 2px 8px; font-size: 11px;">📋 gemini-4-carbon</button>
+          <button type="button" class="ghost copy-model-btn" data-model="gemini-3.8-flash" style="padding: 2px 8px; font-size: 11px;">📋 gemini-3.8-flash</button>
+          <button type="button" class="ghost copy-model-btn" data-model="claude-opus-4-6-thinking" style="padding: 2px 8px; font-size: 11px;">📋 claude-opus-4-6-thinking</button>
+          <button type="button" class="ghost copy-model-btn" data-model="claude-sonnet-4-6" style="padding: 2px 8px; font-size: 11px;">📋 claude-sonnet-4-6</button>
         </div>
         <span class="hint" style="margin-top: 4px; display: block;">提示：点击上方按钮可快速复制模型 ID；点击页面底部「列出可用模型」按钮可查看当前授权的全部模型。</span>
       </div>
@@ -353,9 +360,9 @@
       <span class="hint">连续高频工具回填之间的最小目标间隔（≥7 轮自动放大 1.5 倍）</span>
     </div>
     <div class="field">
-      <label for="reportedContextWindow">上报宿主的上下文窗口大小（Token，默认 200000）</label>
+      <label for="reportedContextWindow">上报宿主的上下文窗口覆盖（Token，默认 0 = 原生 1M）</label>
       <input id="reportedContextWindow" type="number" min="0" max="2000000" step="10000">
-      <span class="hint">控制 PI-Desktop 自动触发上下文压缩（Compaction）的水位；宿主会在达到 90%（默认约 18 万 Token）时触发压缩并生成阶段摘要；设为 0 则上报模型原生 100 万 Token（需累积至 90 万 Token 才压缩）</span>
+      <span class="hint">0 = 如实上报模型原生窗口（Gemini 1,048,576 / Claude 1,000,000），推荐直接在 PI-Desktop 模型列表中按模型设置上下文窗口与压缩水位；设为 &gt;0（如 200000）时网关将统一覆盖上报值</span>
     </div>
   </section>
 

@@ -1344,7 +1344,7 @@ async function main() {
     const gw = createGateway({
       acp: mockAcp,
       limiter: createLimiter({ limit: 0, maxQueue: 8, queueTimeoutMs: 5000 }),
-      getConfig: () => ({ ...configLib.DEFAULTS, configDir: tempDir('gw-150'), bridgeTools: false }),
+      getConfig: () => ({ ...configLib.DEFAULTS, source: path.join(tempDir('gw-150'), 'config.json'), bridgeTools: false }),
       log: () => {},
     });
     const port = await gw.listen([0]);
@@ -1484,6 +1484,97 @@ async function main() {
     }
   });
 
+  await suite('context-coupling: 原生上下文窗口对齐、旧默认迁移、turnUsage 快照合并与工具轮压缩平铺', async () => {
+    const serverLib = require('../lib/server.js');
+
+    // 1. 默认 reportedContextWindow 为 0（原生窗口），且旧版自动固化的 200000 仅迁移一次，用户显式保存后予以保留
+    assert.strictEqual(configLib.DEFAULTS.reportedContextWindow, 0, '默认应为 0 以如实上报模型原生窗口');
+    const migDir = tempDir('ctx-mig');
+    try {
+      const cfgPath = path.join(migDir, 'config.json');
+      fs.writeFileSync(cfgPath, JSON.stringify({ port: 41910, reportedContextWindow: 200000 }, null, 2), 'utf8');
+      const loaded1 = configLib.loadConfig({ packageRoot: root, dataPath: migDir });
+      assert.strictEqual(loaded1.reportedContextWindow, 0, '旧版未标记的默认 200000 应平滑迁移为 0');
+      const savedRes = configLib.savePanel({ packageRoot: root, dataPath: migDir }, { reportedContextWindow: 200000 });
+      assert.strictEqual(savedRes.ok, true);
+      const loaded2 = configLib.loadConfig({ packageRoot: root, dataPath: migDir });
+      assert.strictEqual(loaded2.reportedContextWindow, 200000, '用户在面板主动保存 200000 后不得被再次抹除');
+    } finally {
+      fs.rmSync(migDir, { recursive: true, force: true });
+    }
+
+    // 2. 模型家族原生上下文窗口精确对齐（Gemini 1048576 / Claude 1000000 / 120B 131072）
+    const rt = new AcpRuntime({ getConfig: () => ({ reportedContextWindow: 0, virtualModels: true }), log: () => {} });
+    rt.ingestModels([
+      { modelId: 'gemini-4-hydrogen-xhigh', name: 'Gemini 4 Hydrogen (xhigh)' },
+      { modelId: 'claude-opus-4-6-thinking-high', name: 'Claude Opus 4.6 Thinking (high)' },
+      { modelId: 'gpt-oss-120b', name: 'GPT-OSS 120B' },
+    ]);
+    rt.discover = async () => rt.discovery;
+    const models = await rt.modelsForApi();
+    assert.strictEqual(models.find((m) => m.id === 'gemini-4-hydrogen').contextWindow, 1048576);
+    assert.strictEqual(models.find((m) => m.id === 'claude-opus-4-6-thinking').contextWindow, 1000000);
+    assert.strictEqual(models.find((m) => m.id === 'gpt-oss-120b').contextWindow, 131072);
+
+    // 3. mergeTurnUsage：输入上下文（inputTokens / cachedReadTokens）取最新非零快照，输出累加，严禁输入翻倍
+    const step1 = serverLib.normalizeTurnUsage({ inputTokens: 15000, cachedReadTokens: 165000, outputTokens: 200, thoughtTokens: 120, totalTokens: 180200 });
+    const step2 = serverLib.normalizeTurnUsage({ inputTokens: 15200, cachedReadTokens: 165000, outputTokens: 350, thoughtTokens: 180, totalTokens: 180550 });
+    const merged = serverLib.mergeTurnUsage(step1, step2);
+    assert.strictEqual(merged.inputTokens, 15200, 'inputTokens 必须取最新步快照而非累加翻倍');
+    assert.strictEqual(merged.cachedReadTokens, 165000, 'cachedReadTokens 必须取最新步快照而非累加翻倍');
+    assert.strictEqual(merged.outputTokens, 550, 'outputTokens 应跨步累加');
+    assert.strictEqual(merged.thoughtTokens, 300, 'thoughtTokens 应跨步累加');
+    assert.strictEqual(merged.totalTokens, 180750, 'totalTokens 应等于最新上下文输入加累计输出');
+
+    // 4. flatten：工具循环中途发生 Compaction 时（末尾为 tool 输出），完整保留系统指令、摘要专段与尾部工具结果
+    const midTurnMsgsA = serverLib.normalizeMessages({
+      instructions: 'SYSTEM_ANCHOR_KEEP_ALL',
+      input: [
+        { role: 'user', content: '# Resuming from a compaction\n\n<summary>\nSUMMARY_ANCHOR_MID_TURN\n</summary>' },
+        { type: 'function_call', call_id: 'call_mid_1', name: 'Read', arguments: '{"path":"lib/server.js"}' },
+        { type: 'function_call_output', call_id: 'call_mid_1', output: 'TRAILING_TOOL_OUTPUT_ANCHOR_1' },
+      ],
+    }, { responses: true });
+    const flatA = serverLib.flatten(midTurnMsgsA);
+    assert.ok(flatA.includes('SYSTEM_ANCHOR_KEEP_ALL'), '必须保留完整系统指令');
+    assert.ok(flatA.includes('=== 历史阶段压缩摘要 (Compaction Summary) ==='), '最后的 user 若为压缩摘要必须归入摘要专段');
+    assert.ok(flatA.includes('SUMMARY_ANCHOR_MID_TURN'), '必须包含压缩摘要正文');
+    assert.ok(flatA.includes('Tool (Read):') && flatA.includes('TRAILING_TOOL_OUTPUT_ANCHOR_1'), '必须完整保留压缩摘要后的尾部工具结果');
+
+    const midTurnMsgsB = serverLib.normalizeMessages({
+      instructions: 'SYSTEM_ANCHOR_B',
+      input: [
+        { role: 'user', content: '# Resuming from a compaction\n\n<summary>SUMMARY_B</summary>' },
+        { role: 'user', content: 'USER_REQ_AFTER_SUMMARY' },
+        { type: 'function_call', call_id: 'call_mid_2', name: 'Bash', arguments: '{"command":"git status"}' },
+        { type: 'function_call_output', call_id: 'call_mid_2', output: 'TRAILING_TOOL_OUTPUT_B' },
+      ],
+    }, { responses: true });
+    const flatB = serverLib.flatten(midTurnMsgsB);
+    assert.ok(flatB.includes('SUMMARY_B') && flatB.includes('USER_REQ_AFTER_SUMMARY') && flatB.includes('TRAILING_TOOL_OUTPUT_B'));
+
+    // 5. flatten 普通 [system, user] 不得将最后一条 user 重复拼入 trailingAfterUser；压缩摘要识别严格限定 user 角色头
+    const simpleSysUser = serverLib.flatten([
+      { role: 'system', content: 'SYS_ONCE_ANCHOR' },
+      { role: 'user', content: 'UNIQUE_USER_ONCE_TOKEN_991' },
+    ]);
+    assert.strictEqual(simpleSysUser.split('UNIQUE_USER_ONCE_TOKEN_991').length - 1, 1, '最后一条普通 user 消息只能出现 1 次，严禁被重复拼入尾部步骤');
+    assert.strictEqual(serverLib.isCompactionSummary('/// <summary>Builds a fixture</summary>'), false, 'C# XML <summary> 注释不得误判为压缩摘要');
+    assert.strictEqual(serverLib.isCompactionSummary('Prose mentioning <summary> tag inline'), false, '正文内嵌 <summary> 不得误判为压缩摘要');
+    assert.strictEqual(
+      serverLib.isCompactionSummary('The conversation history before this point was compacted into the following summary:\n\n<summary>\nok\n</summary>'),
+      true,
+      'PI-Desktop 标准压缩头必须准确识别',
+    );
+    assert.strictEqual(
+      serverLib.extractLatestCompaction([
+        { role: 'tool', content: '# Resuming from a compaction\n\n<summary>tool read server.js</summary>' },
+        { role: 'assistant', content: 'The conversation history before this point was compacted...' },
+      ]),
+      '',
+      'tool / assistant 消息中包含压缩字面量时不得触发压缩签名变更',
+    );
+  });
   const failed = results.filter((r) => !r.ok);
   console.log(`\n结果: ${results.length - failed.length}/${results.length} 通过`);
   if (failed.length > 0) process.exit(1);

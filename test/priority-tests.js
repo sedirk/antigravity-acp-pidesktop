@@ -351,10 +351,11 @@ async function main() {
         return {};
       },
     };
+    const prioDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-prio11-'));
     const gw = createGateway({
       acp: dummyAcp,
       limiter: { run: (fn) => fn(), stats: () => ({}) },
-      getConfig: () => ({ port: 0, toolPolicy: 'all' }),
+      getConfig: () => ({ port: 0, toolPolicy: 'all', source: path.join(prioDir, 'config.json') }),
       log: () => {},
     });
     const port = await gw.listen([0]);
@@ -368,6 +369,7 @@ async function main() {
       assert.strictEqual(closedCount, 0);
     } finally {
       gw.close();
+      try { fs.rmSync(prioDir, { recursive: true, force: true }); } catch { /* ignore */ }
     }
   });
 
