@@ -1220,6 +1220,270 @@ async function main() {
     assert.strictEqual(nullTaskOk.args.subagent_type, undefined);
   });
 
+  await suite('acp-1.5.0: 运行时元数据升级检测、能力协商、Turn Usage 明细与 usage_update 零值保护', async () => {
+    const http = require('node:http');
+    const plugin = require(path.join(root, 'main.js'));
+    assert.strictEqual(plugin._internals.RUNTIME.version, '1.5.0');
+    assert.strictEqual(plugin._internals.RUNTIME.archiveBytes, 105513364);
+    assert.strictEqual(plugin._internals.RUNTIME.sha256, '6163F6B59B381BAE419652DBAE167BC8CDA0EF29D665C0BA8AF3D8C7FDDD8867');
+
+    // 1. runtimeStatus 版本检测与 1.3.0 → 1.5.0 升级提示判定
+    const rtDataDir = tempDir('rt-150');
+    plugin._internals.setDataPath(rtDataDir);
+    const managedDir = path.join(rtDataDir, 'runtime');
+    fs.mkdirSync(managedDir, { recursive: true });
+    const exePath = path.join(managedDir, 'agy_acp_server.exe');
+    fs.writeFileSync(exePath, Buffer.alloc(1024));
+    fs.writeFileSync(path.join(managedDir, 'runtime-meta.json'), JSON.stringify({
+      version: '1.3.0',
+      exeBytes: 1024,
+    }), 'utf8');
+    plugin._internals.reloadConfig();
+    const stOld = plugin._internals.runtimeStatus();
+    assert.strictEqual(stOld.installedVersion, '1.3.0');
+    assert.strictEqual(stOld.version, '1.5.0');
+    assert.strictEqual(stOld.updateAvailable, true);
+
+    fs.writeFileSync(path.join(managedDir, 'runtime-meta.json'), JSON.stringify({
+      version: '1.5.0',
+      exeBytes: 1024,
+    }), 'utf8');
+    const stNew = plugin._internals.runtimeStatus();
+    assert.strictEqual(stNew.installedVersion, '1.5.0');
+    assert.strictEqual(stNew.updateAvailable, false);
+
+    // 2. AcpRuntime 1.5.0 能力协商与旧版兼容回退
+    const extraDir = tempDir('extra-ws');
+    const primaryDir = tempDir('primary-ws');
+    const acp13 = new AcpRuntime({
+      getConfig: () => ({ mcpMaxOutputBytes: 262144 }),
+      getAdditionalDirs: async () => [extraDir, primaryDir],
+      log: () => {},
+    });
+    assert.deepStrictEqual(
+      await acp13.sessionParams(primaryDir, [{ type: 'http', name: 'pi-bridge', url: 'http://127.0.0.1:9999/mcp', headers: [] }]),
+      { cwd: primaryDir, mcpServers: [{ type: 'http', name: 'pi-bridge', url: 'http://127.0.0.1:9999/mcp', headers: [] }] },
+      '未声明 1.5.0 能力的旧版运行时必须原样发送 { cwd, mcpServers }',
+    );
+
+    const acp15 = new AcpRuntime({
+      getConfig: () => ({ mcpMaxOutputBytes: 262144 }),
+      getAdditionalDirs: async () => [extraDir, primaryDir, path.parse(extraDir).root, 'relative/not-allowed'],
+      log: () => {},
+    });
+    acp15.agentCapabilities = {
+      sessionCapabilities: { additionalDirectories: {} },
+      _meta: { antigravity: { tier: true, systemPrompt: { append: true } } },
+    };
+    const params15 = await acp15.sessionParams(primaryDir, [{ type: 'http', name: 'pi-bridge', url: 'http://127.0.0.1:9999/mcp', headers: [] }]);
+    assert.deepStrictEqual(params15.additionalDirectories, [path.resolve(extraDir)]);
+    assert.deepStrictEqual(params15._meta, { antigravity: { mcpMaxOutputBytes: 262144 } });
+    const paramsNoMcp = await acp15.sessionParams(primaryDir, []);
+    assert.strictEqual(paramsNoMcp._meta, undefined, '无 MCP 服务时不注入 mcpMaxOutputBytes');
+    acp15.ingestSessionMeta({ _meta: { antigravity: { tier: { id: 'g1-ultra-tier', name: 'Google AI Ultra' } } } });
+    assert.strictEqual(acp15.status().tier.name, 'Google AI Ultra');
+
+    // 3. PromptResponse.usage 归一化与不重复累加 thoughtTokens
+    const { createGateway, usageFor, normalizeTurnUsage } = require(path.join(root, 'lib/server.js'));
+    const norm = normalizeTurnUsage({
+      totalTokens: 34582,
+      inputTokens: 21695,
+      outputTokens: 672,
+      thoughtTokens: 597,
+      cachedReadTokens: 12215,
+      cachedWriteTokens: 0,
+    });
+    const u15 = usageFor('hi', 'short reply', 'long thinking', {
+      contextUsed: 18500,
+      contextSize: 1000000,
+      turnUsage: norm,
+    });
+    assert.strictEqual(u15.prompt_tokens, 18500, '保持 contextUsed 为 prompt_tokens 以保证宿主上下文进度条准确');
+    assert.strictEqual(u15.completion_tokens, 672, 'outputTokens 已含 thoughtTokens，不得重复相加');
+    assert.strictEqual(u15.total_tokens, 18500 + 672);
+    assert.strictEqual(u15.estimated, false);
+    assert.deepStrictEqual(u15.prompt_tokens_details, { cached_tokens: 12215 });
+    assert.deepStrictEqual(u15.completion_tokens_details, { reasoning_tokens: 597 });
+
+    // 4. 网关端到端验证：1.5.0 usage_update(used:0) 不冲掉已有会话非零占用，且透传 Turn Usage 明细
+    let promptTurn = 0;
+    const mockAcp = {
+      ready: true,
+      child: { pid: 1234 },
+      policyBySession: new Map(),
+      discovery: { at: Date.now(), groups: new Map(), raw: [] },
+      onNotification: () => {},
+      onExit: () => {},
+      proxyDrift: () => '',
+      start: async () => ({}),
+      discover: async () => ({ groups: new Map(), raw: [] }),
+      resolveModel: async () => 'claude-opus-5-5-high',
+      cwdFor: async () => primaryDir,
+      sessionParams: async (cwd, mcpServers) => ({ cwd, mcpServers }),
+      ingestSessionMeta: () => {},
+      ingestModels: () => {},
+      notify: () => {},
+      request: async (method, params) => {
+        if (method === 'session/new') return { sessionId: 'sid-150', models: { currentModelId: 'claude-opus-5-5-high', availableModels: [] } };
+        if (method === 'session/close') return {};
+        if (method === 'session/prompt') {
+          promptTurn += 1;
+          if (promptTurn === 1) {
+            mockAcp.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'usage_update', used: 24000, size: 1000000 } } });
+            mockAcp.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'first' } } } });
+            return { stopReason: 'end_turn', usage: { inputTokens: 8000, cachedReadTokens: 16000, outputTokens: 120, thoughtTokens: 80, totalTokens: 24120 } };
+          }
+          // 第二轮模拟切换/恢复后先收到一条 used:0 的初始化帧，随后直接返回结果
+          mockAcp.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'usage_update', used: 0, size: 1000000 } } });
+          mockAcp.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'second' } } } });
+          return { stopReason: 'end_turn', usage: { inputTokens: 500, cachedReadTokens: 23800, outputTokens: 90, thoughtTokens: 40, totalTokens: 24390 } };
+        }
+        return {};
+      },
+    };
+    const gw = createGateway({
+      acp: mockAcp,
+      limiter: createLimiter({ limit: 0, maxQueue: 8, queueTimeoutMs: 5000 }),
+      getConfig: () => ({ ...configLib.DEFAULTS, configDir: tempDir('gw-150'), bridgeTools: false }),
+      log: () => {},
+    });
+    const port = await gw.listen([0]);
+    try {
+      const post = (body) => new Promise((resolve, reject) => {
+        const payload = JSON.stringify(body);
+        const req = http.request({ hostname: '127.0.0.1', port, path: '/v1/responses', method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } }, (res) => {
+          let raw = '';
+          res.setEncoding('utf8');
+          res.on('data', (c) => { raw += c; });
+          res.on('end', () => resolve(JSON.parse(raw)));
+        });
+        req.on('error', reject);
+        req.end(payload);
+      });
+      const r1 = await post({ model: 'claude-opus-5-5', stream: false, prompt_cache_key: 'k-150', input: [{ role: 'user', content: 'turn 1' }] });
+      assert.strictEqual(r1.usage.input_tokens, 24000);
+      assert.strictEqual(r1.usage.output_tokens, 120);
+      assert.deepStrictEqual(r1.usage.input_tokens_details, { cached_tokens: 16000 });
+      assert.deepStrictEqual(r1.usage.output_tokens_details, { reasoning_tokens: 80 });
+
+      const r2 = await post({
+        model: 'claude-opus-5-5',
+        stream: false,
+        prompt_cache_key: 'k-150',
+        input: [
+          { role: 'user', content: 'turn 1' },
+          { role: 'assistant', content: 'first' },
+          { role: 'user', content: 'turn 2' },
+        ],
+      });
+      assert.strictEqual(r2.usage.input_tokens, 24000, 'used:0 不得把已有的 24000 上下文占用清零');
+      assert.strictEqual(r2.usage.output_tokens, 90);
+      assert.deepStrictEqual(r2.usage.output_tokens_details, { reasoning_tokens: 40 });
+    } finally {
+      gw.close();
+    }
+  });
+
+  await suite('runtime-upgrade: 维护态锁定阻止并发拉起、半残解压拦截与原子切换回滚', async () => {
+    // 1. AcpRuntime.enterMaintenance 立即拒绝 start() 且触发 onExit 清理挂起会话
+    let exitCount = 0;
+    const guardAcp = new AcpRuntime({ getConfig: () => ({ bin: __filename }) });
+    guardAcp.onExit = () => { exitCount += 1; };
+    guardAcp.enterMaintenance('升级维护中');
+    assert.strictEqual(exitCount, 1);
+    await assert.rejects(
+      () => guardAcp.start(),
+      (err) => err && err.code === 'RUNTIME_UPDATING' && err.message.includes('升级维护中'),
+    );
+    guardAcp.exitMaintenance();
+    assert.strictEqual(guardAcp.maintenanceReason, '');
+
+    // 2. psQuote 转义单引号路径（如 C:\Users\O'Connor\...）
+    const pluginMain = require(path.join(root, 'main.js'));
+    const { _internals } = pluginMain;
+    assert.strictEqual(_internals.psQuote("C:\\Users\\O'Connor\\a.zip"), "'C:\\Users\\O''Connor\\a.zip'");
+
+    // 3. swapStagedRuntime：暂存目录缺文件时不触碰旧 1.3.0 目录；切换失败自动回滚；成功则原子替换为 1.5.0
+    const dataRoot = tempDir('swap');
+    const liveDir = path.join(dataRoot, 'runtime');
+    fs.mkdirSync(liveDir, { recursive: true });
+    const oldBin = path.join(liveDir, 'agy_acp_server.exe');
+    const oldHarness = path.join(liveDir, 'localharness_external.exe');
+    fs.writeFileSync(oldBin, 'OLD_1_3_0_BIN');
+    fs.writeFileSync(oldHarness, 'OLD_1_3_0_HARNESS');
+    fs.writeFileSync(path.join(liveDir, 'runtime-meta.json'), JSON.stringify({ version: '1.3.0' }), 'utf8');
+
+    _internals.setDataPath(dataRoot);
+    _internals.setConfig({ bin: oldBin, port: 0 });
+    try {
+      assert.strictEqual(_internals.runtimeStatus().installedVersion, '1.3.0');
+      assert.strictEqual(_internals.runtimeStatus().updateAvailable, true);
+
+      // 3a. 暂存目录缺少 localharness_external.exe → 直接报错且清理 stage，旧目录毫发无损
+      const badStage = path.join(dataRoot, 'stage-bad');
+      fs.mkdirSync(badStage, { recursive: true });
+      fs.writeFileSync(path.join(badStage, 'agy_acp_server.exe'), 'NEW_1_5_0_BIN');
+      await assert.rejects(
+        () => _internals.swapStagedRuntime(badStage, liveDir, { reap: false }),
+        /解压后缺少有效的 localharness_external\.exe/,
+      );
+      assert.strictEqual(fs.existsSync(badStage), false);
+      assert.strictEqual(fs.readFileSync(oldBin, 'utf8'), 'OLD_1_3_0_BIN');
+      assert.strictEqual(JSON.parse(fs.readFileSync(path.join(liveDir, 'runtime-meta.json'), 'utf8')).version, '1.3.0');
+
+      // 3b. 模拟 dir→backup 成功但 stage→dir 发生 EPERM → 自动将 backup 回滚回 dir，绝不留混合半残目录
+      const rollbackStage = path.join(dataRoot, 'stage-rollback');
+      fs.mkdirSync(rollbackStage, { recursive: true });
+      fs.writeFileSync(path.join(rollbackStage, 'agy_acp_server.exe'), 'NEW_1_5_0_BIN');
+      fs.writeFileSync(path.join(rollbackStage, 'localharness_external.exe'), 'NEW_1_5_0_HARNESS');
+      await assert.rejects(
+        () => _internals.swapStagedRuntime(rollbackStage, liveDir, {
+          reap: false,
+          retryDelayMs: 5,
+          renameSync: (from, to) => {
+            if (from === rollbackStage) {
+              throw Object.assign(new Error('simulated lock'), { code: 'EPERM' });
+            }
+            fs.renameSync(from, to);
+          },
+        }),
+        (err) => err && err.code === 'EPERM',
+      );
+      assert.strictEqual(fs.existsSync(rollbackStage), false, '失败的暂存目录必须清理');
+      assert.strictEqual(fs.readFileSync(oldBin, 'utf8'), 'OLD_1_3_0_BIN', '旧二进制必须完整回滚');
+      assert.strictEqual(JSON.parse(fs.readFileSync(path.join(liveDir, 'runtime-meta.json'), 'utf8')).version, '1.3.0', '不得误标为 1.5.0');
+
+      // 3c. 模拟短暂 EBUSY 后解锁并完成原子替换 → 升级至 1.5.0 且清理 backup
+      const okStage = path.join(dataRoot, 'stage-ok');
+      fs.mkdirSync(okStage, { recursive: true });
+      fs.writeFileSync(path.join(okStage, 'agy_acp_server.exe'), 'NEW_1_5_0_BIN_OK');
+      fs.writeFileSync(path.join(okStage, 'localharness_external.exe'), 'NEW_1_5_0_HARNESS_OK');
+      let transientFailures = 0;
+      const swapped = await _internals.swapStagedRuntime(okStage, liveDir, {
+        reap: false,
+        retryDelayMs: 5,
+        renameSync: (from, to) => {
+          if (from === liveDir && transientFailures < 2) {
+            transientFailures += 1;
+            throw Object.assign(new Error('transient busy'), { code: 'EBUSY' });
+          }
+          fs.renameSync(from, to);
+        },
+      });
+      assert.strictEqual(transientFailures, 2);
+      assert.strictEqual(fs.readFileSync(swapped.bin, 'utf8'), 'NEW_1_5_0_BIN_OK');
+      assert.strictEqual(JSON.parse(fs.readFileSync(path.join(liveDir, 'runtime-meta.json'), 'utf8')).version, '1.5.0');
+      const leftovers = fs.readdirSync(dataRoot).filter((n) => n.includes('.bak-') || n.startsWith('stage-'));
+      assert.deepStrictEqual(leftovers, [], '不应残留 backup 或 stage 目录');
+      assert.strictEqual(_internals.runtimeStatus().installedVersion, '1.5.0');
+      assert.strictEqual(_internals.runtimeStatus().updateAvailable, false);
+    } finally {
+      _internals.setDataPath('');
+      _internals.setConfig(null);
+      fs.rmSync(dataRoot, { recursive: true, force: true });
+    }
+  });
+
   const failed = results.filter((r) => !r.ok);
   console.log(`\n结果: ${results.length - failed.length}/${results.length} 通过`);
   if (failed.length > 0) process.exit(1);

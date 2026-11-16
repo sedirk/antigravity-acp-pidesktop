@@ -142,7 +142,7 @@
     <div class="field wide">
       <label>运行时操作与管理</label>
       <div class="btn-group">
-        <button id="install" type="button" class="primary primary-full">下载官方运行时 (约 120 MB)</button>
+        <button id="install" type="button" class="primary primary-full">下载官方运行时 (约 101 MB)</button>
         <button id="restartRuntime" type="button">重启运行时</button>
         <button id="cleanup" type="button">清理运行时文件</button>
         <button id="refreshRuntimeBtn" type="button" class="ghost">刷新运行时状态</button>
@@ -325,7 +325,7 @@
     <div class="field">
       <label for="clientName">客户端名称（解锁第三方模型）</label>
       <input id="clientName" type="text" maxlength="40" placeholder="留空＝antigravity-acp-pidesktop">
-      <span class="hint">上游 1.3.0 只在 clientInfo.name 为 Zed / Xcode / JetBrains 时才提供 Claude、GPT-OSS；填 Zed 即可看到</span>
+      <span class="hint">上游运行时按 clientInfo.name 门控 Claude、GPT-OSS（如 Zed / Xcode / JetBrains / Android Studio）；填 Zed 即可解锁</span>
     </div>
     <div class="field">
       <label for="idleSessionMinutes">会话空闲回收（分钟）</label>
@@ -571,13 +571,17 @@
       if (badge) { badge.className = 'badge err'; badge.textContent = '安装失败'; }
     } else {
       fill.style.width = rt.binExists ? '100%' : '0%';
+      const verTag = rt.installedVersion ? 'v' + rt.installedVersion : (rt.version ? 'v' + rt.version : '');
       label.textContent = rt.binExists
-        ? '已安装 · ' + mb(rt.dirBytes) + ' · 卸载插件不会自动删除这些文件'
-        : '尚未安装运行时（约 120 MB）';
+        ? ('已安装' + (verTag ? ' ' + verTag : '') + ' · ' + mb(rt.dirBytes) + (rt.updateAvailable ? ' · 可升级至 v' + rt.version : ' · 卸载插件不会自动删除这些文件'))
+        : '尚未安装运行时（v' + (rt.version || '1.5.0') + '，约 101 MB）';
       if (badge) {
-        if (rt.ready || rt.binExists) {
+        if (rt.updateAvailable) {
+          badge.className = 'badge warn';
+          badge.textContent = '可升级 v' + rt.version;
+        } else if (rt.ready || rt.binExists) {
           badge.className = 'badge ok';
-          badge.textContent = rt.ready ? '运行中 (PID ' + rt.pid + ')' : '已安装 (待命)';
+          badge.textContent = rt.ready ? '运行中' + (verTag ? ' ' + verTag : '') + ' (PID ' + rt.pid + ')' : '已安装' + (verTag ? ' ' + verTag : '') + ' (待命)';
         } else {
           badge.className = 'badge warn';
           badge.textContent = '未安装';
@@ -587,20 +591,26 @@
 
     if (summary) {
       if (rt.binExists) {
-        summary.innerHTML = '<span style="color:#6bd48a;font-weight:600">● 运行时文件已就绪</span> ' +
-          '<span style="color:#8f8f96">(' + mb(rt.dirBytes) + (rt.pid ? ' · 运行中 PID: ' + rt.pid : ' · 空闲待命') + ')</span>';
+        const verLabel = rt.installedVersion ? ' v' + rt.installedVersion : '';
+        const tierLabel = rt.tier && rt.tier.name ? ' · ' + rt.tier.name : '';
+        const upgHint = rt.updateAvailable ? ' · <span style="color:#f5c542">可升级至官方 v' + rt.version + '</span>' : '';
+        summary.innerHTML = '<span style="color:#6bd48a;font-weight:600">● 运行时文件' + verLabel + ' 已就绪</span> ' +
+          '<span style="color:#8f8f96">(' + mb(rt.dirBytes) + (rt.pid ? ' · 运行中 PID: ' + rt.pid : ' · 空闲待命') + tierLabel + ')' + upgHint + '</span>';
       } else {
         summary.innerHTML = '<span style="color:#ff8a80;font-weight:600">○ 尚未安装官方运行时</span> ' +
-          '<span style="color:#8f8f96">（请点击下方按钮一键下载约 120 MB）</span>';
+          '<span style="color:#8f8f96">（请点击下方按钮一键下载 v' + (rt.version || '1.5.0') + '，约 101 MB）</span>';
       }
     }
 
     $('install').disabled = rt.busy === true;
-    if (rt.binExists) {
-      $('install').textContent = '重新下载官方运行时 (约 120 MB)';
+    if (rt.updateAvailable) {
+      $('install').textContent = '一键升级官方运行时至 v' + rt.version + ' (约 101 MB)';
+      $('install').className = 'primary primary-full';
+    } else if (rt.binExists) {
+      $('install').textContent = '重新下载官方运行时 v' + (rt.version || '1.5.0') + ' (约 101 MB)';
       $('install').className = 'primary-full';
     } else {
-      $('install').textContent = '一键下载官方运行时 (约 120 MB)';
+      $('install').textContent = '一键下载官方运行时 v' + (rt.version || '1.5.0') + ' (约 101 MB)';
       $('install').className = 'primary primary-full';
     }
     $('cleanup').disabled = rt.busy === true || !(rt.dirBytes > 0);

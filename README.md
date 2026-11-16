@@ -100,7 +100,7 @@ flowchart TD
 
 ### 1. 安装插件
 
-1. 前往 [Releases 发布页面](https://github.com/sedirk/antigravity-acp-pidesktop/releases) 下载最新版本的 `.piplug` 安装包（如 `local.antigravity-acp-2.2.0.piplug`）。
+1. 前往 [Releases 发布页面](https://github.com/sedirk/antigravity-acp-pidesktop/releases) 下载最新版本的 `.piplug` 安装包（如 `local.antigravity-acp-2.3.0.piplug`）。
 2. 在 **PI-Desktop** 中打开 **设置** → **插件**。
 3. 点击右上角 **从本地安装**，选择刚下载的 `.piplug` 文件。
 4. 安装完成后，插件后台将自动初始化并在默认端口 `41910` 启动网关服务。

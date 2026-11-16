@@ -1,5 +1,16 @@
 # 变更记录
 
+## 2.3.0
+
+- **升级 Google 官方 `agy-acp-server` 运行时至 `1.5.0` 并完成全链路兼容**：
+  - 更新内置官方运行时包描述至 `agy-acp-server-1.5.0-windows-x86_64.zip`（约 101 MB，SHA256 `6163F6B59B381BAE419652DBAE167BC8CDA0EF29D665C0BA8AF3D8C7FDDD8867`，内建 Python 3.14 运行时）；
+  - 修复 Windows 下在线升级已有运行时（如 `1.3.0 → 1.5.0`）的文件锁与并发竞态：采用暂存目录完整性校验解压、`AcpRuntime` 维护态锁定（阻止在途连接重拉旧进程）及同盘目录原子替换与失败自动回滚，并写入 `runtime-meta.json` 版本清单；
+  - 配置面板新增已装运行时版本检测与一键升级提示（精准识别旧版 `1.3.0` 与新版 `1.5.0`），并展示账号订阅等级（如 `Google AI Ultra`）；
+- **适配 ACP `1.5.0` 新增协议能力与真实 Token 计量**：
+  - 接入 `1.5.0` `PromptResponse.usage` 单轮真实 Token 统计（`inputTokens`、`outputTokens`、`thoughtTokens`、`cachedReadTokens`），输出标准 OpenAI `cached_tokens` 与 `reasoning_tokens` 明细并写入用量账本，同时保持 `usage_update` 上下文窗口占用优先以确保 PI-Desktop 进度条准确；
+  - 修复恢复会话或切换模型时 `usage_update` 初始 `used: 0` 覆盖既有非零上下文占用的边界问题；
+  - 按需协商 `1.5.0` `_meta.antigravity.mcpMaxOutputBytes`（默认 256 KB，消除宿主工具桥 `Read`/`Grep`/`Bash` 输出超过 ~2 KB 被截断落盘的问题）及多根目录 `additionalDirectories` 工作区透传，并对旧版运行时保持 100% 向后兼容。
+
 ## 2.2.7
 
 - **主子 Agent 多通道物理隔离（彻底解决 Carbon 与 Hydrogen 互相排队与 switchModel 剧烈震荡）**：

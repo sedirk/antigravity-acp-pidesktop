@@ -28,12 +28,17 @@ const COMMANDS = {
 };
 
 const RUNTIME = {
-  version: '1.3.0',
-  url: 'https://dl.google.com/agy-extensions/releases/windows/agy-acp-server-1.3.0-windows-x86_64.zip',
-  sha256: '65215E0688681FA3116E048A9EAB27EF53AF1BBD6F3DA3F1C52BD4911D8B17F9',
-  archiveBytes: 124509787,
+  version: '1.5.0',
+  url: 'https://dl.google.com/agy-extensions/releases/windows/agy-acp-server-1.5.0-windows-x86_64.zip',
+  sha256: '6163F6B59B381BAE419652DBAE167BC8CDA0EF29D665C0BA8AF3D8C7FDDD8867',
+  archiveBytes: 105513364,
   files: ['agy_acp_server.exe', 'localharness_external.exe'],
 };
+
+const KNOWN_RUNTIME_EXE_BYTES = Object.freeze({
+  81437336: '1.3.0',
+  58314376: '1.5.0',
+});
 
 let pi = null;
 let packageRoot = __dirname;
@@ -74,6 +79,7 @@ function setInstall(patch) {
 }
 
 const INSTALL_BUSY = new Set(['downloading', 'verifying', 'extracting']);
+let runtimeSwapping = false;
 
 function writeLogLine(message) {
   const line = `[${new Date().toISOString()}] ${message}`;
@@ -103,6 +109,25 @@ async function workspaceCwd() {
   } catch (error) {
     writeLogLine(`读取 PI-Desktop 项目目录失败：${String(error && error.message).slice(0, 160)}`);
     return '';
+  }
+}
+
+async function workspaceAdditionalDirs() {
+  try {
+    if (!pi || !pi.workspace || typeof pi.workspace.get !== 'function') return [];
+    const info = await pi.workspace.get();
+    const candidates = [
+      ...(Array.isArray(info && info.additionalDirectories) ? info.additionalDirectories : []),
+      ...(Array.isArray(info && info.additionalRoots) ? info.additionalRoots : []),
+      ...(Array.isArray(info && info.folders) ? info.folders : []),
+      ...(Array.isArray(info && info.roots) ? info.roots : []),
+      ...(Array.isArray(info && info.workspace && info.workspace.folders) ? info.workspace.folders : []),
+    ];
+    return candidates
+      .map((item) => (typeof item === 'string' ? item : (item && typeof item.path === 'string' ? item.path : '')))
+      .filter(Boolean);
+  } catch {
+    return [];
   }
 }
 function reloadConfig() {
@@ -152,14 +177,16 @@ function pidAlive(pid) {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
-function reapOrphans() {
+function reapOrphans(targetDir = runtimeDir()) {
   if (process.platform !== 'win32') return 0;
-  const dir = runtimeDir().toLowerCase();
+  const rawDir = String(targetDir || '').trim();
+  if (!rawDir) return 0;
+  const dirPrefix = (path.resolve(rawDir) + path.sep).toLowerCase();
   const mine = acp && acp.child ? acp.child.pid : 0;
   let killed = 0;
   for (const item of listRuntimeServers()) {
     const exe = String(item.ExecutablePath || '').toLowerCase();
-    if (!dir || !exe.startsWith(dir)) continue;
+    if (!exe.startsWith(dirPrefix)) continue;
     const pid = Number(item.ProcessId);
     if (!pid || pid === mine) continue;
     if (pidAlive(Number(item.ParentProcessId))) continue;
@@ -176,7 +203,7 @@ async function startService({ log: providedLog } = {}) {
   refreshProxy();
   reapOrphans();
   limiter = buildLimiter();
-  acp = new AcpRuntime({ getConfig: () => config, getProxy: () => refreshProxy({ force: false }).url, getCwd: workspaceCwd, log });
+  acp = new AcpRuntime({ getConfig: () => config, getProxy: () => refreshProxy({ force: false }).url, getCwd: workspaceCwd, getAdditionalDirs: workspaceAdditionalDirs, log });
   gateway = createGateway({ acp, limiter, getConfig: () => config, log });
   const base = config.port;
   const port = await gateway.listen([base, base + 1, base + 2, base + 3]);
@@ -262,12 +289,101 @@ async function download(zip) {
   return size;
 }
 
-/** 后台任务：下载 → 校验 → 解压 → 写配置。面板通过 runtime:status 观察。 */
+function psQuote(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+/**
+ * 校验暂存目录后原子切换至正式 runtime 目录：
+ * 1. 先在暂存目录校验全部核心文件并生成 runtime-meta.json，半残解压绝不触碰旧目录；
+ * 2. 锁定 AcpRuntime 维护态并关闭网关/旧进程树，杜绝并发请求在切换窗口重新拉起旧二进制；
+ * 3. 通过同盘目录重命名（dir → backup，stage → dir）完成原子替换，失败时自动回滚并恢复服务。
+ */
+async function swapStagedRuntime(stageDir, dir = runtimeDir(), options = {}) {
+  for (const name of RUNTIME.files) {
+    const candidate = path.join(stageDir, name);
+    let st = null;
+    try { st = fs.statSync(candidate); } catch { st = null; }
+    if (!st || !st.isFile() || st.size <= 0) {
+      try { fs.rmSync(stageDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      throw new Error(`解压后缺少有效的 ${name}`);
+    }
+  }
+  const stagedBin = path.join(stageDir, 'agy_acp_server.exe');
+  const bytes = fs.statSync(stagedBin).size;
+  fs.writeFileSync(path.join(stageDir, 'runtime-meta.json'), `${JSON.stringify({
+    version: RUNTIME.version,
+    sha256: RUNTIME.sha256,
+    exeBytes: bytes,
+    installedAt: new Date().toISOString(),
+  }, null, 2)}\n`, 'utf8');
+
+  const shouldReap = options.reap !== false;
+  const renameFn = typeof options.renameSync === 'function' ? options.renameSync : fs.renameSync;
+  const retryDelayMs = Number.isFinite(options.retryDelayMs) ? Math.max(5, options.retryDelayMs) : 150;
+  const hadService = Boolean(gateway || acp);
+  const backupDir = `${dir}.bak-${process.pid}-${Date.now()}`;
+  let movedLiveToBackup = false;
+  let swapped = false;
+  runtimeSwapping = true;
+  try {
+    if (acp) acp.enterMaintenance('正在升级官方 ACP 运行时，请稍候…');
+    stopService();
+    if (shouldReap) reapOrphans(dir);
+
+    const renameWithRetry = async (fromPath, toPath) => {
+      let lastErr = null;
+      for (let attempt = 0; attempt < 8; attempt++) {
+        try {
+          renameFn(fromPath, toPath);
+          return;
+        } catch (err) {
+          lastErr = err;
+          const code = err && err.code;
+          if (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES') throw err;
+          if (shouldReap) reapOrphans(dir);
+          await new Promise((r) => setTimeout(r, retryDelayMs));
+        }
+      }
+      throw lastErr;
+    };
+
+    fs.mkdirSync(path.dirname(dir), { recursive: true });
+    if (fs.existsSync(dir)) {
+      await renameWithRetry(dir, backupDir);
+      movedLiveToBackup = true;
+    }
+    try {
+      await renameWithRetry(stageDir, dir);
+      swapped = true;
+    } catch (swapErr) {
+      if (movedLiveToBackup && !fs.existsSync(dir) && fs.existsSync(backupDir)) {
+        try { fs.renameSync(backupDir, dir); } catch { /* ignore */ }
+      }
+      throw swapErr;
+    }
+    if (movedLiveToBackup && fs.existsSync(backupDir)) {
+      try { fs.rmSync(backupDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+    return { bin: path.join(dir, 'agy_acp_server.exe'), bytes };
+  } finally {
+    runtimeSwapping = false;
+    if (!swapped && fs.existsSync(stageDir)) {
+      try { fs.rmSync(stageDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+    if (!swapped && hadService && fs.existsSync(path.join(dir, 'agy_acp_server.exe'))) {
+      try { await startService(); } catch (err) { log(`升级回滚后恢复服务失败：${String(err && err.message).slice(0, 160)}`); }
+    }
+  }
+}
+
+/** 后台任务：下载 → 校验 → 暂存解压 → 原子替换 → 写配置。面板通过 runtime:status 观察。 */
 async function runInstall() {
   if (process.platform !== 'win32') throw new Error('自动安装目前只支持 Windows，请手动放置 agy_acp_server.exe');
   const dir = runtimeDir();
-  fs.mkdirSync(dir, { recursive: true });
-  const zip = path.join(dir, `agy-acp-${RUNTIME.version}.zip`);
+  const baseDir = path.dirname(dir);
+  fs.mkdirSync(baseDir, { recursive: true });
+  const zip = path.join(baseDir, `agy-acp-${RUNTIME.version}.zip`);
 
   await download(zip);
 
@@ -279,21 +395,30 @@ async function runInstall() {
   }
 
   setInstall({ phase: 'extracting' });
-  await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `Expand-Archive -LiteralPath '${zip}' -DestinationPath '${dir}' -Force`]);
-  try { fs.unlinkSync(zip); } catch { /* ignore */ }
-  const bin = path.join(dir, 'agy_acp_server.exe');
-  for (const name of RUNTIME.files) {
-    if (!fs.existsSync(path.join(dir, name))) throw new Error(`解压后缺少 ${name}`);
+  const stageDir = path.join(baseDir, `runtime-staging-${process.pid}-${Date.now()}`);
+  fs.rmSync(stageDir, { recursive: true, force: true });
+  fs.mkdirSync(stageDir, { recursive: true });
+  try {
+    const expandCmd = `$ErrorActionPreference = 'Stop'; Expand-Archive -LiteralPath ${psQuote(zip)} -DestinationPath ${psQuote(stageDir)} -Force -ErrorAction Stop`;
+    await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', expandCmd]);
+  } catch (error) {
+    try { fs.rmSync(stageDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    throw error;
+  } finally {
+    try { fs.unlinkSync(zip); } catch { /* ignore */ }
   }
 
+  const { bin, bytes } = await swapStagedRuntime(stageDir, dir);
   const saved = configLib.savePanel(ctx(), { bin }, null);
-  if (!saved.ok) throw new Error(`运行时已下载，但写入配置失败：${(saved.errors || []).join('；')}`);
+  if (!saved.ok) {
+    await restartService().catch(() => {});
+    throw new Error(`运行时已下载，但写入配置失败：${(saved.errors || []).join('；')}`);
+  }
   reloadConfig();
   refreshProxy();
-  const bytes = fs.statSync(bin).size;
   setInstall({ phase: 'done', bytes, bin });
   await restartService();
-  await toast(`Antigravity 运行时已就绪（${Math.round(bytes / 1048576)} MB，SHA256 已校验）`, 'info');
+  await toast(`Antigravity 运行时 v${RUNTIME.version} 已就绪（${Math.round(bytes / 1048576)} MB，SHA256 已校验）`, 'info');
 }
 
 function startInstall() {
@@ -308,6 +433,9 @@ function startInstall() {
 
 /** 删掉 runtime 目录，返回释放的字节数（卸载插件不会自动清理，需要这一步）。 */
 function cleanupRuntime() {
+  if (runtimeSwapping || INSTALL_BUSY.has(installState.phase)) {
+    throw new Error('正在安装或升级运行时，请等待完成后再清理');
+  }
   const dir = runtimeDir();
   const before = dirSize(dir);
   if (!fs.existsSync(dir)) return { ok: true, freedBytes: 0, dir };
@@ -352,6 +480,11 @@ function authStatus() {
  * 运行时内置的 WSGI 临时服务将自动调用 webbrowser.open 弹起默认浏览器完成授权。
  */
 async function loginGoogle() {
+  if (runtimeSwapping || INSTALL_BUSY.has(installState.phase)) {
+    const msg = '正在安装或升级运行时，请等待完成后再登录';
+    await toast(msg, 'warning');
+    return { ok: false, error: msg };
+  }
   const bin = config ? config.bin : configLib.defaultBin(ctx());
   if (!bin || !fs.existsSync(bin)) {
     const msg = '官方运行时尚未下载，请先在面板点击「下载官方运行时」';
@@ -455,7 +588,7 @@ function registerCommands() {
     run: async () => {
       const result = startInstall();
       if (!result.started) { await toast(`已在下载中（${result.phase}），看面板进度即可`, 'info'); return; }
-      await toast('开始下载官方 ACP 运行时（约 120 MB），进度见配置面板', 'info');
+      await toast('开始下载官方 ACP 运行时 v' + RUNTIME.version + '（约 101 MB），进度见配置面板', 'info');
     },
   });
 
@@ -465,10 +598,14 @@ function registerCommands() {
     category: 'AI',
     keywords: ['antigravity', 'agy', '清理', '卸载', 'cleanup', '空间'],
     run: async () => {
-      const result = cleanupRuntime();
-      await toast(result.freedBytes > 0
-        ? `已删除运行时，释放 ${(result.freedBytes / 1048576).toFixed(0)} MB`
-        : '没有可清理的运行时', 'info');
+      try {
+        const result = cleanupRuntime();
+        await toast(result.freedBytes > 0
+          ? `已删除运行时，释放 ${(result.freedBytes / 1048576).toFixed(0)} MB`
+          : '没有可清理的运行时', 'info');
+      } catch (error) {
+        await toast(`清理运行时失败：${String((error && error.message) || error).slice(0, 160)}`, 'warning');
+      }
     },
   });
 }
@@ -481,21 +618,58 @@ function unregisterCommands() {
 
 // ---------------------------------------------------------------- 面板
 
+function detectInstalledVersion(bin) {
+  if (!bin || !fs.existsSync(bin)) return '';
+  const activeBin = config && config.bin ? config.bin : '';
+  if (
+    acp &&
+    acp.ready &&
+    acp.agentInfo &&
+    acp.agentInfo.version &&
+    activeBin &&
+    path.resolve(activeBin).toLowerCase() === path.resolve(bin).toLowerCase()
+  ) {
+    return String(acp.agentInfo.version);
+  }
+  let exeBytes = 0;
+  try { exeBytes = fs.statSync(bin).size; } catch { return ''; }
+  try {
+    const metaFile = path.join(path.dirname(bin), 'runtime-meta.json');
+    if (fs.existsSync(metaFile)) {
+      const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+      if (meta && meta.version && (!meta.exeBytes || Number(meta.exeBytes) === exeBytes)) {
+        return String(meta.version);
+      }
+    }
+  } catch { /* ignore */ }
+  return KNOWN_RUNTIME_EXE_BYTES[exeBytes] || '';
+}
+
 function runtimeStatus() {
   const bin = config ? config.bin : configLib.defaultBin(ctx());
   const dir = runtimeDir();
+  const binExists = Boolean(bin) && fs.existsSync(bin);
+  const installedVersion = binExists ? detectInstalledVersion(bin) : '';
+  const dirPrefix = dir ? (path.resolve(dir) + path.sep).toLowerCase() : '';
+  const isManagedBin = Boolean(bin && dirPrefix) && path.resolve(bin).toLowerCase().startsWith(dirPrefix);
+  const updateAvailable = Boolean(binExists && isManagedBin && installedVersion && installedVersion !== RUNTIME.version);
   return {
     ...installState,
-    busy: INSTALL_BUSY.has(installState.phase),
+    busy: runtimeSwapping || INSTALL_BUSY.has(installState.phase),
+    ready: Boolean(acp && acp.ready),
+    pid: acp && acp.child ? acp.child.pid : null,
     bin: bin || '',
-    binExists: Boolean(bin) && fs.existsSync(bin),
+    binExists,
     dir,
     dirBytes: dirSize(dir),
     expectedBytes: RUNTIME.archiveBytes,
     version: RUNTIME.version,
+    installedVersion,
+    updateAvailable,
     sha256: RUNTIME.sha256,
     proxy: resolvedProxy,
     auth: authStatus(),
+    tier: (acp && acp.tierInfo) || null,
   };
 }
 
@@ -508,7 +682,7 @@ async function onPanelInvoke(channel, payload) {
     if (!result.ok) return result;
     reloadConfig();
     refreshProxy();
-    if (!gateway) return { ...result, restarted: false };
+    if (!gateway || runtimeSwapping) return { ...result, restarted: false };
     try {
       const started = await restartService();
       log(`配置面板保存：${result.changed.join(', ') || '(无变化)'} · 端口 ${started.port}`);
@@ -538,6 +712,7 @@ async function onPanelInvoke(channel, payload) {
   if (channel === 'auth:status') return authStatus();
   if (channel === 'auth:login') return await loginGoogle();
   if (channel === 'runtime:restart') {
+    if (runtimeSwapping) return { ok: false, error: '正在升级运行时，请稍候' };
     if (!gateway) return { ok: false, error: '网关未运行' };
     try {
       const result = gateway.restartRuntime('panel');
@@ -608,8 +783,15 @@ module.exports = {
     // 首次使用引导：缺少运行时时主动提示，不依赖用户先读 README
     if (!config.bin || !fs.existsSync(config.bin)) {
       setTimeout(() => {
-        void toast('Antigravity 插件还没安装运行时。打开「Antigravity: 打开配置面板」→ 点「下载官方运行时」（约 120 MB）。', 'warning');
+        void toast(`Antigravity 插件还没安装运行时。打开「Antigravity: 打开配置面板」→ 点「下载官方运行时」（v${RUNTIME.version}，约 101 MB）。`, 'warning');
       }, 1500);
+    } else {
+      const rt = runtimeStatus();
+      if (rt.updateAvailable) {
+        setTimeout(() => {
+          void toast(`检测到官方 ACP 运行时新版本 v${RUNTIME.version}（当前 v${rt.installedVersion}），可在「Antigravity: 打开配置面板」一键升级（约 101 MB）。`, 'info');
+        }, 1500);
+      }
     }
   },
 
@@ -632,6 +814,8 @@ module.exports = {
     stopService,
     restartService,
     startInstall,
+    swapStagedRuntime,
+    psQuote,
     cleanupRuntime,
     runtimeStatus,
     registerCommands,
