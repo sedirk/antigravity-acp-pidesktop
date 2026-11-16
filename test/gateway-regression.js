@@ -1310,7 +1310,7 @@ async function main() {
       }
     });
 
-    await check('high-context consecutive tool bursts apply smooth pacing to prevent TPM 429', async () => {
+    await check('high-context consecutive tool bursts complete immediately without deadlocks or artificial stalls', async () => {
       const p = await (async () => { const s = net.createServer(); await new Promise((r) => s.listen(0, '127.0.0.1', r)); const pt = s.address().port; await new Promise((r) => s.close(r)); return pt; })();
       let mcpUrlSeen = '';
       let acpRef;
@@ -1370,7 +1370,7 @@ async function main() {
             assert.ok(sse.includes('四轮工具微节流完成'), '最终轮正常输出汇总文本');
           }
         }
-        assert.ok(logs.some((l) => l.includes('桥接微节流：高上下文（220000 tokens，连续第 4 轮工具回填）')), `第 4 次连续高上下文工具回填必须触发微节流日志，实际日志: ${logs.join(' | ')}`);
+        assert.ok(!logs.some((l) => l.includes('QUEUE_TIMEOUT')), '运行过程中不得出现队列超时');
       } finally {
         gw.close();
         try { fs.rmSync(pcDir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -1947,7 +1947,7 @@ async function main() {
             if (entry && entry.mcpUrl && promptCalls.filter((x) => x.sid === sid).length === 1) {
               const sseRes = await fetch(entry.mcpUrl, {
                 method: 'POST', headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'Edit', arguments: { path: 'lib/core.js' } } }),
+                body: JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'Edit', arguments: { path: 'lib/core.js', tag: 'DEAD', ops: 'PUT 1.=1:\n+x' } } }),
               });
               const rawToolReply = await sseRes.text();
               mcpToolOutputs.push({ sid, rawToolReply });
@@ -2307,6 +2307,800 @@ async function main() {
         assert.ok(g3Cont.includes('doc-preserved-ok'));
         const secondSid3Prompt = JSON.stringify(promptsSeen.filter((x) => x.sid === 'guard-sid-3')[1]?.prompt || '');
         assert.ok(secondSid3Prompt.includes('spec-line-anchor-rules') && secondSid3Prompt.includes('INVALID_ARGUMENT'), '多条新增用户消息含附件时必须走完整块发送并保留文档与工具结果');
+      } finally {
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    await check('concurrent subagents sharing prompt_cache_key run in parallel lanes without steering collision', async () => {
+      const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'ag-sublanes-'));
+      const subCfg = { ...config, concurrency: 4, source: path.join(dir, 'config.json') };
+      const mcpBySid = new Map();
+      const cancels = [];
+      let seq = 0;
+      let activeInFlight = 0;
+      let maxParallel = 0;
+      let releaseBarrier;
+      const allThreeEntered = new Promise((resolve) => { releaseBarrier = resolve; });
+      let enteredCount = 0;
+
+      const acpSub = {
+        policyBySession: new Map(),
+        discover: async () => {},
+        resolveModel: (m) => m,
+        cwdFor: async () => dir,
+        start: async () => {},
+        status: () => ({ running: true }),
+        notify: (method, params) => {
+          if (method === 'session/cancel') cancels.push(params.sessionId);
+        },
+        abandon: () => 0,
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            const sid = `sub-lane-${++seq}`;
+            if (params.mcpServers && params.mcpServers[0]) mcpBySid.set(sid, params.mcpServers[0].url);
+            return { sessionId: sid };
+          }
+          if (method === 'session/prompt') {
+            const sid = params.sessionId;
+            const txt = params.prompt.map((b) => b.text || '').join('\n');
+            const matchIdx = /SUBTASK_#(\d+)/.exec(txt);
+            const idx = matchIdx ? Number(matchIdx[1]) : 0;
+            activeInFlight += 1;
+            if (activeInFlight > maxParallel) maxParallel = activeInFlight;
+            enteredCount += 1;
+            if (enteredCount === 3) releaseBarrier();
+            await allThreeEntered;
+            try {
+              const mcpUrl = mcpBySid.get(sid);
+              const toolRes = await fetch(mcpUrl, {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id: idx, method: 'tools/call', params: { name: 'Read', arguments: { path: `file-${idx}.txt` } } }),
+              }).then(async (r) => { const raw = await r.text(); const dm = /^data:\s*(.+)$/m.exec(raw); return dm ? JSON.parse(dm[1]) : JSON.parse(raw); });
+              const content = toolRes?.result?.content?.[0]?.text || '';
+              assert.ok(!toolRes?.result?.isError, `子代理 #${idx} 工具调用不得被误判中断: ${JSON.stringify(toolRes)}`);
+              acpSub.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `DONE_${idx}:${content}` } } },
+              });
+              return { stopReason: 'end_turn' };
+            } finally {
+              activeInFlight -= 1;
+            }
+          }
+          return {};
+        },
+      };
+      const gw = createGateway({ acp: acpSub, limiter: { run: (f) => f(), stats: () => ({ active: activeInFlight }) }, getConfig: () => subCfg, log: () => {} });
+      const p = await gw.listen([0]);
+      const subTools = [{ type: 'function', name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } }];
+      const parseSse = async (r) => {
+        const raw = await r.text();
+        return raw.split('\n\n').filter(Boolean).map((blk) => {
+          const ev = /^event: (.+)$/m.exec(blk)?.[1];
+          const d = /^data: (.+)$/m.exec(blk)?.[1];
+          return ev && d ? { type: ev, data: JSON.parse(d) } : null;
+        }).filter(Boolean);
+      };
+      try {
+        const runOneSubagent = async (idx) => {
+          const instructions = 'You are nuaa-zxh fast exploration subagent.';
+          const userTask = `Investigate module for SUBTASK_#${idx}`;
+          const ev1 = await parseSse(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              model: 'gemini-4-hydrogen', stream: true, prompt_cache_key: 'shared-workspace-cache-key',
+              instructions, tools: subTools, input: [{ role: 'user', content: userTask }],
+            }),
+          }));
+          const done1 = ev1.find((e) => e.type === 'response.completed');
+          assert.ok(done1, `子代理 #${idx} 首轮必须正常返回 response.completed，不得被截断`);
+          const fc = done1.data.response.output.find((o) => o.type === 'function_call');
+          assert.ok(fc, `子代理 #${idx} 首轮应返回挂起的 Read function_call`);
+          const ev2 = await parseSse(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              model: 'gemini-4-hydrogen', stream: true, prompt_cache_key: 'shared-workspace-cache-key',
+              instructions, tools: subTools,
+              input: [
+                { role: 'user', content: userTask },
+                { type: 'function_call', call_id: fc.call_id, name: 'Read', arguments: fc.arguments },
+                { type: 'function_call_output', call_id: fc.call_id, output: `DATA_${idx}` },
+              ],
+            }),
+          }));
+          const done2 = ev2.find((e) => e.type === 'response.completed');
+          assert.ok(done2, `子代理 #${idx} 续流轮必须返回 response.completed`);
+          const msg = done2.data.response.output.find((o) => o.type === 'message')?.content?.[0]?.text || '';
+          assert.equal(msg, `DONE_${idx}:DATA_${idx}`, `子代理 #${idx} 工具回填结果必须精确路由，不得串台`);
+        };
+        await Promise.all([runOneSubagent(1), runOneSubagent(2), runOneSubagent(3)]);
+        assert.equal(seq, 3, '3 个同缓存键并发子代理应分配 3 个独立会话');
+        assert.equal(maxParallel, 3, '3 个子代理应真正并发进入 session/prompt，前两个不得挂死等待');
+        assert.equal(cancels.length, 0, '并发子代理不得相互触发 Steering 取消');
+      } finally {
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    await check('parent parked on 30ms-staggered parallel Task batch stays intact while 3 shared-key subagents run', async () => {
+      const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'ag-parent-sub-'));
+      const psCfg = { ...config, concurrency: 4, source: path.join(dir, 'config.json') };
+      const mcpBySid = new Map();
+      const cancels = [];
+      let seq = 0;
+
+      const acpPs = {
+        policyBySession: new Map(),
+        discover: async () => {},
+        resolveModel: (m) => m,
+        cwdFor: async () => dir,
+        start: async () => {},
+        status: () => ({ running: true }),
+        notify: (method, params) => {
+          if (method === 'session/cancel') cancels.push(params.sessionId);
+        },
+        abandon: () => 0,
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            const sid = `ps-sess-${++seq}`;
+            if (params.mcpServers && params.mcpServers[0]) mcpBySid.set(sid, params.mcpServers[0].url);
+            return { sessionId: sid };
+          }
+          if (method === 'session/prompt') {
+            const sid = params.sessionId;
+            const mcpUrl = mcpBySid.get(sid);
+            const txt = params.prompt.map((b) => b.text || '').join('\n');
+            if (txt.includes('PARENT_DISPATCH_3_SUBAGENTS')) {
+              const callTask = (i) => fetch(mcpUrl, {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id: 100 + i, method: 'tools/call', params: { name: 'Task', arguments: { agent: 'nuaa-zxh', task: `sub-${i}` } } }),
+              }).then(async (r) => { const raw = await r.text(); const dm = /^data:\s*(.+)$/m.exec(raw); return dm ? JSON.parse(dm[1]) : JSON.parse(raw); });
+              // 模拟 agy_acp_server 逐个派发并行 MCP tools/call（每次间隔 30ms，旧版 20ms 窗口会被拆碎）
+              const p1 = callTask(1);
+              await new Promise((r) => setTimeout(r, 30));
+              const p2 = callTask(2);
+              await new Promise((r) => setTimeout(r, 30));
+              const p3 = callTask(3);
+              const [r1, r2, r3] = await Promise.all([p1, p2, p3]);
+              for (const r of [r1, r2, r3]) {
+                assert.ok(!r?.result?.isError, `父会话挂起的 Task 工具不得被子代理抢占取消: ${JSON.stringify(r)}`);
+              }
+              const joined = [r1, r2, r3].map((r) => r.result.content[0].text).join('|');
+              acpPs.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `PARENT_FINAL:${joined}` } } },
+              });
+              return { stopReason: 'end_turn' };
+            }
+            const m = /CHILD_WORK_(\d+)/.exec(txt);
+            const cIdx = m ? m[1] : '0';
+            acpPs.onNotification({
+              method: 'session/update',
+              params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `CHILD_OK_${cIdx}` } } },
+            });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const gw = createGateway({ acp: acpPs, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => psCfg, log: () => {} });
+      const p = await gw.listen([0]);
+      const parentTools = [{ type: 'function', name: 'Task', parameters: { type: 'object', properties: { agent: { type: 'string' }, task: { type: 'string' } } } }];
+      const childTools = [{ type: 'function', name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } }];
+      const parseSse = async (r) => {
+        const raw = await r.text();
+        return raw.split('\n\n').filter(Boolean).map((blk) => {
+          const ev = /^event: (.+)$/m.exec(blk)?.[1];
+          const d = /^data: (.+)$/m.exec(blk)?.[1];
+          return ev && d ? { type: ev, data: JSON.parse(d) } : null;
+        }).filter(Boolean);
+      };
+      try {
+        const parentTurn1 = await parseSse(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-hydrogen', stream: true, prompt_cache_key: 'shared-parent-child-key',
+            instructions: 'You are PI-Desktop main agent.', tools: parentTools,
+            input: [{ role: 'user', content: 'PARENT_DISPATCH_3_SUBAGENTS' }],
+          }),
+        }));
+        const pDone1 = parentTurn1.find((e) => e.type === 'response.completed');
+        const fcs = pDone1.data.response.output.filter((o) => o.type === 'function_call');
+        assert.equal(fcs.length, 3, '间隔 30ms 派发的 3 个并行 Task 调用必须合并在同一轮返回宿主');
+
+        // 父会话挂起期间，3 个子代理带着完全相同的 prompt_cache_key 并发请求网关
+        const childOutputs = await Promise.all([1, 2, 3].map(async (i) => {
+          const cEv = await parseSse(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              model: 'gemini-4-hydrogen', stream: true, prompt_cache_key: 'shared-parent-child-key',
+              instructions: 'You are nuaa-zxh subagent.', tools: childTools,
+              input: [{ role: 'user', content: `CHILD_WORK_${i}` }],
+            }),
+          }));
+          const cDone = cEv.find((e) => e.type === 'response.completed');
+          assert.ok(cDone, `子代理 #${i} 应正常完成`);
+          return cDone.data.response.output.find((o) => o.type === 'message').content[0].text;
+        }));
+        assert.deepEqual(childOutputs, ['CHILD_OK_1', 'CHILD_OK_2', 'CHILD_OK_3']);
+        assert.equal(cancels.length, 0, '父子共享 prompt_cache_key 时绝不能互相发送 session/cancel');
+
+        const parentTurn2 = await parseSse(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-hydrogen', stream: true, prompt_cache_key: 'shared-parent-child-key',
+            instructions: 'You are PI-Desktop main agent.', tools: parentTools,
+            input: [
+              { role: 'user', content: 'PARENT_DISPATCH_3_SUBAGENTS' },
+              ...fcs.map((fc) => ({ type: 'function_call', call_id: fc.call_id, name: fc.name, arguments: fc.arguments })),
+              ...fcs.map((fc, idx) => ({ type: 'function_call_output', call_id: fc.call_id, output: childOutputs[idx] })),
+            ],
+          }),
+        }));
+        const pDone2 = parentTurn2.find((e) => e.type === 'response.completed');
+        const finalMsg = pDone2.data.response.output.find((o) => o.type === 'message').content[0].text;
+        assert.equal(finalMsg, 'PARENT_FINAL:CHILD_OK_1|CHILD_OK_2|CHILD_OK_3');
+      } finally {
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    await check('preflight contract guard intercepts malformed Edit/Task in MCP without consuming host retry budget and auto-normalizes valid aliases', async () => {
+      const p = await (async () => { const s = net.createServer(); await new Promise((r) => s.listen(0, '127.0.0.1', r)); const pt = s.address().port; await new Promise((r) => s.close(r)); return pt; })();
+      const dir = path.join(process.env.PI_SCRATCH_DIR || process.cwd(), `gw-preflight-${Date.now()}`);
+      const { createLimiter } = require('../lib/core.js');
+      const lim = createLimiter({ limit: 2, maxQueue: 4, queueTimeoutMs: 2000 });
+      const interceptedReplies = [];
+      let acpRef;
+      const acpMock = {
+        policyBySession: new Map(), start: async () => {}, discover: async () => {},
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        resolveModel: (m) => m, status: () => ({ running: true, ready: true }),
+        notify: () => {},
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            return { sessionId: 'pf-sid-1', models: { currentModelId: 'test', availableModels: [], mcpUrl: params.mcpServers?.[0]?.url || '' }, _mcpUrl: params.mcpServers?.[0]?.url || '' };
+          }
+          if (method === 'session/close') return {};
+          if (method === 'session/prompt') {
+            const sid = params.sessionId;
+            const mcpUrl = acpMock._lastMcpUrl;
+            // 1) 误传 old_string/new_string
+            const bad1 = await fetch(mcpUrl, {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'Edit', arguments: { file_path: 'lib/core.js', old_string: 'a', new_string: 'b' } } }),
+            }).then((r) => r.text());
+            interceptedReplies.push(bad1);
+            // 2) PUT 漏末尾冒号
+            const bad2 = await fetch(mcpUrl, {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'Edit', arguments: { path: 'lib/core.js', tag: 'fb2a', ops: 'PUT 5.=5\n+missing_colon' } } }),
+            }).then((r) => r.text());
+            interceptedReplies.push(bad2);
+            // 3) Task 误传 subagent_type/prompt
+            const bad3 = await fetch(mcpUrl, {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'Task', arguments: { subagent_type: 'nuaa-zxh', prompt: 'check' } } }),
+            }).then((r) => r.text());
+            interceptedReplies.push(bad3);
+            // 4) 模型修正后传入合法别名与单行简写：file_path + 小写 tag + PUT 5:
+            const okEdit = await fetch(mcpUrl, {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'Edit', arguments: { file_path: 'lib/core.js', tag: 'fb2a', ops: 'PUT 5:\n+healed_line' } } }),
+            }).then((r) => r.text());
+            if (okEdit.includes('EDIT_APPLIED_OK')) {
+              acpRef.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'PREFLIGHT_FLOW_SUCCESS' } } },
+              });
+            }
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const origReq = acpMock.request;
+      acpMock.request = async (method, params) => {
+        if (method === 'session/new') acpMock._lastMcpUrl = params.mcpServers?.[0]?.url || '';
+        return origReq(method, params);
+      };
+      acpRef = acpMock;
+      const gw = createGateway({
+        acp: acpMock, limiter: lim,
+        getConfig: () => ({ ...config, concurrency: 2, source: path.join(dir, 'config.json') }),
+        log: () => {},
+      });
+      await gw.listen([p]);
+      const hostTools = [
+        {
+          type: 'function', name: 'Edit',
+          parameters: {
+            type: 'object',
+            properties: { path: { type: 'string' }, file_path: { type: 'string' }, tag: { type: 'string' }, ops: { type: 'string' }, old_string: { type: 'string' }, new_string: { type: 'string' } },
+          },
+        },
+        {
+          type: 'function', name: 'Task',
+          parameters: { type: 'object', required: ['agent', 'task'], properties: { agent: { type: 'string' }, task: { type: 'string' } } },
+        },
+      ];
+      try {
+        const r1 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'pf-key', tools: hostTools, input: [{ role: 'user', content: '更新第 5 行' }] }),
+        }).then((r) => r.text());
+        assert.equal(interceptedReplies.length, 3, '前 3 次违例工具调用必须在 MCP 内部原地拦截返回');
+        assert.ok(interceptedReplies.every((x) => x.includes('"isError":true')), '被拦截调用必须标记 isError:true');
+        const uniqueCallIds = [...new Set([...r1.matchAll(/"call_id":"(call_[^"]+)"/g)].map((m) => m[1]))];
+        assert.equal(uniqueCallIds.length, 1, '宿主只应收到修正后的那 1 次合法 Edit 调用（零消耗宿主重试预算）');
+        assert.ok(r1.includes('\\"path\\":\\"lib/core.js\\"') && r1.includes('\\"tag\\":\\"FB2A\\"') && r1.includes('PUT 5.=5:'), `应完成 file_path/tag/PUT 单行无损归一，实际: ${r1}`);
+        const cid = uniqueCallIds[0];
+        const r2 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'pf-key', tools: hostTools,
+            input: [
+              { role: 'user', content: '更新第 5 行' },
+              { type: 'function_call', call_id: cid, name: 'Edit', arguments: '{"path":"lib/core.js","tag":"FB2A","ops":"PUT 5.=5:\\n+healed_line"}' },
+              { type: 'function_call_output', call_id: cid, output: 'EDIT_APPLIED_OK' },
+            ],
+          }),
+        }).then((r) => r.text());
+        assert.ok(r2.includes('PREFLIGHT_FLOW_SUCCESS'), `回填后应顺利收尾，实际: ${r2}`);
+      } finally {
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    await check('unreturned tool_output after MUTATION_RETRY_BUDGET_EXHAUSTED recovers cleanly on regenerate, turn-1 edit, and 2-char CJK compaction without orphan sub-lanes', async () => {
+      const p = await (async () => { const s = net.createServer(); await new Promise((r) => s.listen(0, '127.0.0.1', r)); const pt = s.address().port; await new Promise((r) => s.close(r)); return pt; })();
+      const dir = path.join(process.env.PI_SCRATCH_DIR || process.cwd(), `gw-mut-unret-${Date.now()}`);
+      const { createLimiter } = require('../lib/core.js');
+      const lim = createLimiter({ limit: 1, maxQueue: 4, queueTimeoutMs: 1500 });
+      const createdSids = [];
+      const cancels = [];
+      let promptSeq = 0;
+      let acpRef;
+      const acpMock = {
+        policyBySession: new Map(), start: async () => {}, discover: async () => {},
+        cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
+        resolveModel: (m) => m, status: () => ({ running: true, ready: true }),
+        notify: (method, params) => {
+          if (method === 'session/cancel') cancels.push(params.sessionId);
+        },
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            const sid = `unret-sid-${createdSids.length + 1}`;
+            const mcpUrl = params.mcpServers?.[0]?.url || '';
+            createdSids.push({ sid, mcpUrl });
+            return { sessionId: sid, models: { currentModelId: 'test', availableModels: [] } };
+          }
+          if (method === 'session/close') return {};
+          if (method === 'session/prompt') {
+            const sid = params.sessionId;
+            const pText = JSON.stringify(params.prompt || '');
+            if (pText.includes('context summarization assistant')) {
+              acpRef.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '<summary>short cjk summary</summary>' } } },
+              });
+              return { stopReason: 'end_turn' };
+            }
+            promptSeq += 1;
+            const entry = createdSids.find((x) => x.sid === sid);
+            if (promptSeq <= 3 && entry && entry.mcpUrl) {
+              await fetch(entry.mcpUrl, {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id: promptSeq, method: 'tools/call', params: { name: 'Edit', arguments: { path: 'a.js', tag: 'BEEF', ops: 'PUT 1.=1:\n+v' + promptSeq } } }),
+              }).then((r) => r.text());
+              return { stopReason: 'end_turn' };
+            }
+            acpRef.onNotification({
+              method: 'session/update',
+              params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'RECOVERED_AFTER_COMPACT' } } },
+            });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      acpRef = acpMock;
+      const gw = createGateway({
+        acp: acpMock, limiter: lim,
+        getConfig: () => ({ ...config, concurrency: 1, source: path.join(dir, 'config.json') }),
+        log: () => {},
+      });
+      await gw.listen([p]);
+      const parentTools = [
+        { type: 'function', name: 'Edit', parameters: { type: 'object', required: ['path', 'tag', 'ops'], properties: { path: { type: 'string' }, tag: { type: 'string' }, ops: { type: 'string' } } } },
+        { type: 'function', name: 'Task', parameters: { type: 'object', required: ['agent', 'task'], properties: { agent: { type: 'string' }, task: { type: 'string' } } } },
+      ];
+      try {
+        // 第 1 轮：2 字中文短指令挂起在 Edit，宿主本地熔断未回传 tool_output
+        const t1 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'unret-pk', instructions: 'Parent sys', tools: parentTools, input: [{ role: 'user', content: '修复' }] }),
+        }).then((r) => r.text());
+        assert.ok(t1.includes('"call_id":"call_'), '首轮挂起在 Edit');
+
+        // 第 2 轮：用户点击「重新生成 / 重试」（无 tool_output，首句相同）→ 必须命中原通道取消旧挂起，绝不误分流到 _sub1
+        const t2 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'unret-pk', instructions: 'Parent sys', tools: parentTools, input: [{ role: 'user', content: '修复' }] }),
+        }).then((r) => r.text());
+        assert.ok(t2.includes('"call_id":"call_'), '重试轮次应正常重新挂起而非卡死');
+        assert.ok(!createdSids.some((x) => x.mcpUrl.includes('_sub')), `重试不得分配 _sub 孤儿通道，实际: ${JSON.stringify(createdSids)}`);
+
+        // 第 3 轮：熔断未回传 tool_output 后用户追加新指令继续（保留首句前缀）→ 必须命中原通道取消旧挂起，绝不误分流到 _sub1
+        const t3 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'unret-pk', instructions: 'Parent sys', tools: parentTools, input: [{ role: 'user', content: '修复' }, { role: 'user', content: '彻底修复' }] }),
+        }).then((r) => r.text());
+        assert.ok(t3.includes('"call_id":"call_'), '追加指令重发应正常执行');
+        assert.ok(!createdSids.some((x) => x.mcpUrl.includes('_sub')), '追加指令重发不得分配 _sub 孤儿通道');
+
+        // 第 4 轮：无 prompt_cache_key 的自动压缩（匹配短中文历史锚点「彻底修复」）→ 释放挂起后完成压缩与续推
+        const cRes = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: false,
+            instructions: 'You are a context summarization assistant.',
+            input: [{ role: 'user', content: 'Summarize the entire conversation:\nUser: 彻底修复' }],
+          }),
+        });
+        assert.equal(cRes.status, 200);
+
+        const t4 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'unret-pk', instructions: 'Parent sys', tools: parentTools,
+            input: [
+              { role: 'user', content: 'The conversation history before this point was compacted into the following summary:\n<summary>short cjk summary</summary>\n\n继续收尾' },
+            ],
+          }),
+        }).then((r) => r.text());
+        assert.ok(t4.includes('RECOVERED_AFTER_COMPACT'), `压缩后续推应正常收尾且无 AGENT_BUSY，实际: ${t4}`);
+        assert.ok(!createdSids.some((x) => x.mcpUrl.includes('_sub')), '全程不得产生任何 _sub 孤儿通道');
+      } finally {
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+    await check('aborted auxiliary UI requests and subagent compaction sharing prompt_cache_key never kill parked main bridge', async () => {
+      const p = await (async () => { const s = net.createServer(); await new Promise((r) => s.listen(0, '127.0.0.1', r)); const pt = s.address().port; await new Promise((r) => s.close(r)); return pt; })();
+      const dir = path.join(process.env.PI_SCRATCH_DIR || process.cwd(), `gw-aux-disconnect-${Date.now()}`);
+      const { createLimiter } = require('../lib/core.js');
+      const lim = createLimiter({ limit: 1, maxQueue: 8, queueTimeoutMs: 5000 });
+      const cancelledSids = [];
+      let mainMcpUrl = '';
+      let auxStreamHoldRelease = null;
+      let auxStreamStartedResolve = null;
+      const auxStreamStarted = new Promise((r) => { auxStreamStartedResolve = r; });
+      let sidSeq = 0;
+      const acpMock = {
+        policyBySession: new Map(), start: async () => {}, discover: async () => {},
+        cwdFor: async () => process.cwd(), resolveModel: (m) => m, status: () => ({ running: true, ready: true }),
+        notify: (method, params) => {
+          if (method === 'session/cancel' && params && params.sessionId) cancelledSids.push(params.sessionId);
+        },
+        abandon: () => 1,
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            const sid = `iso-sess-${++sidSeq}`;
+            const url = params.mcpServers && params.mcpServers[0] && params.mcpServers[0].url;
+            if (url && !mainMcpUrl) mainMcpUrl = url;
+            return { sessionId: sid, models: { currentModelId: 'test', availableModels: [] } };
+          }
+          if (method === 'session/close') return {};
+          if (method === 'session/prompt') {
+            const sid = params.sessionId;
+            const pText = (params.prompt || []).map((b) => b.text || '').join('\n');
+            if (pText.includes("predict the user's next message")) {
+              if (auxStreamStartedResolve) { auxStreamStartedResolve(sid); auxStreamStartedResolve = null; }
+              await new Promise((r) => { auxStreamHoldRelease = r; });
+              return { stopReason: 'cancelled' };
+            }
+            if (pText.includes('Summarize the entire conversation')) {
+              acpMock.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '<summary>subagent compacted</summary>' } } },
+              });
+              return { stopReason: 'end_turn' };
+            }
+            // 主会话首轮：调 Task 挂起，等待宿主回填
+            const callTask = await fetch(mainMcpUrl, {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'Task', arguments: { agent: 'research', task: 'check module' } } }),
+            }).then((r) => r.text());
+            assert.ok(!callTask.includes('"isError":true') && callTask.includes('SUBAGENT_DONE'), `主会话挂起的 Task 绝不能被辅助请求断流或子代理压缩误杀，实际: ${callTask}`);
+            acpMock.onNotification({
+              method: 'session/update',
+              params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'PARENT_RESUMED_INTACT' } } },
+            });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const gw = createGateway({ acp: acpMock, limiter: lim, getConfig: () => config, log: () => {}, dataDir: dir });
+      await gw.listen([p]);
+      const tools = [{
+        type: 'function', name: 'Task',
+        parameters: { type: 'object', required: ['agent', 'task'], properties: { agent: { type: 'string' }, task: { type: 'string' } } },
+      }];
+      try {
+        const r1 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'shared-aux-pk', tools, input: [{ role: 'user', content: 'run subagent check' }] }),
+        }).then((r) => r.text());
+        const taskCallId = /"call_id":"(call_[^"]+)"/.exec(r1)?.[1];
+        assert.ok(taskCallId, `主会话应挂起在 Task 工具上，实际: ${r1}`);
+
+        // 1) 发起带相同 prompt_cache_key 的辅助追问预测请求，并在 active 流式中主动 abort（模拟宿主切换状态断流）
+        const acActive = new AbortController();
+        const aux1Promise = fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' }, signal: acActive.signal,
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'shared-aux-pk',
+            instructions: "You predict the user's next message, not the assistant's answer.",
+            input: [{ role: 'user', content: 'run subagent check' }],
+          }),
+        }).catch(() => null);
+        const auxSid = await auxStreamStarted;
+
+        // 2) 在单并发槽位被 aux1 占住时，再发起第 2 个排队中的辅助请求并立刻 abort（覆盖 !task.active 分支）
+        const acQueued = new AbortController();
+        const aux2Promise = fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' }, signal: acQueued.signal,
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'shared-aux-pk',
+            instructions: "You predict the user's next message, not the assistant's answer.",
+            input: [{ role: 'user', content: 'queued prediction' }],
+          }),
+        }).catch(() => null);
+        await new Promise((r) => setTimeout(r, 40));
+        acQueued.abort();
+        acActive.abort();
+        await new Promise((r) => setTimeout(r, 50));
+        if (auxStreamHoldRelease) auxStreamHoldRelease();
+        await Promise.all([aux1Promise, aux2Promise]);
+
+        assert.ok(!cancelledSids.includes('iso-sess-1'), `辅助请求断流绝不能向主会话发送 session/cancel，实际取消列表: ${JSON.stringify(cancelledSids)}`);
+        assert.ok(cancelledSids.includes(auxSid), '活跃辅助请求断流应正常取消辅助会话自身以释放槽位');
+
+        // 3) 子代理携带相同 prompt_cache_key 触发自动压缩：不得误杀父会话挂起的 Task
+        const subCompact = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: false, prompt_cache_key: 'shared-aux-pk',
+            instructions: 'You are a context summarization assistant.',
+            input: [{ role: 'user', content: 'Summarize the entire conversation:\nUser: subagent internal prompt' }],
+          }),
+        });
+        assert.equal(subCompact.status, 200);
+        assert.ok(!cancelledSids.includes('iso-sess-1'), '子代理压缩绝不能抢占父会话挂起的 Task');
+
+        // 4) 宿主回填 Task 结果，主会话无损恢复收尾
+        const r2 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'shared-aux-pk', tools,
+            input: [
+              { role: 'user', content: 'run subagent check' },
+              { type: 'function_call', call_id: taskCallId, name: 'Task', arguments: '{"agent":"research","task":"check module"}' },
+              { type: 'function_call_output', call_id: taskCallId, output: 'SUBAGENT_DONE' },
+            ],
+          }),
+        }).then((r) => r.text());
+        assert.ok(r2.includes('PARENT_RESUMED_INTACT'), `父会话应无损恢复收尾，实际: ${r2}`);
+      } finally {
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+    await check('rapid multi-steering, subagent Task/prefix protection, and sibling-lane compaction never cross-stream or cancel wrong lane', async () => {
+      const p = await (async () => { const s = net.createServer(); await new Promise((r) => s.listen(0, '127.0.0.1', r)); const pt = s.address().port; await new Promise((r) => s.close(r)); return pt; })();
+      const dir = path.join(process.env.PI_SCRATCH_DIR || process.cwd(), `gw-p1-guards-${Date.now()}`);
+      const { createLimiter } = require('../lib/core.js');
+      const lim = createLimiter({ limit: 4, maxQueue: 16, queueTimeoutMs: 5000 });
+      let sidSeq = 0;
+      const mcpUrlsBySid = new Map();
+      let acpRef;
+      let releaseSlowCancel = null;
+      const acpMock = {
+        policyBySession: new Map(), start: async () => {}, discover: async () => {},
+        cwdFor: async () => process.cwd(), resolveModel: (m) => m, status: () => ({ running: true, ready: true }),
+        notify: () => {},
+        abandon: () => 1,
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            const sid = `p1-sess-${++sidSeq}`;
+            const url = params.mcpServers && params.mcpServers[0] && params.mcpServers[0].url;
+            if (url) mcpUrlsBySid.set(sid, url);
+            return { sessionId: sid, models: { currentModelId: 'test', availableModels: [] } };
+          }
+          if (method === 'session/close') return {};
+          if (method === 'session/prompt') {
+            const sid = params.sessionId;
+            const txt = (params.prompt || []).map((b) => b.text || '').join('\n');
+            const mUrl = mcpUrlsBySid.get(sid) || '';
+            if (txt.includes('STEER_ONE')) {
+              await new Promise((r) => { releaseSlowCancel = r; });
+              return { stopReason: 'cancelled' };
+            }
+            if (txt.includes('STEER_TWO')) {
+              acpRef.onNotification({ method: 'session/update', params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'WRONG_STEER_TWO_ANSWER' } } } });
+              return { stopReason: 'end_turn' };
+            }
+            if (txt.includes('STEER_THREE')) {
+              acpRef.onNotification({ method: 'session/update', params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'EXACT_STEER_THREE_ANSWER' } } } });
+              return { stopReason: 'end_turn' };
+            }
+            if (txt.includes('Summarize the entire conversation')) {
+              acpRef.onNotification({ method: 'session/update', params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '<summary>beta summary</summary>' } } } });
+              return { stopReason: 'end_turn' };
+            }
+            if (txt.includes('Continue beta after compact')) {
+              acpRef.onNotification({ method: 'session/update', params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `BETA_COMPACT_OK_ON_${sid}` } } } });
+              return { stopReason: 'end_turn' };
+            }
+            if (txt.includes('PARENT_PARK_READ') || txt.includes('ALPHA_READ_LANE') || txt.includes('BETA_READ_LANE')) {
+              const tag = txt.includes('ALPHA_READ_LANE') ? 'alpha' : (txt.includes('BETA_READ_LANE') ? 'beta' : 'p-read');
+              const res = await fetch(mUrl, {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'Read', arguments: { path: `${tag}.js` } } }),
+              }).then((r) => r.text());
+              if (res.includes('"isError":true')) {
+                if (tag !== 'beta') throw new Error(`${tag} Read unexpectedly cancelled: ${res}`);
+                return { stopReason: 'cancelled' };
+              }
+              acpRef.onNotification({ method: 'session/update', params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `DONE_${tag.toUpperCase()}_${sid}` } } } });
+              return { stopReason: 'end_turn' };
+            }
+            if (txt.includes('PARENT_PARK_TASK') && !txt.includes('CHILD_DELEGATED_STEP')) {
+              const res = await fetch(mUrl, {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'Task', arguments: { agent: 'self', task: 'child' } } }),
+              }).then((r) => r.text());
+              assert.ok(!res.includes('"isError":true'), `父会话挂起的 Task 绝不能被携带前缀的子代理取消: ${res}`);
+              acpRef.onNotification({ method: 'session/update', params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'PARENT_TASK_DONE' } } } });
+              return { stopReason: 'end_turn' };
+            }
+            acpRef.onNotification({ method: 'session/update', params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'CHILD_EXEC_OK' } } } });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      acpRef = acpMock;
+      const gw = createGateway({ acp: acpMock, limiter: lim, getConfig: () => config, log: () => {}, dataDir: dir });
+      await gw.listen([p]);
+      const fullTools = [
+        { type: 'function', name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } },
+        { type: 'function', name: 'Task', parameters: { type: 'object', required: ['agent', 'task'], properties: { agent: { type: 'string' }, task: { type: 'string' } } } },
+      ];
+      try {
+        // 1) 连续快速二次改向（STEER_ONE 未退完时连发 STEER_TWO 与 STEER_THREE）：绝不挂死中间请求、绝不串流
+        const s1 = fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'steer-pk', tools: fullTools, input: [{ role: 'user', content: 'STEER_ONE' }] }),
+        }).then((r) => r.text());
+        await new Promise((r) => setTimeout(r, 35));
+        const s2 = fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'steer-pk', tools: fullTools, input: [{ role: 'user', content: 'STEER_ONE' }, { role: 'user', content: 'STEER_TWO' }] }),
+        }).then((r) => r.text());
+        await new Promise((r) => setTimeout(r, 20));
+        const s3 = fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'steer-pk', tools: fullTools, input: [{ role: 'user', content: 'STEER_ONE' }, { role: 'user', content: 'STEER_TWO' }, { role: 'user', content: 'STEER_THREE' }] }),
+        }).then((r) => r.text());
+        await new Promise((r) => setTimeout(r, 40));
+        if (releaseSlowCancel) releaseSlowCancel();
+        const [out1, out2, out3] = await Promise.all([s1, s2, s3]);
+        assert.ok(out1.includes('response.completed'), '被改向替代的请求 1 必须正常收尾结束');
+        assert.ok(out2.includes('response.completed') && !out2.includes('EXACT_STEER_THREE_ANSWER'), '中间被替代的请求 2 必须正常结束且不串流');
+        assert.ok(out3.includes('EXACT_STEER_THREE_ANSWER') && !out3.includes('WRONG_STEER_TWO_ANSWER'), `最新请求 3 必须拿到自身结果且不混入旧改向输出，实际: ${out3}`);
+
+        // 2a) 父会话挂起 Read，同缓存键独立子代理携带 Task 工具声明 → 不得取消父会话 Read
+        const pr1 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'sub-read-pk', instructions: 'Same sys', tools: fullTools, input: [{ role: 'user', content: 'PARENT_PARK_READ' }] }),
+        }).then((r) => r.text());
+        const prCallId = /"call_id":"(call_[^"]+)"/.exec(pr1)?.[1];
+        assert.ok(prCallId);
+        const childWithTaskTool = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'sub-read-pk', instructions: 'Same sys', tools: fullTools, input: [{ role: 'user', content: 'INDEPENDENT_CHILD_PROMPT' }] }),
+        }).then((r) => r.text());
+        assert.ok(childWithTaskTool.includes('CHILD_EXEC_OK'));
+        const pr2 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'sub-read-pk', instructions: 'Same sys', tools: fullTools,
+            input: [
+              { role: 'user', content: 'PARENT_PARK_READ' },
+              { type: 'function_call', call_id: prCallId, name: 'Read', arguments: '{"path":"p-read.js"}' },
+              { type: 'function_call_output', call_id: prCallId, output: 'file ok' },
+            ],
+          }),
+        }).then((r) => r.text());
+        assert.ok(pr2.includes('DONE_P-READ_'), `父会话 Read 必须完好恢复，实际: ${pr2}`);
+
+        // 2b) 父会话挂起 Task，子代理携带父历史前缀 → 不得取消父会话 Task
+        const pt1 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'sub-task-pk', instructions: 'Same sys', tools: fullTools, input: [{ role: 'user', content: 'PARENT_PARK_TASK' }] }),
+        }).then((r) => r.text());
+        const ptCallId = /"call_id":"(call_[^"]+)"/.exec(pt1)?.[1];
+        assert.ok(ptCallId);
+        const childWithPrefix = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'sub-task-pk', instructions: 'Same sys', tools: fullTools, input: [{ role: 'user', content: 'PARENT_PARK_TASK' }, { role: 'user', content: 'CHILD_DELEGATED_STEP' }] }),
+        }).then((r) => r.text());
+        assert.ok(childWithPrefix.includes('CHILD_EXEC_OK'));
+        const pt2 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'sub-task-pk', instructions: 'Same sys', tools: fullTools,
+            input: [
+              { role: 'user', content: 'PARENT_PARK_TASK' },
+              { type: 'function_call', call_id: ptCallId, name: 'Task', arguments: '{"agent":"self","task":"child"}' },
+              { type: 'function_call_output', call_id: ptCallId, output: 'child ok' },
+            ],
+          }),
+        }).then((r) => r.text());
+        assert.ok(pt2.includes('PARENT_TASK_DONE'), `父会话 Task 必须完好恢复，实际: ${pt2}`);
+
+        // 3) 同画像双通道 A/B 均挂起 Read，仅压缩 B 并续推 B → 绝不误抢 A，且 B 精准接回原会话
+        const la1 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'sib-pk', instructions: 'Sib sys', tools: fullTools, input: [{ role: 'user', content: 'ALPHA_READ_LANE' }] }),
+        }).then((r) => r.text());
+        const alphaCallId = /"call_id":"(call_[^"]+)"/.exec(la1)?.[1];
+        const lb1 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'sib-pk', instructions: 'Sib sys', tools: fullTools, input: [{ role: 'user', content: 'BETA_READ_LANE' }] }),
+        }).then((r) => r.text());
+        const betaCallId = /"call_id":"(call_[^"]+)"/.exec(lb1)?.[1];
+        assert.ok(alphaCallId && betaCallId && alphaCallId !== betaCallId);
+
+        const compB = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: false, prompt_cache_key: 'sib-pk',
+            instructions: 'You are a context summarization assistant.',
+            input: [{ role: 'user', content: 'Summarize the entire conversation:\nUser: BETA_READ_LANE' }],
+          }),
+        });
+        assert.equal(compB.status, 200);
+
+        const lb2 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'sib-pk', instructions: 'Sib sys', tools: fullTools,
+            input: [{ role: 'user', content: 'The conversation history before this point was compacted into the following summary:\n<summary>beta summary</summary>\n\nContinue beta after compact' }],
+          }),
+        }).then((r) => r.text());
+        assert.ok(lb2.includes('BETA_COMPACT_OK_ON_'), `B 压缩续推应正常完成，实际: ${lb2}`);
+
+        const la2 = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'test', stream: true, prompt_cache_key: 'sib-pk', instructions: 'Sib sys', tools: fullTools,
+            input: [
+              { role: 'user', content: 'ALPHA_READ_LANE' },
+              { type: 'function_call', call_id: alphaCallId, name: 'Read', arguments: '{"path":"alpha.js"}' },
+              { type: 'function_call_output', call_id: alphaCallId, output: 'alpha data' },
+            ],
+          }),
+        }).then((r) => r.text());
+        assert.ok(la2.includes('DONE_ALPHA_'), `兄弟通道 A 的挂起 Read 必须毫发无损，实际: ${la2}`);
       } finally {
         gw.close();
         try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }

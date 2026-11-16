@@ -1152,6 +1152,74 @@ async function main() {
     }
   });
 
+  await suite('bridge: 行锚点 Edit 模式净化与网关侧预检拦截（零消耗宿主熔断预算）', async () => {
+    const { projectTools, validateBridgedToolCall } = require(path.join(root, 'lib/bridge.js'));
+    const hostTools = [
+      {
+        type: 'function',
+        name: 'Edit',
+        parameters: {
+          type: 'object',
+          properties: {
+            file_path: { type: 'string' },
+            path: { type: 'string' },
+            old_string: { type: 'string' },
+            new_string: { type: 'string' },
+            tag: { type: 'string', description: 'Required unless legacy old_string/new_string is used' },
+            ops: { type: 'string', description: 'Line-anchor instructions (unless legacy old_string/new_string is used)' },
+          },
+        },
+      },
+      {
+        type: 'function',
+        name: 'Task',
+        parameters: {
+          type: 'object',
+          required: ['agent', 'task'],
+          properties: { agent: { type: 'string' }, task: { type: 'string' } },
+        },
+      },
+    ];
+    const projected = projectTools(hostTools);
+    const wireJson = JSON.stringify(projected);
+    assert.ok(!wireJson.includes('old_string') && !wireJson.includes('new_string'), 'MCP tools/list 序列化结果绝不能残留 old_string/new_string 误导模型');
+    assert.deepStrictEqual(projected[0].inputSchema.required, ['path', 'tag', 'ops']);
+
+    const badLegacy = validateBridgedToolCall(projected[0], { path: 'a.js', old_string: 'x', new_string: 'y' });
+    assert.strictEqual(badLegacy.ok, false);
+    assert.ok(badLegacy.message.includes('old_string'));
+
+    const badNoColon = validateBridgedToolCall(projected[0], { path: 'a.js', tag: 'fb2a', ops: 'PUT 10.=12\n+hello' });
+    assert.strictEqual(badNoColon.ok, false);
+    assert.ok(badNoColon.message.includes('冒号'));
+
+    const goodNorm = validateBridgedToolCall(projected[0], { file_path: ' a.js ', tag: 'fb2a', ops: 'PUT 10:\r\n+hello\r\n' });
+    assert.strictEqual(goodNorm.ok, true);
+    assert.strictEqual(goodNorm.args.path, 'a.js');
+    assert.strictEqual(goodNorm.args.file_path, undefined);
+    assert.strictEqual(goodNorm.args.tag, 'FB2A');
+    assert.strictEqual(goodNorm.args.ops, 'PUT 10.=10:\n+hello');
+    const badBlockPut = validateBridgedToolCall(projected[0], { path: 'a.js', tag: 'fb2a', ops: 'PUT 10*:\n+hello' });
+    assert.strictEqual(badBlockPut.ok, false);
+    assert.ok(badBlockPut.message.includes('EDIT_BLOCK_UNRESOLVED'));
+
+    const badBlockCut = validateBridgedToolCall(projected[0], { path: 'a.js', tag: 'fb2a', ops: 'CUT 10*' });
+    assert.strictEqual(badBlockCut.ok, false);
+    assert.ok(badBlockCut.message.includes('EDIT_BLOCK_UNRESOLVED'));
+
+    const nullLegacyOk = validateBridgedToolCall(projected[0], { path: 'a.js', tag: 'fb2a', ops: 'PUT 1.=1:\n+ok', old_string: null, new_string: null });
+    assert.strictEqual(nullLegacyOk.ok, true);
+    assert.strictEqual(nullLegacyOk.args.old_string, undefined);
+
+    const badTask = validateBridgedToolCall(projected[1], { subagent_type: 'research', prompt: 'hi' });
+    assert.strictEqual(badTask.ok, false);
+    assert.ok(badTask.message.includes('agent'));
+
+    const nullTaskOk = validateBridgedToolCall(projected[1], { agent: 'reviewer-gpt', task: 'check diff', subagent_type: null, prompt: null });
+    assert.strictEqual(nullTaskOk.ok, true);
+    assert.strictEqual(nullTaskOk.args.subagent_type, undefined);
+  });
+
   const failed = results.filter((r) => !r.ok);
   console.log(`\n结果: ${results.length - failed.length}/${results.length} 通过`);
   if (failed.length > 0) process.exit(1);
