@@ -101,7 +101,7 @@ flowchart TD
 
 ### 1. 安装插件
 
-1. 前往 [Releases 发布页面](https://github.com/sedirk/antigravity-acp-pidesktop/releases) 下载最新版本的 `.piplug` 安装包（如 `local.antigravity-acp-2.3.3.piplug`）。
+1. 前往 [Releases 发布页面](https://github.com/sedirk/antigravity-acp-pidesktop/releases) 下载最新版本的 `.piplug` 安装包（如 `local.antigravity-acp-2.3.4.piplug`）。
 2. 在 **PI-Desktop** 中打开 **设置** → **插件**。
 3. 点击右上角 **从本地安装**，选择刚下载的 `.piplug` 文件。
 4. 安装完成后，插件后台将自动初始化并在默认端口 `41910` 启动网关服务。
@@ -132,8 +132,8 @@ flowchart TD
 > [!IMPORTANT]
 > **关键步骤：配置完成后，请务必点击右侧的「获取列表」按钮勾选模型并保存服务！**
 > 点击后客户端将从网关同步全部模型元数据（包括最新上线的 `gemini-4-hydrogen`、原生 `1M` 上下文规格及 `xhigh` 思考档位；推荐直接从「获取列表」勾选添加，避免手填 ID 命中内置目录小窗口上限）。
-> - **原生窗口（默认）**：保持发现列表的模型窗口（Gemini `1,048,576` / Claude `1,000,000`）；实际可用上限以运行时为准，宿主扣除输出预留和安全余量后决定压缩时机，并非固定百分比保证。
-> - **更早精简（日常长任务可选）**：可在 PI-Desktop 模型高级设置中将窗口调为 `262144` / `200000`；宿主生成阶段摘要后网关重建底层会话，以有界意图、近期交付和摘要续接，不承诺无限无损。保存配置后在下一轮生效；详见[核验与风险说明](docs/CONTEXT-AND-RISK.md)。
+> - **原生窗口（默认）**：模型目录默认值按模型系列在 `lib/core.js:725` 声明（Gemini `1,048,576` / Claude `1,000,000` / `120b` 系列 `131,072`）；即便运行时 `usage_update.size` 返回 `1M`，也只是容量声明，**不代表已完成 1M 长会话满载验收**。自动压缩由宿主在窗口扣除输出预留和安全余量后的可用预算达到 `90%` 时触发，**不承诺固定 UI 百分比**。
+> - **更早精简（日常长任务可选）**：可在 PI-Desktop 模型高级设置中将窗口调为 `262144` / `200000`；当前模型配置变更后仅作用于后续轮次，**不反推历史**。宿主生成阶段摘要后网关重建底层会话，以有界意图、近期交付和摘要续接，不承诺无限无损；详见[核验与风险说明](docs/CONTEXT-AND-RISK.md)。
 
 > [!WARNING]
 > **旧版（≤ v2.3.0）升级必读**：PI-Desktop 仅点击「获取列表」**不会自动覆盖**右侧已添加模型的旧 `200000` 上下文窗口缓存。从旧版升级后若希望启用原生 `1M` 窗口，请打开「设置 → 模型」编辑服务，点击「获取列表」后将该模型**取消勾选再重新勾选**（或在模型高级设置中手动将上下文窗口改为 `1048576` / `1000000`），最后点击 **「保存服务」**！
@@ -155,6 +155,7 @@ flowchart TD
 | `claude-opus-4-6-thinking` | Claude Opus 4.6 (Thinking) | 1,000,000 (1M) | 131,072 (128K) | `low`, `medium`, `high` | 深度复杂推理、高难度综合分析 |
 | `gpt-oss-120b` | GPT-OSS 120B | 131,072 (128K) | 32,768 (32K) | *不支持思考* | 开源大参数基座测试与实验对比 |
 
+> 注：上表默认上下文窗口按模型系列在 `lib/core.js:725` 声明；`1M` 为目录/运行时容量信息，不等于长会话满载验收完成。
 ---
 
 ### 全新 Gemini 4 Hydrogen 与 xhigh 档位
@@ -244,7 +245,18 @@ Windows 环境下后台常驻进程（`agy_acp_server.exe` / `localharness_exter
 | `virtualModels` | `true` | `true` / `false` | 是否启用虚拟模型归一化（聚合思考档位，避免列表散乱） |
 | `defaultEffort` | `"medium"` | `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"` | 客户端未指定思考深度时的全局默认档位 |
 | `idleTimeoutMs` | `600000` | 毫秒数值（默认 10分钟） | 后台长连接会话空闲回收超时 |
-| `reportedContextWindow` | `0` | `0` 或正整数 Token | 上报给宿主的上下文窗口覆盖值。默认 `0` 表示如实上报模型原生窗口（1M / 128K），推荐在 PI-Desktop 模型列表中按模型控制压缩水位 |
+| `reportedContextWindow` | `0` | `0` 或正整数 Token | 模型目录窗口覆盖值。默认 `0` 使用模型系列声明值（1M / 128K），不是上游满载保证；推荐在 PI-Desktop 模型列表中按模型控制压缩水位 |
+| `highContextThrottleTokens` | `160000` | 非负整数 Token | 可选的高上下文微节流触发阈值，**不是**模型上下文容量上限 |
+| `highContextThrottleMs` | `0` | 毫秒数值（`0` - `30000`） | 达到阈值且连续工具回填第 4 步起的每步额外等待（至少 150ms 生效）。v2.3.4 默认 `0`，保留已保存的非零值；升级后仍显示非零时，可手动设为 `0` 并保存。v2.3.3 曾默认 `2500` |
+| `mcpMaxOutputBytes` | `262144` | 字节数（默认 256 KiB） | 单次 MCP/工具输出字节数上限，**不是**模型 Token 上下文容量（未发现 256K 硬截断证据） |
+
+### 延迟与上下文数字诊断（`[acp-diag]`）
+
+v2.3.4 新增默认启用、无正文的 `[acp-diag]` JSON 行诊断，仅记录数字、布尔值、固定枚举和哈希/随机 `trace` / `session` / `lane` 及 `step`（不包含提示词、工具参数、工具结果、报告或密钥；常数状态维护，不保存历史数组）。该隐私范围仅针对新增诊断行，不代表所有既有日志都无正文：
+
+- **事件类型**：`dispatch`、`first_progress`、`park`、`resume`、`context`、`context_final`、`end`。
+- **耗时字段归因**：`throttleMs`（实际额外等待，默认 `0`，非零表示存在已保存的非零配置）、`hostRoundTripMs`（含工具执行、用户等待及宿主/HTTP 往返，**不是纯工具耗时**）、`localResumeMs`（本地回填处理，包含 `throttleMs`，两者不能相加）、`waitMs`（首次派发或工具结果回交后至首次可见模型活动，仍含传输与上游等待，**不是纯模型生成速度**）。
+- **上下文字段归因**：`rawUsed` / `rawSize`（官方 `usage_update` 原始字段）、`beforeUsed` / `pendingBefore` 与 `reportedUsed` / `pendingAfter`（桥接处理值）、`rawInputTokens` / `rawCachedReadTokens`（终态累计输入，不直接等于当前上下文占用）。插件保留官方回落，不以 256K 强行钳值或重建；拥有诊断能力不等于已修复所有上游慢或证明 1M 满载。
 
 ---
 
@@ -299,6 +311,9 @@ node test/gateway-regression.js
 # 稳定性与上下文保真回归
 node test/priority-tests.js
 node test/context-regression.js
+
+# 微节流默认值/显式配置保留及 [acp-diag] 诊断口径回归
+node test/latency-regression.js
 ```
 
 ---

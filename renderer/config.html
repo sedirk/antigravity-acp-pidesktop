@@ -192,9 +192,9 @@
           API 密钥：<span style="color: #94a3b8;">sk-local（留空或填写任意字符均可）</span>
         </div>
         <div style="margin: 6px 0 0; padding: 8px 10px; background: rgba(76, 125, 255, 0.08); border-radius: 6px; border: 1px solid rgba(76, 125, 255, 0.25); font-size: 11.5px; color: #cbd5e1; line-height: 1.65;">
-          💡 <b>模型列表上下文与自动压缩（Compaction）推荐设置</b>：网关默认如实上报原生窗口（Gemini <code>1,048,576</code>、Claude <code>1,000,000</code>），压缩水位完全交由 PI-Desktop 模型列表控制：<br>
-          • <b>满血超长上下文（默认，不提前压缩）</b>：通过「获取列表」勾选模型即可直接使用原生 <code>1M</code> 窗口（扣除输出预留后约在 78 万～88 万 Token 才触发压缩）。<br>
-          • <b>均衡省流防慢（日常长任务推荐）</b>：若希望长对话自动阶段精简以降低延迟与 429 概率，可在 PI-Desktop <b>模型列表展开该模型高级设置，将上下文窗口设为 <code>262144</code>（256K，约 17.7 万水位压缩）或 <code>200000</code>（200K，约 13.5 万水位压缩）</b>，宿主生成摘要后网关将自动重置底层会话并无损续接。
+          💡 <b>模型列表上下文与自动压缩（Compaction）推荐设置</b>：模型目录按系列声明默认窗口（Gemini <code>1,048,576</code>、Claude <code>1,000,000</code>），不代表已验证的实际满载容量；压缩由 PI-Desktop 决定：<br>
+          • <b>大窗口设置</b>：获取列表后勾选模型，检查并保存上下文设置。触发点取决于输出预留、安全余量和宿主校准，不保证固定 Token 数或界面百分比。<br>
+          • <b>较早整理（可选）</b>：可在 PI-Desktop 模型高级设置把窗口设为 <code>262144</code> 或 <code>200000</code> 并保存，主动缩短历史；具体触发点仍取决于输出预留与宿主校准，摘要续接有界，不等于全量历史无损保留。
         </div>
       </div>
       <div>
@@ -354,17 +354,17 @@
     <div class="field">
       <label for="highContextThrottleTokens">微节流上下文阈值（Token，默认 160000）</label>
       <input id="highContextThrottleTokens" type="number" min="0" max="2000000" step="10000">
-      <span class="hint">0 = 关闭；长上下文连续 ≥4 轮工具回填时自动平滑缓冲防 TPM 限流</span>
+      <span class="hint">0 = 关闭；仅在额外等待非零时，达到此阈值且连续 ≥4 轮工具回填才执行，不是上下文容量上限</span>
     </div>
     <div class="field">
-      <label for="highContextThrottleMs">微节流最小间隔（毫秒，默认 2500）</label>
+      <label for="highContextThrottleMs">每步额外等待（毫秒，默认 0 = 关闭）</label>
       <input id="highContextThrottleMs" type="number" min="0" max="30000" step="100">
-      <span class="hint">连续高频工具回填之间的最小目标间隔（≥7 轮自动放大 1.5 倍）</span>
+      <span class="hint">0 = 关闭；至少 150ms 生效。每步额外等待，不随轮数自动放大；升级保留已保存的非零值，想取消请填 0 后保存</span>
     </div>
     <div class="field">
-      <label for="reportedContextWindow">上报宿主的上下文窗口覆盖（Token，默认 0 = 原生 1M）</label>
+      <label for="reportedContextWindow">模型目录上下文窗口覆盖（Token，默认 0 = 按模型系列）</label>
       <input id="reportedContextWindow" type="number" min="0" max="2000000" step="10000">
-      <span class="hint">0 = 如实上报模型原生窗口（Gemini 1,048,576 / Claude 1,000,000），推荐直接在 PI-Desktop 模型列表中按模型设置上下文窗口与压缩水位；设为 &gt;0（如 200000）时网关将统一覆盖上报值</span>
+      <span class="hint">0 = 使用模型系列声明值（Gemini 1,048,576 / Claude 1,000,000），不是上游长会话验收结论；建议在 PI-Desktop 模型列表保存实际窗口。设为 &gt;0 时统一覆盖目录值，不会改变上游真实容量</span>
     </div>
   </section>
 

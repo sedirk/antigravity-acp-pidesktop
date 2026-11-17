@@ -220,7 +220,7 @@ test('bridged tool usage includes observed thought and arguments without rebilli
     const final=await send([user('read a fixture'),call,{type:'function_call_output',call_id:call.call_id,output:'fixture content'}]);
     assert.equal(first.usage.output_tokens+final.usage.output_tokens,1000,'final usage is cumulative, not another 1000 tokens');
     assert.ok(final.usage.input_tokens<100000,'authoritative runtime shrink must not be frozen by a monotonic clamp');
-    assert.ok(logs.some(s=>s.includes('官方上下文水位回落')));
+    assert.ok(logs.some(s=>s.includes('上下文水位回落')));
   }finally{await gateway.close();fs.rmSync(dir,{recursive:true,force:true});}
 });
 
