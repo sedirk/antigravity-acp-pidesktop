@@ -859,7 +859,34 @@ async function main() {
     assert.strictEqual(m.supports_steering, true, '应声明 supports_steering: true');
     assert.ok(m.capabilities.includes('steer'), 'capabilities 列表中应包含 steer');
     assert.strictEqual(m.thinkingProtocol, 'adaptive', '思考模型应声明 adaptive 思考协议');
-    assert.strictEqual(m.contextWindow, 1048576, '应导出标准 contextWindow');
+    assert.strictEqual(m.contextWindow, 256000, '未配置覆盖值时默认通告 256K');
+  });
+
+  await suite('models: 默认256K通告、128K例外与自定义覆盖在所有字段和变体中一致', async () => {
+    for (const reportedContextWindow of [undefined, 0, 200000, 1000000]) {
+      const cfg = { virtualModels: true, exposeVariantModels: true };
+      if (reportedContextWindow !== undefined) cfg.reportedContextWindow = reportedContextWindow;
+      const rt = new AcpRuntime({ getConfig: () => cfg, log: () => {} });
+      rt.ingestModels([
+        { modelId: 'gemini-4-carbon-high', name: 'Gemini 4 Carbon (high)' },
+        { modelId: 'claude-opus-4-6-thinking-high', name: 'Claude Opus 4.6 Thinking (high)' },
+        { modelId: 'gpt-oss-120b', name: 'GPT-OSS 120B' },
+        { modelId: 'custom-model', name: 'Custom Model' },
+      ]);
+      rt.discover = async () => rt.discovery;
+      const models = await rt.modelsForApi();
+      assert.ok(models.length >= 6, '应覆盖基础模型与思考档位变体');
+      for (const model of models) {
+        const expected = reportedContextWindow > 0 ? reportedContextWindow : (model.id.includes('120b') ? 131072 : 256000);
+        for (const key of ['context_window', 'contextWindow', 'context_length']) {
+          assert.strictEqual(model[key], expected, `${model.id}.${key} 通告不一致`);
+        }
+        assert.strictEqual(model.limit.context, expected);
+        assert.strictEqual(model.limit.input, expected);
+        const output = model.id.includes('claude') ? 131072 : (model.id.includes('gemini') ? 65536 : 32768);
+        assert.strictEqual(model.maxTokens, output, '上下文通告调整不改变输出上限');
+      }
+    }
   });
 
   await suite('panel: onPanelInvoke 对 config:get 与 config:save 双向兼容', async () => {
@@ -1526,11 +1553,11 @@ async function main() {
     }
   });
 
-  await suite('context-coupling: 原生上下文窗口对齐、旧默认迁移、turnUsage 快照合并与工具轮压缩平铺', async () => {
+  await suite('context-coupling: 默认上下文通告、旧默认迁移、turnUsage 快照合并与工具轮压缩平铺', async () => {
     const serverLib = require('../lib/server.js');
 
-    // 1. 默认 reportedContextWindow 为 0（原生窗口），且旧版自动固化的 200000 仅迁移一次，用户显式保存后予以保留
-    assert.strictEqual(configLib.DEFAULTS.reportedContextWindow, 0, '默认应为 0 以如实上报模型原生窗口');
+    // 1. reportedContextWindow=0 采用默认通告；保留旧默认迁移和用户显式保存的值。
+    assert.strictEqual(configLib.DEFAULTS.reportedContextWindow, 0, '默认 0 采用模型通告策略');
     const migDir = tempDir('ctx-mig');
     try {
       const cfgPath = path.join(migDir, 'config.json');
@@ -1545,7 +1572,7 @@ async function main() {
       fs.rmSync(migDir, { recursive: true, force: true });
     }
 
-    // 2. 模型家族原生上下文窗口精确对齐（Gemini 1048576 / Claude 1000000 / 120B 131072）
+    // 2. 默认通告 256K，GPT-OSS 120B 保留 128K。
     const rt = new AcpRuntime({ getConfig: () => ({ reportedContextWindow: 0, virtualModels: true }), log: () => {} });
     rt.ingestModels([
       { modelId: 'gemini-4-hydrogen-xhigh', name: 'Gemini 4 Hydrogen (xhigh)' },
@@ -1554,8 +1581,8 @@ async function main() {
     ]);
     rt.discover = async () => rt.discovery;
     const models = await rt.modelsForApi();
-    assert.strictEqual(models.find((m) => m.id === 'gemini-4-hydrogen').contextWindow, 1048576);
-    assert.strictEqual(models.find((m) => m.id === 'claude-opus-4-6-thinking').contextWindow, 1000000);
+    assert.strictEqual(models.find((m) => m.id === 'gemini-4-hydrogen').contextWindow, 256000);
+    assert.strictEqual(models.find((m) => m.id === 'claude-opus-4-6-thinking').contextWindow, 256000);
     assert.strictEqual(models.find((m) => m.id === 'gpt-oss-120b').contextWindow, 131072);
 
     // 3. mergeTurnUsage：输入上下文（inputTokens / cachedReadTokens）取最新非零快照，输出累加，严禁输入翻倍

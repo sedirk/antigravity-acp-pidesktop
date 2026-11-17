@@ -1886,6 +1886,8 @@ async function main() {
       const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'config.html'), 'utf8');
       assert.ok(html.includes('id="reportedContextWindow"'), 'config.html 必须包含 #reportedContextWindow 控件');
       assert.ok(html.includes("'reportedContextWindow'"), 'config.html ids 数组必须包含 reportedContextWindow');
+      assert.ok(html.includes('默认通告') && html.includes('256K'), '面板应说明默认通告 256K');
+      assert.ok(!html.includes('1,048,576') && !html.includes('1,000,000'), '面板不再宣传默认 1M');
 
       const { AcpRuntime } = require('../lib/core.js');
       const rt1 = new AcpRuntime({ getConfig: () => ({ reportedContextWindow: 200000, virtualModels: true }) });
@@ -1905,7 +1907,7 @@ async function main() {
       rt2.discover = async () => rt2.discovery;
       const list2 = await rt2.modelsForApi();
       const m2 = list2.find((x) => x.id === 'gemini-4-carbon');
-      assert.equal(m2.context_window, 1048576, '配置为 0 时回退原生 1048576 context_window');
+      assert.equal(m2.context_window, 256000, '配置为 0 时默认通告 256000 context_window');
     });
 
     await check('MUTATION_RETRY_BUDGET_EXHAUSTED: parked tool error + user continuation coalesces without cancel and never deadlocks concurrency=1 compaction', async () => {
