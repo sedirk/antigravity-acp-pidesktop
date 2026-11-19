@@ -16,6 +16,7 @@ const configLib = require('./lib/config');
 const proxyLib = require('./lib/proxy');
 const { AcpRuntime, createLimiter, killTree } = require('./lib/core');
 const { createGateway } = require('./lib/server');
+const { meterService } = require('./lib/meter-service');
 
 const SERVICE_ID = 'antigravity-acp-gateway';
 const COMMANDS = {
@@ -47,6 +48,8 @@ let config = null;
 let acp = null;
 let limiter = null;
 let gateway = null;
+let contextMeter = null;
+const modelChanged = event => contextMeter?.modelChanged(event);
 let log = () => {};
 let resolvedProxy = { url: '', source: 'none', note: '尚未解析' };
 let proxyAt = 0;
@@ -203,10 +206,12 @@ async function startService({ log: providedLog } = {}) {
   refreshProxy();
   reapOrphans();
   limiter = buildLimiter();
-  acp = new AcpRuntime({ getConfig: () => config, getProxy: () => refreshProxy({ force: false }).url, getCwd: workspaceCwd, getAdditionalDirs: workspaceAdditionalDirs, log });
+  acp = new AcpRuntime({ getConfig: () => config, getProxy: (opts) => refreshProxy({ force: Boolean(opts && opts.force) }).url, getCwd: workspaceCwd, getAdditionalDirs: workspaceAdditionalDirs, log });
   gateway = createGateway({ acp, limiter, getConfig: () => config, log });
   const base = config.port;
   const port = await gateway.listen([base, base + 1, base + 2, base + 3]);
+  // Optional, local-only display. A failed private channel never stops the model gateway.
+  try { contextMeter = meterService(gateway, () => pi.session.getActive()); } catch { contextMeter = null; }
   // 预热：先完成 ACP 握手与模型发现，避免第一条对话撞上运行时初始化的 10–20 秒
   acp.start()
     .then(() => acp.discover().catch(() => {}))
@@ -216,6 +221,7 @@ async function startService({ log: providedLog } = {}) {
 }
 
 function stopService() {
+  contextMeter?.close(); contextMeter = null;
   if (gateway) gateway.close();
   if (acp) acp.kill();
   gateway = null;
@@ -756,6 +762,7 @@ async function onPanelInvoke(channel, payload) {
 
 module.exports = {
   onPanelInvoke,
+  async onRendererCall(method, args) { return contextMeter ? contextMeter.read(method, args) : null; },
 
   async onLoad() {
     pi = globalThis.pi;
@@ -771,6 +778,7 @@ module.exports = {
 
     reloadConfig();
     refreshProxy();
+    pi.events?.on?.('session:modelChanged', modelChanged);
     reapOrphans();
     pi.services.register({
       id: SERVICE_ID,
@@ -796,6 +804,7 @@ module.exports = {
   },
 
   async onUnload() {
+    pi?.events?.off?.('session:modelChanged', modelChanged);
     try { unregisterCommands(); } catch { /* ignore */ }
     stopService();
   },

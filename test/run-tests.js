@@ -399,14 +399,20 @@ async function main() {
     assert.strictEqual(countTokens('你好世界'), 4);
     assert.strictEqual(countTokens(''), 0);
     const usage = usageFor('你好', '世界', '');
-    assert.strictEqual(usage.prompt_tokens, 2);
-    assert.strictEqual(usage.completion_tokens, 2);
-    assert.strictEqual(usage.total_tokens, 4);
+    assert.strictEqual(usage.usage_status, 'unavailable');
+    assert.strictEqual(usage.prompt_tokens, undefined);
+    assert.strictEqual(usage.completion_tokens, undefined);
+    assert.strictEqual(usage.total_tokens, undefined);
+    assert.strictEqual(usage.observed_output_tokens, 2);
+    assert.strictEqual(usage.observed_reasoning_tokens, 0);
     assert.strictEqual(usage.estimated, true);
+    assert.strictEqual(usage.output_estimated, true);
     assert.deepStrictEqual(ignoredParams({ model: 'm', messages: [], temperature: 0.2, tools: [] }), ['temperature']);
     assert.deepStrictEqual(ignoredParams({ messages: [], max_tokens: 5, reasoning_effort: 'high' }), ['max_tokens']);
     assert.deepStrictEqual(ignoredParams({ messages: [], text: { format: { type: 'json_object' } } }), ['text.format']);
     const withContext = usageFor('你好', '世界', '', { contextUsed: 11643, contextSize: 1048576 });
+    assert.strictEqual(withContext.usage_status, 'unavailable');
+    assert.strictEqual(withContext.prompt_tokens, undefined);
     assert.strictEqual(withContext.context_used, 11643);
     assert.strictEqual(withContext.context_size, 1048576);
   });
@@ -1320,14 +1326,28 @@ async function main() {
       cachedReadTokens: 12215,
       cachedWriteTokens: 0,
     });
-    const u15 = usageFor('hi', 'short reply', 'long thinking', {
+    const u15Diag = usageFor('hi', 'short reply', 'long thinking', {
       contextUsed: 18500,
       contextSize: 1000000,
       turnUsage: norm,
     });
-    assert.strictEqual(u15.prompt_tokens, 18500, '保持 contextUsed 为 prompt_tokens 以保证宿主上下文进度条准确');
+    assert.strictEqual(u15Diag.usage_status, 'unavailable', '未声明单 prompt 完整终态时仅作诊断保存，不透传标准字段');
+    assert.strictEqual(u15Diag.prompt_tokens, undefined);
+    assert.strictEqual(u15Diag.context_used, 18500);
+    assert.strictEqual(u15Diag.acp_turn_usage.inputTokens, 21695);
+
+    const u15 = usageFor('hi', 'short reply', 'long thinking', {
+      usagePromptCount: 1,
+      contextUsed: 34582,
+      contextSize: 1000000,
+      usageWatermark: 34582,
+      turnUsage: norm,
+    });
+    assert.strictEqual(u15.usage_status, 'measured');
+    assert.strictEqual(u15.prompt_tokens, 21695 + 12215, '标准 prompt_tokens 为 inputTokens + cachedReadTokens + cachedWriteTokens');
     assert.strictEqual(u15.completion_tokens, 672, 'outputTokens 已含 thoughtTokens，不得重复相加');
-    assert.strictEqual(u15.total_tokens, 18500 + 672);
+    assert.strictEqual(u15.total_tokens, 34582);
+    assert.strictEqual(u15.context_used, 34582);
     assert.strictEqual(u15.estimated, false);
     assert.deepStrictEqual(u15.prompt_tokens_details, { cached_tokens: 12215 });
     assert.deepStrictEqual(u15.completion_tokens_details, { reasoning_tokens: 597 });
@@ -1356,7 +1376,7 @@ async function main() {
         if (method === 'session/prompt') {
           promptTurn += 1;
           if (promptTurn === 1) {
-            mockAcp.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'usage_update', used: 24000, size: 1000000 } } });
+            mockAcp.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'usage_update', used: 24120, size: 1000000 } } });
             mockAcp.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'first' } } } });
             return { stopReason: 'end_turn', usage: { inputTokens: 8000, cachedReadTokens: 16000, outputTokens: 120, thoughtTokens: 80, totalTokens: 24120 } };
           }
@@ -1400,8 +1420,11 @@ async function main() {
         req.end(payload);
       });
       const r1 = await post({ model: 'claude-opus-5-5', stream: false, prompt_cache_key: 'k-150', input: [{ role: 'user', content: 'turn 1' }] });
+      assert.strictEqual(r1.usage.usage_status, 'measured');
       assert.strictEqual(r1.usage.input_tokens, 24000);
       assert.strictEqual(r1.usage.output_tokens, 120);
+      assert.strictEqual(r1.usage.total_tokens, 24120);
+      assert.strictEqual(r1.usage.context_used, 24120);
       assert.deepStrictEqual(r1.usage.input_tokens_details, { cached_tokens: 16000 });
       assert.deepStrictEqual(r1.usage.output_tokens_details, { reasoning_tokens: 80 });
 
@@ -1415,7 +1438,9 @@ async function main() {
           { role: 'user', content: 'turn 2a' },
         ],
       });
-      assert.strictEqual(r2a.usage.input_tokens, 24000, 'used:0 且无 turnUsage 时不得把已有的 24000 上下文占用清零');
+      assert.strictEqual(r2a.usage.usage_status, 'unavailable');
+      assert.strictEqual(r2a.usage.input_tokens, undefined);
+      assert.ok(r2a.usage.context_used >= 24120 && r2a.usage.context_used < 24200, 'used:0 且无 turnUsage 时不得把已有的 24120 上下文占用清零');
 
       const r2b = await post({
         model: 'claude-opus-5-5',
@@ -1429,8 +1454,10 @@ async function main() {
           { role: 'user', content: 'turn 2b' },
         ],
       });
+      assert.strictEqual(r2b.usage.usage_status, 'measured');
       assert.strictEqual(r2b.usage.input_tokens, 24300, '1.5.0 PromptResponse.usage(500+23800) 应精确对齐并回写最新上下文水位');
       assert.strictEqual(r2b.usage.output_tokens, 90);
+      assert.strictEqual(r2b.usage.total_tokens, 24390);
       assert.deepStrictEqual(r2b.usage.output_tokens_details, { reasoning_tokens: 40 });
 
       const r3 = await post({
@@ -1447,7 +1474,9 @@ async function main() {
           { role: 'user', content: 'turn 3' },
         ],
       });
-      assert.strictEqual(r3.usage.input_tokens, 24300, 'owner.contextUsed 必须跨轮保留已回写的 24300 水位');
+      assert.strictEqual(r3.usage.usage_status, 'unavailable');
+      assert.strictEqual(r3.usage.input_tokens, undefined);
+      assert.ok(r3.usage.context_used >= 24300 && r3.usage.context_used < 24400, 'owner.contextUsed 必须跨轮保留已回写的 24300 水位');
     } finally {
       gw.close();
     }
@@ -1585,15 +1614,25 @@ async function main() {
     assert.strictEqual(models.find((m) => m.id === 'claude-opus-4-6-thinking').contextWindow, 256000);
     assert.strictEqual(models.find((m) => m.id === 'gpt-oss-120b').contextWindow, 131072);
 
-    // 3. mergeTurnUsage：输入上下文（inputTokens / cachedReadTokens）取最新非零快照，输出累加，严禁输入翻倍
+    // 3. mergeTurnUsage：不同 prompt 真实累加各共同存在字段，缺失字段不伪造为 0，且多 prompt 聚合不得透传为标准用量
     const step1 = serverLib.normalizeTurnUsage({ inputTokens: 15000, cachedReadTokens: 165000, outputTokens: 200, thoughtTokens: 120, totalTokens: 180200 });
     const step2 = serverLib.normalizeTurnUsage({ inputTokens: 15200, cachedReadTokens: 165000, outputTokens: 350, thoughtTokens: 180, totalTokens: 180550 });
     const merged = serverLib.mergeTurnUsage(step1, step2);
-    assert.strictEqual(merged.inputTokens, 15200, 'inputTokens 必须取最新步快照而非累加翻倍');
-    assert.strictEqual(merged.cachedReadTokens, 165000, 'cachedReadTokens 必须取最新步快照而非累加翻倍');
+    assert.strictEqual(merged.inputTokens, 30200, '不同 prompt 合并应真实累加 inputTokens');
+    assert.strictEqual(merged.cachedReadTokens, 330000, '不同 prompt 合并应真实累加 cachedReadTokens');
     assert.strictEqual(merged.outputTokens, 550, 'outputTokens 应跨步累加');
     assert.strictEqual(merged.thoughtTokens, 300, 'thoughtTokens 应跨步累加');
-    assert.strictEqual(merged.totalTokens, 180750, 'totalTokens 应等于最新上下文输入加累计输出');
+    assert.strictEqual(merged.totalTokens, 360750, 'totalTokens 应累加总计');
+    assert.strictEqual(merged.cachedWriteTokens, undefined, '双方均缺失的字段不得伪造为 0');
+    const partialMerged = serverLib.mergeTurnUsage(step1, serverLib.normalizeTurnUsage({ outputTokens: 10 }));
+    assert.strictEqual(partialMerged.inputTokens, undefined, '仅单侧存在的字段合并后保持缺失');
+    assert.strictEqual(partialMerged.outputTokens, 210);
+    const multiPromptUsage = serverLib.usageFor('done', 'ok', '', { usagePromptCount: 2, contextUsed: 180550, turnUsage: merged });
+    assert.strictEqual(multiPromptUsage.usage_status, 'unavailable');
+    assert.strictEqual(multiPromptUsage.prompt_tokens, undefined);
+    assert.strictEqual(multiPromptUsage.context_used, 180550);
+    assert.strictEqual(multiPromptUsage.acp_turn_usage.prompt_count, 2);
+    assert.strictEqual(multiPromptUsage.acp_turn_usage.inputTokens, 30200);
 
     // 4. flatten：工具循环中途发生 Compaction 时（末尾为 tool 输出），完整保留系统指令、摘要专段与尾部工具结果
     const midTurnMsgsA = serverLib.normalizeMessages({
@@ -1649,29 +1688,35 @@ async function main() {
     const serverLib = require(path.join(root, 'lib/server.js'));
     const bridgeLib = require(path.join(root, 'lib/bridge.js'));
 
-    // 1. usageFor：已有基准 contextUsed(187300) 叠加轮中无放大增量 pendingDeltaTokens(4200)
+    // 1. usageFor：已有基准 contextUsed(187300) 叠加轮中无放大增量 pendingDeltaTokens(4200)，仅更新诊断 context_used
     const midStepUsage = serverLib.usageFor('continue', 'checking', '', {
       contextUsed: 187300,
       pendingDeltaTokens: 4200,
       contextSize: 1000000,
     });
-    assert.strictEqual(midStepUsage.prompt_tokens, 191500, '轮中挂起应实时上报 baseContext + pendingDeltaTokens');
+    assert.strictEqual(midStepUsage.usage_status, 'unavailable');
+    assert.strictEqual(midStepUsage.prompt_tokens, undefined, '轮中挂起仅上报诊断 context_used，不进入标准 prompt_tokens');
     assert.strictEqual(midStepUsage.context_used, 191500);
-    assert.strictEqual(midStepUsage.estimated, false);
+    assert.strictEqual(midStepUsage.context_size, 1000000);
+    assert.strictEqual(midStepUsage.estimated, true);
 
-    // 新会话首轮尚无 contextUsed 时，pendingDeltaTokens 也能驱动轮中步进增长
+    // 新会话首轮尚无 contextUsed 时，pendingDeltaTokens 也能驱动轮中步进增长（诊断字段）
     const freshMidUsage = serverLib.usageFor('init', '', '', {
       contextUsed: 0,
       pendingDeltaTokens: 13500,
       estimateContext: 9000,
     });
-    assert.strictEqual(freshMidUsage.prompt_tokens, 13500);
+    assert.strictEqual(freshMidUsage.usage_status, 'unavailable');
+    assert.strictEqual(freshMidUsage.prompt_tokens, undefined);
     assert.strictEqual(freshMidUsage.context_used, 13500);
 
-    // 2. 多步 turnUsage 累计缓存读取超过单轮 prompt_tokens 时按真实命中比例钳制，避免虚报 100% 命中
+    // 2. 多步 turnUsage 累计缓存读取超过单轮水位时不比例缩放、不透传标准字段，原始汇总保留在 acp_turn_usage
     const multiCallTurn = serverLib.usageFor('done', 'ok', '', {
+      usagePromptCount: 1,
+      parkedBatches: 3,
       contextUsed: 195300,
       contextSize: 1000000,
+      usageWatermark: 195300,
       turnUsage: {
         inputTokens: 40000,
         cachedReadTokens: 720000,
@@ -1681,28 +1726,54 @@ async function main() {
         totalTokens: 760600,
       },
     });
-    assert.strictEqual(multiCallTurn.prompt_tokens, 195300);
-    const expectedCached = Math.round(195300 * (720000 / 760000));
-    assert.strictEqual(multiCallTurn.prompt_tokens_details.cached_tokens, expectedCached);
-    assert.ok(multiCallTurn.prompt_tokens_details.cached_tokens < 195300);
+    assert.strictEqual(multiCallTurn.usage_status, 'unavailable');
+    assert.strictEqual(multiCallTurn.prompt_tokens, undefined);
+    assert.strictEqual(multiCallTurn.prompt_tokens_details, undefined);
+    assert.strictEqual(multiCallTurn.context_used, 195300);
+    assert.strictEqual(multiCallTurn.acp_turn_usage.scope, 'prompt_aggregate');
+    assert.strictEqual(multiCallTurn.acp_turn_usage.cachedReadTokens, 720000, '累计缓存不作比例缩放');
+    assert.strictEqual(multiCallTurn.acp_turn_usage.outputTokens, 600);
 
-    // 2b. 同时存在 cachedReadTokens 与 cachedWriteTokens 且累计输入超过 prompt 水位时，按同一分母等比缩放
-    const proportionalBoth = serverLib.usageFor('done', 'ok', '', {
+    // 2b. 同时存在 cachedReadTokens 与 cachedWriteTokens：多步/失配时不缩放不透传；单次完整未拆分终态时原样透传
+    const unalignedBoth = serverLib.usageFor('done', 'ok', '', {
+      usagePromptCount: 1,
       contextUsed: 120000,
       contextSize: 1000000,
+      usageWatermark: 120000,
       turnUsage: {
         inputTokens: 100000,
         cachedReadTokens: 100000,
         cachedWriteTokens: 50000,
         outputTokens: 300,
         thoughtTokens: 50,
-        totalTokens: 200300,
+        totalTokens: 250300,
       },
     });
-    assert.strictEqual(proportionalBoth.prompt_tokens, 120000);
-    assert.deepStrictEqual(proportionalBoth.prompt_tokens_details, {
-      cached_tokens: 60000,
-      cache_write_tokens: 30000,
+    assert.strictEqual(unalignedBoth.usage_status, 'unavailable');
+    assert.strictEqual(unalignedBoth.prompt_tokens, undefined);
+    assert.strictEqual(unalignedBoth.prompt_tokens_details, undefined);
+    assert.strictEqual(unalignedBoth.acp_turn_usage.cachedReadTokens, 100000);
+    assert.strictEqual(unalignedBoth.acp_turn_usage.cachedWriteTokens, 50000);
+
+    const measuredBoth = serverLib.usageFor('done', 'ok', '', {
+      usagePromptCount: 1,
+      contextUsed: 250300,
+      contextSize: 1000000,
+      usageWatermark: 250300,
+      turnUsage: {
+        inputTokens: 100000,
+        cachedReadTokens: 100000,
+        cachedWriteTokens: 50000,
+        outputTokens: 300,
+        thoughtTokens: 50,
+        totalTokens: 250300,
+      },
+    });
+    assert.strictEqual(measuredBoth.usage_status, 'measured');
+    assert.strictEqual(measuredBoth.prompt_tokens, 250000);
+    assert.deepStrictEqual(measuredBoth.prompt_tokens_details, {
+      cached_tokens: 100000,
+      cache_write_tokens: 50000,
     });
 
     // 3. flattenSummarization：保留最新前序 <summary> 与末尾压缩指令，且即使叠加多个 32K 摘要也严守 108,000 字与 UTF-8 字节预算

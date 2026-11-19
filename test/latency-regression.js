@@ -160,7 +160,7 @@ test('Responses crosses 256K through 900K without default delay and preserves a 
   }
   const drop = events.find(e => e.event === 'context' && e.rawUsed === 25328);
   assert.equal(drop.rawDrop, true); assert.equal(drop.reportedDrop, true);
-  assert.equal(bodies.at(-1).usage.input_tokens, 25328); assert.equal(serial, 1, 'do not rebuild on a watermark drop');
+  assert.equal(bodies.at(-1).usage.usage_status, 'unavailable'); assert.equal(bodies.at(-1).usage.input_tokens, undefined); assert.equal(bodies.at(-1).usage.context_used, 25328); assert.equal(bodies.at(-1).usage.acp_turn_usage.inputTokens, 25328); assert.equal(serial, 1, 'do not rebuild on a watermark drop');
   assert.equal(new Set(events.map(e => e.trace)).size, 1, 'continuations stay in one diagnostic turn');
   assert.equal(events.filter(e => e.event === 'first_progress').length, 7);
   assert.equal(events.find(e => e.event === 'context_final').rawInputTokens, 25328);
@@ -180,7 +180,7 @@ test('Chat bridge shares the same zero-delay diagnostics beyond 256K', async () 
   const { events, bodies } = await bridgeFixture({ api: 'chat', values: [200000, 260000, 300000, 350000, 400000] });
   assert.equal(events.filter(e => e.event === 'resume').length, 4);
   assert.ok(events.filter(e => e.event === 'resume').every(e => e.throttleMs === 0));
-  assert.equal(bodies.at(-1).usage.prompt_tokens, 400000);
+  assert.equal(bodies.at(-1).usage.usage_status, 'unavailable'); assert.equal(bodies.at(-1).usage.prompt_tokens, undefined); assert.equal(bodies.at(-1).usage.context_used, 400000); assert.equal(bodies.at(-1).usage.acp_turn_usage.inputTokens, 400000);
 });
 
 test('explicit throttle still applies only from the fourth high-context continuation', async () => {

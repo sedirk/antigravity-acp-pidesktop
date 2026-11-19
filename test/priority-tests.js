@@ -323,19 +323,51 @@ async function main() {
     }
   });
 
-  // 10. Item 10: 真实累计上下文命中时标明 estimated: false
-  await test('Item 10: 官方累计上下文统计命中时标明 estimated: false', async () => {
-    // 纯估算场景（无 stats 或 contextUsed = 0）
+  // 10. Item 10: 仅完整未拆分终态才透传标准用量并标明 estimated: false
+  await test('Item 10: 仅完整未拆分终态标明 estimated: false，水位仅作诊断', async () => {
+    // 无 stats 或仅 contextUsed=0：标准字段缺失，usage_status 为 unavailable
     const est = usageFor('你好', '世界', '', null);
+    assert.strictEqual(est.usage_status, 'unavailable');
     assert.strictEqual(est.estimated, true, '无官方数据时 estimated 应为 true');
+    assert.strictEqual(est.prompt_tokens, undefined);
+    assert.strictEqual(est.observed_output_tokens, 2);
 
     const estZero = usageFor('你好', '世界', '', { contextUsed: 0 });
-    assert.strictEqual(estZero.estimated, true, 'contextUsed 为 0 时应回退估算');
+    assert.strictEqual(estZero.usage_status, 'unavailable');
+    assert.strictEqual(estZero.estimated, true, 'contextUsed 为 0 时应标明 unavailable/estimated');
+    assert.strictEqual(estZero.context_used, 0);
+    assert.strictEqual(estZero.prompt_tokens, undefined);
 
-    // 官方真实占用命中场景
-    const real = usageFor('你好', '世界', '', { contextUsed: 12450, contextSize: 1048576 });
+    // 仅有水位（无完整未拆分 turnUsage）：只保存诊断 context_used，不进入标准 prompt_tokens
+    const wmOnly = usageFor('你好', '世界', '', { contextUsed: 12450, contextSize: 1048576 });
+    assert.strictEqual(wmOnly.usage_status, 'unavailable');
+    assert.strictEqual(wmOnly.estimated, true);
+    assert.strictEqual(wmOnly.context_used, 12450);
+    assert.strictEqual(wmOnly.context_size, 1048576);
+    assert.strictEqual(wmOnly.prompt_tokens, undefined);
+
+    // 完整单 prompt 未拆分终态命中场景（input+cache+output === totalTokens === usageWatermark）
+    const real = usageFor('你好', '世界', '', {
+      usagePromptCount: 1,
+      contextUsed: 12452,
+      contextSize: 1048576,
+      usageWatermark: 12452,
+      turnUsage: {
+        inputTokens: 2450,
+        cachedReadTokens: 10000,
+        cachedWriteTokens: 0,
+        outputTokens: 2,
+        thoughtTokens: 0,
+        totalTokens: 12452,
+      },
+    });
+    assert.strictEqual(real.usage_status, 'measured');
     assert.strictEqual(real.prompt_tokens, 12450);
-    assert.strictEqual(real.estimated, false, '取得官方真实占用时 estimated 应为 false');
+    assert.strictEqual(real.completion_tokens, 2);
+    assert.strictEqual(real.total_tokens, 12452);
+    assert.strictEqual(real.context_used, 12452);
+    assert.strictEqual(real.context_size, 1048576);
+    assert.strictEqual(real.estimated, false, '取得完整未拆分官方终态时 estimated 应为 false');
   });
 
   // 11. Item 11: Gateway 会话状态列表可视化与一键回收

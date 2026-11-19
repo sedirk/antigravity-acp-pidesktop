@@ -12,11 +12,13 @@
   <a href="https://github.com/sedirk/antigravity-acp-pidesktop/releases"><img src="https://img.shields.io/github/v/release/sedirk/antigravity-acp-pidesktop?color=blue&label=Release" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
   <img src="https://img.shields.io/badge/Platform-Windows_x64-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/PI--Desktop-%3E%3D0.9.0-success.svg" alt="PI-Desktop">
+  <img src="https://img.shields.io/badge/PI--Desktop-%3E%3D0.22.0-success.svg" alt="PI-Desktop ≥0.22.0">
   <img src="https://img.shields.io/badge/Thinking-Adaptive-brightgreen.svg" alt="Thinking">
 </p>
 
 ---
+
+**2.3.9 / 原版 PI-Desktop 0.22.0：** 输入框右侧自动显示本网关最近请求的 **PI 输入预算估算**，点开可分别看 PI 采样与 ACP 原始水位（连续多工具轮次中原生圆环停在上一单腿样本属正常契约，长工具链期间请以此控件为准；不是账单，也不是压缩触发线）。同步包含 `2.3.8 → 2.3.9` 就地升级扩展隔离、自定义端点切模即时围栏、本地回环/代理 `connectex` 自动重启热恢复，以及多工具 180 秒重试会话解锁与尾部批次重放。导入 `.piplug`、批准 `agent.extension` 和新增的 `renderer.extension` 即可启用显示；无需改 PI 或输命令。见[工具栏读数](docs/CONTEXT-METER.md)，`/acp-context` 仍可使用。
 
 ## 📑 目录
 
@@ -101,7 +103,7 @@ flowchart TD
 
 ### 1. 安装插件
 
-1. 前往 [Releases 发布页面](https://github.com/sedirk/antigravity-acp-pidesktop/releases) 下载最新版本的 `.piplug` 安装包（如 `local.antigravity-acp-2.3.5.piplug`）。
+1. 前往 [Releases 发布页面](https://github.com/sedirk/antigravity-acp-pidesktop/releases) 下载最新版本的 `.piplug` 安装包（如 `local.antigravity-acp-2.3.9.piplug`）。
 2. 在 **PI-Desktop** 中打开 **设置** → **插件**。
 3. 点击右上角 **从本地安装**，选择刚下载的 `.piplug` 文件。
 4. 安装完成后，插件后台将自动初始化并在默认端口 `41910` 启动网关服务。
@@ -257,6 +259,10 @@ v2.3.4 新增默认启用、无正文的 `[acp-diag]` JSON 行诊断，仅记录
 
 ---
 
+### Usage 映射（2.3.6）
+
+上下文水位不再冒充标准输入。只透传作用域可确认的完整未拆分终态计数；工具链中缺少可靠逐步明细时省略标准用量，保留水位、可见输出估计和官方整轮汇总供诊断。宿主沿用自身历史预算，token/cache UI 可能显示缺失或 0，不代表真实命中为零。另修复 Chat 挂起重复发送正文。详见 [映射合同、同条件对照与限制](docs/USAGE-MAPPING.md)。无需修改宿主；升级后建议用新对话验收，旧错误样本不会被自动改写。
+
 ## 📡 API 端点规范
 
 网关在本地启动后，完全符合标准的 RESTful 协议：
@@ -311,6 +317,12 @@ node test/context-regression.js
 
 # 微节流默认值/显式配置保留及 [acp-diag] 诊断口径回归
 node test/latency-regression.js
+
+# Usage 作用域、缺失计数、上下文计量归属与断连/重试自愈回归
+node test/usage-mapping.js
+node test/cancelled-refill.js
+node test/context-meter.cjs
+node --test test/budget-status.mjs
 ```
 
 ---

@@ -43,9 +43,9 @@ async function main() {
   }
   try {
     await check('listen and health',async()=>{assert.equal(await gateway.listen([port]),port);const h=await (await fetch(`http://127.0.0.1:${port}/health`)).json(); assert.equal(h.port,port);assert.equal(gateway.status().port,port);});
-    await check('text plus tool does not replay or replace session',async()=>{plan.push({updates:[tool,text('final answer'),usage]});const r=await request('a');assert.equal(r.status,200);assert.equal(r.body.output[0].content[0].text,'final answer');assert.equal(serial,1);assert.equal(calls.filter(c=>c[0]==='session/prompt').length,1);assert.ok(logs.some(x=>x.includes('正文 12 字')));assert.equal(r.body.usage.input_tokens,12345);assert.equal(r.body.usage.estimated,false);});
-    await check('same conversation retains context',async()=>{plan.push({updates:[text('next')]});const r=await request('a');assert.equal(serial,1);assert.equal(r.body.usage.input_tokens,12345);});
-    await check('different conversation cannot inherit usage',async()=>{plan.push({updates:[text('other')]});const r=await request('b');assert.equal(serial,2);assert.notEqual(r.body.usage.input_tokens,12345);});
+    await check('text plus tool does not replay or replace session',async()=>{plan.push({updates:[tool,text('final answer'),usage]});const r=await request('a');assert.equal(r.status,200);assert.equal(r.body.output[0].content[0].text,'final answer');assert.equal(serial,1);assert.equal(calls.filter(c=>c[0]==='session/prompt').length,1);assert.ok(logs.some(x=>x.includes('正文 12 字')));assert.equal(r.body.usage.usage_status,'unavailable');assert.equal(r.body.usage.input_tokens,undefined);assert.equal(r.body.usage.context_used,12345);assert.equal(r.body.usage.context_size,1048576);});
+    await check('same conversation retains context',async()=>{plan.push({updates:[text('next')]});const r=await request('a');assert.equal(serial,1);assert.equal(r.body.usage.usage_status,'unavailable');assert.equal(r.body.usage.input_tokens,undefined);assert.equal(r.body.usage.context_used,12345);});
+    await check('different conversation cannot inherit usage',async()=>{plan.push({updates:[text('other')]});const r=await request('b');assert.equal(serial,2);assert.equal(r.body.usage.input_tokens,undefined);assert.notEqual(r.body.usage.context_used,12345);});
     await check('empty tool turn is nudged in the same session, then reported empty',async()=>{plan.push({updates:[tool]},{updates:[tool]},{updates:[tool]});const before=calls.length;const r=await request('a');const prompts=calls.slice(before).filter(c=>c[0]==='session/prompt');assert.equal(r.status,502);assert.equal(r.body.error.code,'EMPTY_RESPONSE');assert.equal(prompts.length,3,'one turn plus two same-session nudges');assert.equal(calls.slice(before).filter(c=>c[0]==='session/new').length,0,'must not switch session');assert.equal(calls.slice(before).filter(c=>c[0]==='session/close').length,0,'must not close the session');assert.ok(prompts.slice(1).every(p=>JSON.stringify(p[1].prompt).includes('没有输出正文')),'nudge text sent in same session');});
     await check('nudge recovers a final answer without replaying tools',async()=>{plan.push({updates:[tool]},{updates:[text('recovered answer'),usage]});const before=calls.length;const r=await request('a');assert.equal(r.status,200);assert.equal(r.body.output[0].content[0].text,'recovered answer');assert.equal(calls.slice(before).filter(c=>c[0]==='session/prompt').length,2);assert.equal(calls.slice(before).filter(c=>c[0]==='session/new').length,0);});
     await check('stream delta and final reasoning agree; output indexes agree',async()=>{plan.push({updates:[text('before'),tool,text('after'),usage]});const events=await request('a',true);const final=events.find(e=>e.type==='response.completed').response;const reasoning=events.filter(e=>e.type==='response.reasoning_summary_text.delta').map(e=>e.delta).join('');assert.equal(final.output[1].summary[0].text,reasoning);for(const e of events.filter(e=>e.type==='response.output_item.added'))assert.equal(final.output[e.output_index].id,e.item.id);assert.equal(final.output[0].content[0].text,'before\n\nafter');});
@@ -82,7 +82,7 @@ async function main() {
       plan.push({updates:[usage,text('live')]});
       const r=await fetch(`http://127.0.0.1:${port}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'test',messages:[{role:'user',content:'test'}],stream:true})});
       const chunks=(await r.text()).split('\n').filter(x=>x.startsWith('data: {')).map(x=>JSON.parse(x.slice(6)));
-      assert.ok(chunks.some(x=>x.usage?.prompt_tokens===12345 && x.choices[0].finish_reason===null));
+      assert.ok(chunks.some(x=>x.usage?.context_used===12345 && x.usage?.usage_status==='unavailable' && x.usage?.prompt_tokens===undefined && x.choices[0].finish_reason===null));
     });
     await check('disconnected queued request neither executes nor cancels active turn',async()=>{
       let release; let began; const started=new Promise(r=>began=r); const gate=new Promise(r=>release=r);
@@ -880,8 +880,9 @@ async function main() {
         const done1 = turn1.find((e) => e.type === 'response.completed');
         const fc1 = done1.data.response.output.find((o) => o.type === 'function_call');
         assert.ok(fc1, '首轮应挂起返回第一个 function_call');
-        assert.equal(done1.data.response.usage.input_tokens, 128945);
-        assert.equal(done1.data.response.usage.estimated, false);
+        assert.equal(done1.data.response.usage.usage_status, 'unavailable');
+        assert.equal(done1.data.response.usage.input_tokens, undefined);
+        assert.equal(done1.data.response.usage.context_used, 128945);
 
         // Step 2: 回填第一个工具结果，同时携带膨胀的本地历史文本，进入第二次 park
         const bloatedHistory = 'x'.repeat(240000);
@@ -900,8 +901,9 @@ async function main() {
         assert.ok(done2, `续流轮应正常 completed，实际事件: ${JSON.stringify(turn2)}`);
         const fc2 = done2.data.response.output.find((o) => o.type === 'function_call');
         assert.ok(fc2, '续流轮应挂起返回第二个 function_call');
-        assert.ok(done2.data.response.usage.input_tokens > 128945 && done2.data.response.usage.input_tokens < 129100, `第 2+ 次 park 应在真实 contextUsed(128945) 基础上叠加无放大工具步增量，绝不退化成虚高本地估算（实际: ${done2.data.response.usage.input_tokens}）`);
-        assert.equal(done2.data.response.usage.estimated, false);
+        assert.equal(done2.data.response.usage.usage_status, 'unavailable');
+        assert.equal(done2.data.response.usage.input_tokens, undefined);
+        assert.ok(done2.data.response.usage.context_used > 128945 && done2.data.response.usage.context_used < 129100, `第 2+ 次 park 应在真实 contextUsed(128945) 基础上叠加无放大工具步增量，绝不退化成虚高本地估算（实际: ${done2.data.response.usage.context_used}）`);
 
         // Step 3: 此时 main-bridged-sess 正挂在第二个 Read 上！
         // 真实模拟 PI-Desktop 发起的自动压缩请求（带 previous_response_id、instructions、完整历史多条消息、无 tools）：不得死锁！
@@ -1193,7 +1195,7 @@ async function main() {
       }
     });
 
-    await check('gateway retries transient 429 with reasoning keepalive and lightweight continuation', async () => {
+    await check('gateway retries transient 429 with transport keepalive and lightweight continuation', async () => {
       const p = await (async () => { const s = net.createServer(); await new Promise((r) => s.listen(0, '127.0.0.1', r)); const pt = s.address().port; await new Promise((r) => s.close(r)); return pt; })();
       const seenPrompts = [];
       let acpRef;
@@ -1239,7 +1241,8 @@ async function main() {
         assert.ok(seenPrompts[0].some((b) => b.type === 'image'), '首次尝试携带原始图片与完整请求');
         assert.equal(seenPrompts[1].length, 1, '同会话内部 429 重试转为单块轻量续推，绝不重复灌入大图');
         assert.ok(!seenPrompts[1][0].text.includes('XXXX'), '重试块不再重复长正文');
-        assert.ok(rawSse.includes('触发上游速率限制（429）'), 'SSE 思考流向前端推送了真实的 429 冷却提示保活帧');
+        assert.ok(!rawSse.includes('触发上游速率限制（429）') && !rawSse.includes('response.reasoning_summary_text.delta'), 'transport waiting is not model reasoning');
+        assert.ok((rawSse.match(/event: response\.in_progress/g) || []).length >= 3, 'both backoffs keep the connection alive');
         assert.ok(rawSse.includes('冷却重试后成功输出'), '最终正常返回完整输出，无需宿主断流重连');
         assert.ok(!rawSse.includes('response.failed'), '内部重试成功后不发 response.failed');
       } finally {
@@ -1377,11 +1380,21 @@ async function main() {
       }
     });
 
-    await check('bridged multi-tool burst recovers from post-tool 429 via cooldown and lightweight continuation', async () => {
+    await check('bridged multi-tool burst recovers from post-tool 429 with real SSE heartbeats, real backoff and no fake reasoning or text', async () => {
       const p = await (async () => { const s = net.createServer(); await new Promise((r) => s.listen(0, '127.0.0.1', r)); const pt = s.address().port; await new Promise((r) => s.close(r)); return pt; })();
       let mcpUrlSeen = '';
       let acpRef;
+      let chatSid = '';
+      let sessionSerial = 0;
       const seenPrompts = [];
+      const gwLogs = [];
+      const marks = { t429: 0, retryAt: 0, chatThrowAt: 0, chatRetryAt: 0 };
+      const RESP_FINAL = '五轮工具后冷却恢复完成';
+      const CHAT_FINAL = '聊天流冷却后恢复完成';
+      const RESP_THOUGHT = '模型真实思考：五步读取已覆盖关键目录。';
+      const CHAT_THOUGHT = '聊天流真实思考：先确认结论。';
+      // 传输层倒计时只能进网关日志；一旦出现在 reasoning 或正文里，就是「把倒计时伪装成思考」。
+      const FAKE_NOTE = /触发上游速率限制|⏳|秒后自动重试|网关冷却/;
       const acpMock = {
         policyBySession: new Map(), start: async () => {}, discover: async () => {},
         cwdFor: async () => process.env.PI_SCRATCH_DIR || process.cwd(),
@@ -1390,19 +1403,38 @@ async function main() {
         request: async (method, params) => {
           if (method === 'session/new') {
             mcpUrlSeen = params.mcpServers?.[0]?.url || '';
-            return { sessionId: 'post-tool-429', models: { currentModelId: 'test', availableModels: [] } };
+            sessionSerial += 1;
+            return { sessionId: `pt429-s${sessionSerial}`, models: { currentModelId: 'test', availableModels: [] } };
           }
           if (method === 'session/prompt') {
-            seenPrompts.push(params.prompt);
-            if (seenPrompts.length === 1) {
+            const promptText = (params.prompt || []).map((b) => (b && b.text) || '').join('');
+            seenPrompts.push({ sid: params.sessionId, prompt: params.prompt });
+            if (promptText.includes('CHAT_COOLDOWN_TEST')) chatSid = params.sessionId;
+            if (chatSid && params.sessionId === chatSid) {
+              if (!marks.chatThrowAt) {
+                marks.chatThrowAt = Date.now();
+                throw Object.assign(new Error('429 RESOURCE_EXHAUSTED: requests per minute exceeded'), { acp: { code: 429 } });
+              }
+              marks.chatRetryAt = Date.now();
               acpRef.onNotification({
                 method: 'session/update',
-                params: { sessionId: 'post-tool-429', update: { sessionUpdate: 'agent_message_chunk', content: { text: '先读取文件排查' } } },
+                params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: CHAT_THOUGHT } } },
+              });
+              acpRef.onNotification({
+                method: 'session/update',
+                params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { text: CHAT_FINAL } } },
+              });
+              return { stopReason: 'end_turn' };
+            }
+            if (!marks.t429) {
+              acpRef.onNotification({
+                method: 'session/update',
+                params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { text: '先读取文件排查' } } },
               });
               for (let i = 1; i <= 5; i += 1) {
                 acpRef.onNotification({
                   method: 'session/update',
-                  params: { sessionId: 'post-tool-429', update: { sessionUpdate: 'tool_call', toolCallId: `tc-${i}`, kind: 'read', title: `Read ${i}` } },
+                  params: { sessionId: params.sessionId, update: { sessionUpdate: 'tool_call', toolCallId: `tc-${i}`, kind: 'read', title: `Read ${i}` } },
                 });
                 const r = await fetch(mcpUrlSeen, {
                   method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' },
@@ -1410,11 +1442,17 @@ async function main() {
                 });
                 await r.text();
               }
+              marks.t429 = Date.now();
               throw Object.assign(new Error('429 RESOURCE_EXHAUSTED: tokens per minute exceeded'), { acp: { code: 429 } });
             }
+            marks.retryAt = Date.now();
             acpRef.onNotification({
               method: 'session/update',
-              params: { sessionId: 'post-tool-429', update: { sessionUpdate: 'agent_message_chunk', content: { text: '五轮工具后冷却恢复完成' } } },
+              params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: RESP_THOUGHT } } },
+            });
+            acpRef.onNotification({
+              method: 'session/update',
+              params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { text: RESP_FINAL } } },
             });
             return { stopReason: 'end_turn' };
           }
@@ -1424,32 +1462,112 @@ async function main() {
       acpRef = acpMock;
       const dir = path.join(process.env.PI_SCRATCH_DIR || process.cwd(), `gateway-pt429-${Date.now()}`);
       const cfgPt = { ...config, rateLimitMaxRetries: 2, rateLimitRetryBaseMs: 80, highContextThrottleTokens: 0, source: path.join(dir, 'config.json') };
-      const gw = createGateway({ acp: acpMock, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => cfgPt, log: () => {} });
+      const gw = createGateway({ acp: acpMock, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => cfgPt, log: (m) => gwLogs.push(m) });
       await gw.listen([p]);
+      // 带时间戳的流式读取：用来区分「冷却期真实下发的协议帧」与「流开头就发过的首帧」。
+      const readTimed = async (url, payload) => {
+        const startedAt = Date.now();
+        const resp = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        const arrivals = [];
+        let raw = '';
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          raw += decoder.decode(value, { stream: true });
+          arrivals.push({ end: raw.length, at: Date.now() });
+        }
+        raw += decoder.decode();
+        return { status: resp.status, text: raw, arrivals, elapsed: Date.now() - startedAt };
+      };
+      const arrivalAt = (arrivals, index) => { const hit = arrivals.find((a) => a.end > index); return hit ? hit.at : 0; };
+      const framesOf = (raw, name) => [...raw.matchAll(new RegExp(`event: ${name.replace(/\./g, '\\.')}\\ndata: (.+)\\n`, 'g'))]
+        .map((m) => ({ index: m.index, data: JSON.parse(m[1]) }));
       try {
         const input = [{ role: 'user', content: '执行五步连续读取' }];
         const tools = [{ type: 'function', name: 'Read', parameters: { type: 'object', properties: {} } }];
-        let finalSse = '';
+        let finalRound = null;
         for (let round = 0; round < 6; round += 1) {
-          const r = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
-            method: 'POST', headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'pt429-conv', tools, input }),
-          });
-          const sse = await r.text();
+          const r = await readTimed(`http://127.0.0.1:${p}/v1/responses`, { model: 'test', stream: true, prompt_cache_key: 'pt429-conv', tools, input });
+          assert.equal(r.status, 200, `round ${round + 1} 应保持 200 长连接`);
+          if (round === 0) {
+            assert.ok(r.text.includes('先读取文件排查'), '429 之前的真实正文必须保留');
+            assert.ok(!FAKE_NOTE.test(r.text), '首轮也不得出现假倒计时文本');
+          }
           if (round < 5) {
-            const matches = [...sse.matchAll(/"call_id":"([^"]+)"/g)];
-            assert.ok(matches.length > 0, `round ${round + 1} expected tool call, got: ${sse.slice(-300)}`);
+            const matches = [...r.text.matchAll(/"call_id":"([^"]+)"/g)];
+            assert.ok(matches.length > 0, `round ${round + 1} expected tool call, got: ${r.text.slice(-300)}`);
             const cid = matches[matches.length - 1][1];
             input.push({ type: 'function_call', call_id: cid, name: 'Read', arguments: '{}' });
             input.push({ type: 'function_call_output', call_id: cid, output: `res-${round + 1}` });
           } else {
-            finalSse = sse;
+            finalRound = r;
           }
         }
-        assert.equal(seenPrompts.length, 2, '5 次工具回填后撞 429 必须进入冷却并自动续推');
-        assert.ok(finalSse.includes('触发上游速率限制（429）'), '续流 HTTP 响应包含 429 冷却提示');
-        assert.ok(finalSse.includes('五轮工具后冷却恢复完成'), '冷却重试后正常返回最终答案');
-        assert.ok(!finalSse.includes('response.failed'), '不应向宿主输出 response.failed');
+        const finalSse = finalRound.text;
+
+        // A) 真 SSE 传输心跳：冷却期间下发合法的 response.in_progress 数据帧，且早于最终正文。
+        const inProgress = framesOf(finalSse, 'response.in_progress');
+        const textFrames = framesOf(finalSse, 'response.output_text.delta');
+        const reasoningFrames = framesOf(finalSse, 'response.reasoning_summary_text.delta');
+        const textAt = finalSse.indexOf('event: response.output_text.delta');
+        assert.ok(inProgress.length >= 2, `冷却期间必须下发真实 response.in_progress 协议帧（首帧 + 冷却心跳），实际 ${inProgress.length} 帧`);
+        assert.ok(inProgress.every((f) => f.data.type === 'response.in_progress' && f.data.response && f.data.response.status === 'in_progress' && Number.isFinite(f.data.sequence_number)), '保活帧必须是带 sequence_number 的合法 Responses 协议事件，不能是注释帧');
+        assert.ok(inProgress[inProgress.length - 1].index < textAt, '冷却心跳必须出现在最终正文之前');
+        const lastBeatAt = arrivalAt(finalRound.arrivals, inProgress[inProgress.length - 1].index);
+        assert.ok(lastBeatAt >= marks.t429, `冷却心跳必须晚于 429 抛出时刻才下发给宿主，实际相对 429 为 ${lastBeatAt - marks.t429}ms`);
+        assert.ok(lastBeatAt <= marks.retryAt + 1000, `冷却心跳必须在最终答案之前送达宿主，实际 ${lastBeatAt - marks.t429}ms`);
+
+        // B) 真实 429 退避 + 同会话单次轻量续推。
+        const backoffMs = marks.retryAt - marks.t429;
+        assert.ok(backoffMs >= 60, `429 后必须先真实退避（rateLimitRetryBaseMs=80ms）再重试，实际 ${backoffMs}ms`);
+        assert.ok(backoffMs < 1500, `退避不得退化成宿主重连级长等待，实际 ${backoffMs}ms`);
+        assert.equal(seenPrompts.length, 2, '5 次工具回填后撞 429 必须进入冷却并自动续推，且只重试一次');
+        const retryText = String((seenPrompts[1].prompt[0] || {}).text || '');
+        assert.equal(seenPrompts[1].prompt.length, 1, '同会话内部 429 重试只发一个轻量续推块');
+        assert.ok(retryText.startsWith('请继续完成上一条请求'), `重试块必须是轻量续推指令，实际：${retryText.slice(0, 120)}`);
+        assert.ok(!retryText.includes('执行五步连续读取') && !/res-\d/.test(retryText), '重试不得重放原始正文或工具结果');
+        assert.ok(gwLogs.some((l) => l.includes('检测到上游 429') && l.includes('第 1/2 次')), '冷却倒计时只能留在网关日志里，不得进入模型输出');
+
+        // C) 最终结果 + 无假 reasoning / 无假正文（正反双向）。
+        assert.ok(finalSse.includes(RESP_FINAL), '冷却重试后正常返回最终答案');
+        assert.equal(framesOf(finalSse, 'response.completed').length, 1, '最终必须且只能有一个 response.completed');
+        assert.ok(!finalSse.includes('response.failed'), '内部冷却重试成功后不得向宿主输出 response.failed');
+        assert.ok(framesOf(finalSse, 'response.output_item.added').some((f) => f.data.item && f.data.item.type === 'message'), '最终答案必须作为真实 message item 下发');
+        const textJoined = textFrames.map((f) => f.data.delta || '').join('');
+        const reasoningJoined = reasoningFrames.map((f) => f.data.delta || '').join('');
+        assert.equal(textJoined.trim(), RESP_FINAL, `正文只能包含模型真实输出，实际：${textJoined.slice(0, 200)}`);
+        assert.ok(!FAKE_NOTE.test(textJoined), '正文不得混入 429 倒计时提示');
+        assert.ok(!/冷却|429|⏳|正在等待/.test(reasoningJoined), `reasoning 不得混入等待/倒计时文本，实际：${reasoningJoined.slice(0, 200)}`);
+        assert.equal(reasoningJoined.trim(), RESP_THOUGHT, `真实模型思考必须原样进入 reasoning（正向对照），实际：${reasoningJoined.slice(0, 200)}`);
+        assert.ok(!FAKE_NOTE.test(finalSse), '整个 Responses 响应体都不得出现 429 倒计时提示文本');
+
+        // D) Chat 侧同一冷却逻辑：真实空 delta 心跳 + 无假 reasoning/假正文。
+        const respPromptCount = seenPrompts.length;
+        const chat = await readTimed(`http://127.0.0.1:${p}/v1/chat/completions`, {
+          model: 'test', stream: true, user: 'pt429-chat',
+          messages: [{ role: 'user', content: 'CHAT_COOLDOWN_TEST 请给我一句结论' }],
+        });
+        assert.equal(chat.status, 200, 'Chat 冷却期间必须保持 200 长连接');
+        const chatPrompts = seenPrompts.filter((x) => x.sid === chatSid);
+        assert.equal(chatPrompts.length, 2, `Chat 侧 429 也必须在同会话内自动重试一次，实际 ${chatPrompts.length} 次`);
+        assert.ok(!chatPrompts[1].prompt.some((b) => String((b && b.text) || '').includes('CHAT_COOLDOWN_TEST')), 'Chat 重试块不得重放原始正文');
+        const chatBackoffMs = marks.chatRetryAt - marks.chatThrowAt;
+        assert.ok(chatBackoffMs >= 60 && chatBackoffMs < 1500, `Chat 429 退避必须真实且短，实际 ${chatBackoffMs}ms`);
+        const chatBeats = [...chat.text.matchAll(/"delta":\{\},"finish_reason":null/g)];
+        assert.ok(chatBeats.length >= 1, `Chat 冷却期间必须下发真实空 delta 数据帧保活，实际 ${chatBeats.length} 帧`);
+        assert.ok(chatBeats[0].index < chat.text.indexOf(CHAT_FINAL), 'Chat 保活帧必须早于最终正文');
+        const chatBeatAt = arrivalAt(chat.arrivals, chatBeats[0].index);
+        assert.ok(chatBeatAt >= marks.chatThrowAt, `Chat 保活帧必须晚于 429 抛出时刻才下发给宿主，实际相对 429 为 ${chatBeatAt - marks.chatThrowAt}ms`);
+        assert.ok(chatBeatAt <= marks.chatRetryAt + 1000, `Chat 保活帧必须在最终答案之前送达宿主，实际 ${chatBeatAt - marks.chatThrowAt}ms`);
+        assert.ok(chat.text.includes(`"content":"${CHAT_FINAL}"`), 'Chat 冷却重试后正常返回最终答案');
+        assert.ok(chat.text.includes('"finish_reason":"stop"'), 'Chat 流必须以 stop 正常收尾');
+        assert.ok(!/"error"/.test(chat.text), '内部冷却重试成功后 Chat 流不得下发 error 帧');
+        assert.ok(!FAKE_NOTE.test(chat.text), 'Chat 流不得出现 429 倒计时提示文本');
+        assert.ok(!/"reasoning_content":"[^"]*(冷却|429|⏳|正在等待)/.test(chat.text), 'Chat reasoning_content 不得混入等待/倒计时文本');
+        assert.ok(chat.text.includes(`"reasoning_content":"${CHAT_THOUGHT}"`), 'Chat 真实模型思考必须照常下发（正向对照）');
+        assert.equal(seenPrompts.length, respPromptCount + 2, 'Chat 侧只允许一次冷却重试，不得多发请求');
       } finally {
         gw.close();
         try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -3218,7 +3336,9 @@ async function main() {
         }));
         const d1 = t1.find((e) => e.type === 'response.completed');
         const fcRead = d1.data.response.output.find((o) => o.type === 'function_call');
-        assert.equal(d1.data.response.usage.input_tokens, 920000);
+        assert.equal(d1.data.response.usage.usage_status, 'unavailable');
+        assert.equal(d1.data.response.usage.input_tokens, undefined);
+        assert.equal(d1.data.response.usage.context_used, 920000);
 
         // 2. 第二步：宿主检测到 920,000 达阈值，在回传 Read 结果前发起旁路自动压缩请求
         const sumRes = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
@@ -3249,7 +3369,9 @@ async function main() {
         assert.ok(fcBash, '压缩重置后的新会话应正常挂起下一个工具 Bash');
         assert.ok(closedSids.includes('bridged-sess-1'), '工具轮中途触发真实 Compaction 时必须关闭膨胀的旧会话 bridged-sess-1');
         assert.equal(bridgedSessionSeq, 2, '必须创建全新的底层会话 bridged-sess-2');
-        assert.ok(d2.data.response.usage.input_tokens < 50000, `新会话首次挂起绝不能残留旧会话的 920000 水位（实际: ${d2.data.response.usage.input_tokens}），否则会触发无限连环压缩`);
+        assert.equal(d2.data.response.usage.usage_status, 'unavailable');
+        assert.equal(d2.data.response.usage.input_tokens, undefined);
+        assert.ok(d2.data.response.usage.context_used < 50000, `新会话首次挂起绝不能残留旧会话的 920000 水位（实际: ${d2.data.response.usage.context_used}），否则会触发无限连环压缩`);
         const sess2Prompt = seenPrompts.find((x) => x.sid === 'bridged-sess-2');
         assert.ok(sess2Prompt.promptText.includes('KEEP_SYS_PROMPT_V1'), '重建的新会话必须包含完整系统指令');
         assert.ok(sess2Prompt.promptText.includes('User asked to refactor heavy.ts'), '重建的新会话必须包含压缩摘要');
@@ -3269,10 +3391,14 @@ async function main() {
           }),
         }));
         const d3 = t3.find((e) => e.type === 'response.completed');
-        assert.equal(d3.data.response.usage.input_tokens, 14200, '压缩后新会话应回落至真实低水位 14200');
+        assert.equal(d3.data.response.usage.usage_status, 'unavailable');
+        assert.equal(d3.data.response.usage.input_tokens, undefined);
+        assert.equal(d3.data.response.usage.context_used, 14200, '压缩后新会话应回落至真实低水位 14200');
         assert.equal(d3.data.response.output.find((o) => o.type === 'message').content[0].text, 'all done on fresh compacted session');
-        assert.deepEqual(d3.data.response.usage.input_tokens_details, { cached_tokens: 12000 }, '续流终态应携带本轮真实 cached_tokens');
-        assert.deepEqual(d3.data.response.usage.output_tokens_details, { reasoning_tokens: 20 }, '续流终态应携带本轮真实 reasoning_tokens');
+        assert.equal(d3.data.response.usage.input_tokens_details, undefined);
+        assert.equal(d3.data.response.usage.output_tokens_details, undefined);
+        assert.equal(d3.data.response.usage.acp_turn_usage.cachedReadTokens, 12000, '续流终态应通过 acp_turn_usage 保留本轮真实 cachedReadTokens');
+        assert.equal(d3.data.response.usage.acp_turn_usage.thoughtTokens, 20, '续流终态应通过 acp_turn_usage 保留本轮真实 thoughtTokens');
       } finally {
         gw.close();
         try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -3411,7 +3537,9 @@ async function main() {
         const done2 = r2.find((e) => e.type === 'response.completed').data.response;
         assert.ok(closedSids.includes('task-sess-1'), '挂起 Task 期间父会话自身完成压缩后必须关闭旧膨胀会话 task-sess-1');
         assert.equal(sessSeq, 2, '必须切换到重建的清洁会话 task-sess-2');
-        assert.equal(done2.usage.input_tokens, 15800, '水位必须从 890000 降至新会话真实 15800，根除连环压缩');
+        assert.equal(done2.usage.usage_status, 'unavailable');
+        assert.equal(done2.usage.input_tokens, undefined);
+        assert.equal(done2.usage.context_used, 15800, '水位必须从 890000 降至新会话真实 15800，根除连环压缩');
         const rebuiltPrompt = seenPrompts.find((x) => x.sid === 'task-sess-2');
         assert.ok(rebuiltPrompt.promptText.includes('SUBAGENT_AUDIT_REPORT_PAYLOAD'), '重建会话必须完整保留 Task 工具返回报告');
 
@@ -3431,10 +3559,13 @@ async function main() {
         const park3 = r3.find((e) => e.type === 'response.completed').data.response;
         const fcRead = park3.output.find((o) => o.type === 'function_call');
         assert.ok(fcRead && fcRead.name === 'Read');
-        assert.equal(park3.usage.input_tokens, 16400);
+        assert.equal(park3.usage.usage_status, 'unavailable');
+        assert.equal(park3.usage.input_tokens, undefined);
+        assert.equal(park3.usage.context_used, 16400);
         assert.equal(park3.usage.input_tokens_details, undefined, '新一轮挂起期间不得串染上一轮的 cached_tokens');
         assert.equal(park3.usage.output_tokens_details, undefined, '新一轮挂起期间不得串染上一轮的 reasoning_tokens');
-        assert.ok(park3.usage.output_tokens < 50, `新一轮挂起期间不得串染上一轮的 outputTokens=180（实际: ${park3.usage.output_tokens}）`);
+        assert.equal(park3.usage.acp_turn_usage, undefined, '新一轮挂起期间不得串染上一轮的 acp_turn_usage');
+        assert.ok(park3.usage.observed_output_tokens < 50, `新一轮挂起期间不得串染上一轮的 outputTokens=180（实际: ${park3.usage.observed_output_tokens}）`);
 
         // 回填 Read 收尾清理
         const r4 = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
@@ -3452,7 +3583,10 @@ async function main() {
           }),
         }));
         const done4 = r4.find((e) => e.type === 'response.completed').data.response;
-        assert.deepEqual(done4.usage.input_tokens_details, { cached_tokens: 15000 });
+        assert.equal(done4.usage.usage_status, 'unavailable');
+        assert.equal(done4.usage.input_tokens, undefined);
+        assert.equal(done4.usage.input_tokens_details, undefined);
+        assert.equal(done4.usage.acp_turn_usage.cachedReadTokens, 15000);
       } finally {
         gw.close();
         try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -3776,7 +3910,9 @@ async function main() {
       };
       try {
         const r0 = await postResp([{ role: 'user', content: 'seed' }]);
-        assert.equal(r0.usage.input_tokens, 187300);
+        assert.equal(r0.usage.usage_status, 'unavailable');
+        assert.equal(r0.usage.input_tokens, undefined);
+        assert.equal(r0.usage.context_used, 187300);
 
         const hist = [
           { role: 'user', content: 'seed' },
@@ -3785,43 +3921,53 @@ async function main() {
         ];
         const p1 = await postResp(hist);
         const fc1 = p1.output.find((o) => o.type === 'function_call');
-        assert.ok(p1.usage.input_tokens > 187300 && p1.usage.input_tokens < 188000, `park1 应平滑微增而非死锁在 187300（实际: ${p1.usage.input_tokens}）`);
+        assert.equal(p1.usage.input_tokens, undefined);
+        assert.ok(p1.usage.context_used > 187300 && p1.usage.context_used < 188000, `park1 应平滑微增而非死锁在 187300（实际: ${p1.usage.context_used}）`);
 
         hist.push({ type: 'function_call', call_id: fc1.call_id, name: 'Read', arguments: fc1.arguments });
         hist.push({ type: 'function_call_output', call_id: fc1.call_id, output: 'A'.repeat(4000) }); // ~1000 tokens
         const p2 = await postResp(hist);
         const fc2 = p2.output.find((o) => o.type === 'function_call');
-        assert.ok(p2.usage.input_tokens >= p1.usage.input_tokens + 950 && p2.usage.input_tokens < p1.usage.input_tokens + 1300, `park2 应按真实无放大增量涨约 1000 tokens（p1=${p1.usage.input_tokens}, p2=${p2.usage.input_tokens}）`);
+        assert.equal(p2.usage.input_tokens, undefined);
+        assert.ok(p2.usage.context_used >= p1.usage.context_used + 950 && p2.usage.context_used < p1.usage.context_used + 1300, `park2 应按真实无放大增量涨约 1000 tokens（p1=${p1.usage.context_used}, p2=${p2.usage.context_used}）`);
 
         hist.push({ type: 'function_call', call_id: fc2.call_id, name: 'Read', arguments: fc2.arguments });
         hist.push({ type: 'function_call_output', call_id: fc2.call_id, output: 'B'.repeat(8000) }); // ~2000 tokens
         const p3 = await postResp(hist);
         const fc3 = p3.output.find((o) => o.type === 'function_call');
-        assert.ok(p3.usage.input_tokens >= p2.usage.input_tokens + 1950 && p3.usage.input_tokens < p2.usage.input_tokens + 2300, `park3 应按真实无放大增量涨约 2000 tokens（p2=${p2.usage.input_tokens}, p3=${p3.usage.input_tokens}）`);
+        assert.equal(p3.usage.input_tokens, undefined);
+        assert.ok(p3.usage.context_used >= p2.usage.context_used + 1950 && p3.usage.context_used < p2.usage.context_used + 2300, `park3 应按真实无放大增量涨约 2000 tokens（p2=${p2.usage.context_used}, p3=${p3.usage.context_used}）`);
 
         hist.push({ type: 'function_call', call_id: fc3.call_id, name: 'Read', arguments: fc3.arguments });
         hist.push({ type: 'function_call_output', call_id: fc3.call_id, output: 'C'.repeat(6000) }); // ~1500 tokens
         const fin2 = await postResp(hist);
-        assert.ok(fin2.usage.input_tokens > 190000 && fin2.usage.input_tokens < 196000, `多步累计 PromptResponse.usage(758700) 必须展开为单轮真实水位 ~192k 并回写（实际: ${fin2.usage.input_tokens}）`);
-        assert.ok(fin2.usage.input_tokens_details.cached_tokens < fin2.usage.input_tokens, 'cached_tokens 必须按比例缩放而非顶满 100%');
+        assert.equal(fin2.usage.usage_status, 'unavailable');
+        assert.equal(fin2.usage.input_tokens, undefined);
+        assert.equal(fin2.usage.input_tokens_details, undefined);
+        assert.ok(fin2.usage.context_used > 190000 && fin2.usage.context_used < 196000, `多步累计 PromptResponse.usage(758700) 必须展开为单轮真实水位 ~192k 并回写 context_used（实际: ${fin2.usage.context_used}）`);
+        assert.equal(fin2.usage.acp_turn_usage.cachedReadTokens, 720000, 'acp_turn_usage 保留原始累计缓存，不作比例缩放');
 
         // Turn 3：验证 owner.contextUsed 已继承 ~192k，且工具返回后上一步 usage_update(193000) 保留刚回填的 3000 token 工具增量，终态 2 倍折叠值 (396000) 自动展开
         hist.push({ role: 'assistant', content: 'All 3 files analyzed.' });
         hist.push({ role: 'user', content: 'now inspect delta and epsilon' });
         const t3p1 = await postResp(hist);
         const fc4 = t3p1.output.find((o) => o.type === 'function_call');
-        assert.ok(t3p1.usage.input_tokens > fin2.usage.input_tokens, `下一轮挂起必须继承已回写的 ${fin2.usage.input_tokens} 水位并继续递增（实际: ${t3p1.usage.input_tokens}）`);
+        assert.equal(t3p1.usage.input_tokens, undefined);
+        assert.ok(t3p1.usage.context_used > fin2.usage.context_used, `下一轮挂起必须继承已回写的 ${fin2.usage.context_used} 水位并继续递增（实际: ${t3p1.usage.context_used}）`);
 
         hist.push({ type: 'function_call', call_id: fc4.call_id, name: 'Read', arguments: fc4.arguments });
         hist.push({ type: 'function_call_output', call_id: fc4.call_id, output: 'D'.repeat(12000) }); // ~3000 tokens
         const t3p2 = await postResp(hist);
         const fc5 = t3p2.output.find((o) => o.type === 'function_call');
-        assert.ok(t3p2.usage.input_tokens >= 195800 && t3p2.usage.input_tokens < 197500, `item.resolve 后的上一步 usage_update(193000) 必须保留刚回填的 3000 tokens 工具结果，严禁倒退回 193000（实际: ${t3p2.usage.input_tokens}）`);
+        assert.equal(t3p2.usage.input_tokens, undefined);
+        assert.ok(t3p2.usage.context_used >= 195800 && t3p2.usage.context_used < 197500, `item.resolve 后的上一步 usage_update(193000) 必须保留刚回填的 3000 tokens 工具结果，严禁倒退回 193000（实际: ${t3p2.usage.context_used}）`);
 
         hist.push({ type: 'function_call', call_id: fc5.call_id, name: 'Read', arguments: fc5.arguments });
         hist.push({ type: 'function_call_output', call_id: fc5.call_id, output: 'E'.repeat(2000) }); // ~500 tokens
         const fin3 = await postResp(hist);
-        assert.ok(fin3.usage.input_tokens > 196000 && fin3.usage.input_tokens < 205000, `1.5.0 漏帧导致的 2 倍叠加 usage_update(396000) 必须自动展开还原 ~199k（实际: ${fin3.usage.input_tokens}）`);
+        assert.equal(fin3.usage.usage_status, 'unavailable');
+        assert.equal(fin3.usage.input_tokens, undefined);
+        assert.ok(fin3.usage.context_used > 196000 && fin3.usage.context_used < 205000, `1.5.0 漏帧导致的 2 倍叠加 usage_update(396000) 必须自动展开还原 ~199k（实际: ${fin3.usage.context_used}）`);
       } finally {
         gw.close();
         try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -4036,7 +4182,9 @@ async function main() {
         c1Hist.push({ type: 'function_call', call_id: c1fc2.call_id, name: 'Read', arguments: c1fc2.arguments });
         c1Hist.push({ type: 'function_call_output', call_id: c1fc2.call_id, output: 'S'.repeat(4000) });
         const c1Fin = await postR('fresh-case-1', c1Hist);
-        assert.ok(c1Fin.usage.input_tokens >= 21000 && c1Fin.usage.input_tokens <= 24000, `新建会话 3 拍折叠 usage_update(63999) 必须展开回 ~22k（实际: ${c1Fin.usage.input_tokens}）`);
+        assert.equal(c1Fin.usage.usage_status, 'unavailable');
+        assert.equal(c1Fin.usage.input_tokens, undefined);
+        assert.ok(c1Fin.usage.context_used >= 21000 && c1Fin.usage.context_used <= 24000, `新建会话 3 拍折叠 usage_update(63999) 必须展开回 ~22k（实际: ${c1Fin.usage.context_used}）`);
 
         // Verify Case 2 (fresh session 4 calls cumulative PromptResponse.usage=87350 -> ~23k, NOT ~30.6k)
         const c2Hist = [{ role: 'user', content: init20k }];
@@ -4053,7 +4201,10 @@ async function main() {
         c2Hist.push({ type: 'function_call', call_id: c2fc3.call_id, name: 'Read', arguments: c2fc3.arguments });
         c2Hist.push({ type: 'function_call_output', call_id: c2fc3.call_id, output: 'Z'.repeat(4000) });
         const c2Fin = await postR('fresh-case-2', c2Hist);
-        assert.ok(c2Fin.usage.input_tokens >= 21500 && c2Fin.usage.input_tokens <= 25000, `新建会话 4 拍累计输入不得把初始提示词当成增长虚胖至 30k+（实际: ${c2Fin.usage.input_tokens}）`);
+        assert.equal(c2Fin.usage.usage_status, 'unavailable');
+        assert.equal(c2Fin.usage.input_tokens, undefined);
+        assert.ok(c2Fin.usage.context_used >= 21500 && c2Fin.usage.context_used <= 25000, `新建会话 4 拍累计输入不得把初始提示词当成增长虚胖至 30k+（实际: ${c2Fin.usage.context_used}）`);
+        assert.equal(c2Fin.usage.acp_turn_usage.cachedReadTokens, 60000);
 
         // Verify Case 3 (100,000 -> +1,000 result -> 102,000 preceding usage_update -> next park >= 103,000)
         const c3Hist = [{ role: 'user', content: 'start 100k test' }];
@@ -4063,7 +4214,8 @@ async function main() {
         c3Hist.push({ type: 'function_call_output', call_id: c3fc1.call_id, output: 'M'.repeat(4000) }); // 1,000 tokens
         const c3p2 = await postR('fresh-case-3', c3Hist);
         const c3fc2 = c3p2.output.find((o) => o.type === 'function_call');
-        assert.ok(c3p2.usage.input_tokens >= 103000, `上一步延迟 usage_update(102000) 绝不能吞掉刚回填的 1000 token 工具结果（实际: ${c3p2.usage.input_tokens}）`);
+        assert.equal(c3p2.usage.input_tokens, undefined);
+        assert.ok(c3p2.usage.context_used >= 103000, `上一步延迟 usage_update(102000) 绝不能吞掉刚回填的 1000 token 工具结果（实际: ${c3p2.usage.context_used}）`);
         c3Hist.push({ type: 'function_call', call_id: c3fc2.call_id, name: 'Read', arguments: c3fc2.arguments });
         c3Hist.push({ type: 'function_call_output', call_id: c3fc2.call_id, output: 'done' });
         await postR('fresh-case-3', c3Hist);
@@ -4202,7 +4354,9 @@ async function main() {
         assert.ok(steerResp, '新打断轮次必须正常完成结算');
         assert.equal(steerResp.output.find((o) => o.type === 'message')?.content?.[0]?.text, 'STEERED_NEW_ANSWER', '新回答必须交付给新打断请求而非旧挂起请求');
         assert.ok(!oldRaw.includes('STEERED_NEW_ANSWER'), '被接管的旧请求不得窃取新轮次回答');
-        assert.ok(steerResp.usage.input_tokens < 500, `旧挂起工具的 1000 tokens 不得污染新打断轮次统计（实际: ${steerResp.usage.input_tokens}）`);
+        assert.equal(steerResp.usage.usage_status, 'unavailable');
+        assert.equal(steerResp.usage.input_tokens, undefined);
+        assert.ok((steerResp.usage.context_used || 0) < 500, `旧挂起工具的 1000 tokens 不得污染新打断轮次统计（实际: ${steerResp.usage.context_used}）`);
       } finally {
         if (releaseCwd) releaseCwd();
         gw.close();

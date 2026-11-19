@@ -213,13 +213,23 @@ test('bridged tool usage includes observed thought and arguments without rebilli
   try{
     await gateway.listen([port]);
     const first=await send([user('read a fixture')]);
-    assert.ok(first.usage.output_tokens>0,'tool-only park must report output');
-    assert.ok(first.usage.output_tokens_details.reasoning_tokens>0,'received thought chunks must be estimated');
+    assert.equal(first.usage.usage_status,'unavailable');
+    assert.equal(first.usage.input_tokens,undefined);
+    assert.equal(first.usage.output_tokens,undefined);
+    assert.equal(first.usage.output_tokens_details,undefined);
+    assert.ok(first.usage.observed_output_tokens>0,'tool-only park must report observed output');
+    assert.ok(first.usage.observed_reasoning_tokens>0,'received thought chunks must be observed');
     assert.equal(first.usage.output_estimated,true);
+    assert.ok(first.usage.context_used>=256844);
     const call=first.output.find(x=>x.type==='function_call');assert.ok(call);
     const final=await send([user('read a fixture'),call,{type:'function_call_output',call_id:call.call_id,output:'fixture content'}]);
-    assert.equal(first.usage.output_tokens+final.usage.output_tokens,1000,'final usage is cumulative, not another 1000 tokens');
-    assert.ok(final.usage.input_tokens<100000,'authoritative runtime shrink must not be frozen by a monotonic clamp');
+    assert.equal(final.usage.usage_status,'unavailable');
+    assert.equal(final.usage.input_tokens,undefined);
+    assert.equal(final.usage.output_tokens,undefined);
+    assert.equal(final.usage.observed_output_tokens,1,'final leg only counts its own visible output without rebilling or subtracting parked estimate');
+    assert.equal(final.usage.acp_turn_usage.scope,'prompt_aggregate');
+    assert.equal(final.usage.acp_turn_usage.outputTokens,1000,'cumulative official output stays unsubtracted in acp_turn_usage');
+    assert.ok(final.usage.context_used>=25328 && final.usage.context_used<100000,'authoritative runtime shrink must not be frozen by a monotonic clamp');
     assert.ok(logs.some(s=>s.includes('上下文水位回落')));
   }finally{await gateway.close();fs.rmSync(dir,{recursive:true,force:true});}
 });
@@ -357,6 +367,9 @@ test('estimated output and reasoning are independent of streaming chunk boundari
       const input = [user('read fixtures')];
       for (let leg = 0; leg < 4; leg++) {
         const { body } = await send(input, { tools, stream: true }); usages.push(body.usage);
+        assert.equal(body.usage.usage_status, 'unavailable');
+        assert.equal(body.usage.output_tokens, undefined);
+        assert.equal(body.usage.output_tokens_details, undefined);
         assert.equal(body.usage.output_estimated, true);
         const call = body.output.find(item => item.type === 'function_call');
         if (leg < 3) {
@@ -364,7 +377,7 @@ test('estimated output and reasoning are independent of streaming chunk boundari
         } else assert.equal(call, undefined);
       }
     });
-    const total = usages.reduce((sum, usage) => ({ output: sum.output + usage.output_tokens, reasoning: sum.reasoning + (usage.output_tokens_details?.reasoning_tokens || 0) }), { output: 0, reasoning: 0 });
+    const total = usages.reduce((sum, usage) => ({ output: sum.output + usage.observed_output_tokens, reasoning: sum.reasoning + (usage.observed_reasoning_tokens || 0) }), { output: 0, reasoning: 0 });
     assert.deepEqual(total, { output: 240 + 3 * countTokens(JSON.stringify(args)), reasoning: 80 });
     totals.push(total);
   }
