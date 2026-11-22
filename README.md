@@ -18,7 +18,7 @@
 
 ---
 
-**2.3.9 / 原版 PI-Desktop 0.22.0：** 输入框右侧自动显示本网关最近请求的 **PI 输入预算估算**，点开可分别看 PI 采样与 ACP 原始水位（连续多工具轮次中原生圆环停在上一单腿样本属正常契约，长工具链期间请以此控件为准；不是账单，也不是压缩触发线）。同步包含 `2.3.8 → 2.3.9` 就地升级扩展隔离、自定义端点切模即时围栏、本地回环/代理 `connectex` 自动重启热恢复，以及多工具 180 秒重试会话解锁与尾部批次重放。导入 `.piplug`、批准 `agent.extension` 和新增的 `renderer.extension` 即可启用显示；无需改 PI 或输命令。见[工具栏读数](docs/CONTEXT-METER.md)，`/acp-context` 仍可使用。
+**2.4.0（默认运行时 `agy-acp-server 1.5.2`）：** 默认官方运行时升级至 **`1.5.2`**（支持从 `1.3.0` / `1.5.0` 一键平滑升级），原生适配 **`gemini-4-neon`** 与 **`gemini-4-hydrogen`**（底层 `-extra_high` 双向映射为标准 `xhigh` 档位，兼容 CCPA 三档映射与 `configOptions` 目录），对齐 `1.5.2` 会话恢复 `currentModelId` 同步、`-32602` 非法模型快速失败及取消/断连合成块分级处置；同时重构上下文压缩与续接全链路（默认 `reportedMaxTokens=32768` 恢复 `256K` 模型 `~200.9K` 自动压缩线、统一字符+UTF-8 字节双预算并前置 `CONTEXT_BUDGET_EXCEEDED` 无损预检、分离非截断型分支摘要、补齐 `/v1/responses` `previous_response_id` 增量工具交付续接、加固显式键隔离与按请求原子签名提交及失效足迹记忆保留），并完整保留输入框工具栏上下文计量插槽（`agent/budget-status-240.mjs`）。见[工具栏读数](docs/CONTEXT-METER.md)，`/acp-context` 仍可使用。
 
 ## 📑 目录
 
@@ -29,8 +29,8 @@
   - [2. 初始化运行时与一键登录](#2-初始化运行时与一键登录)
   - [3. 在 PI-Desktop 中接入服务](#3-在-pi-desktop-中接入服务)
 - [🧠 深度思考与思维链自适应体系](#-深度思考与思维链自适应体系)
-  - [支持模型总览（共 8 款模型）](#支持模型总览共-8-款模型)
-  - [全新 Gemini 4 Hydrogen 与 xhigh 档位](#全新-gemini-4-hydrogen-与-xhigh-档位)
+  - [支持模型总览](#支持模型总览)
+  - [全新 Gemini 4 Neon / Hydrogen 与 xhigh 档位](#全新-gemini-4-neon--hydrogen-与-xhigh-档位)
   - [自适应思考工作机制](#自适应思考工作机制)
 - [🛠️ 核心功能亮点](#️-核心功能亮点)
   - [打断重新编辑与分支重发保障](#打断重新编辑与分支重发保障)
@@ -54,7 +54,7 @@ Google Antigravity 官方运行时（`agy_acp_server.exe`）拥有强大的智�
 - 🔒 **本地私密安全**：**不逆向私有接口，不上传或劫持 Token**，所有凭据由 Google 官方二进制在本地安全保管。
 - 📦 **免装官方客户端**：内置极简自动化下载与校验机制，无需在电脑上预装数十 GB 的臃肿桌面客户端。
 - ⚡ **原生标准适配**：对外统一提供标准的 `/v1/responses` 与 `/v1/chat/completions` 接口，无缝接入 PI-Desktop、Cherry Studio 等生态工具。
-- 🧠 **思维链自适应**：原生适配最新 **Gemini 4 Hydrogen (支持 xhigh 极限思考)**、Carbon、Argon 及 Claude 系列，自动解析并下发思考深度。
+- 🧠 **思维链自适应**：原生适配 `1.5.2` 最新 **Gemini 4 Neon / Hydrogen（支持 xhigh 极限思考）**、Carbon、Argon 及 Claude 系列，自动解析并下发精确思考深度。
 
 ---
 
@@ -70,7 +70,7 @@ flowchart TD
     subgraph Plugin["Antigravity ACP 本地插件 (Port: 41910)"]
         Server["HTTP / SSE 网关 (server.js)"]
         Core["核心调度与会话映射 (core.js)"]
-        ThinkingEngine["自适应思考引擎<br/>(minimal / low / medium / high / xhigh)"]
+        ThinkingEngine["自适应思考引擎<br/>(minimal / low / medium / high / xhigh / max)"]
         BranchManager["分支重发与提问比对<br/>(Session Branch Restart)"]
         WebUI["原生侧边栏控制台 (ui.html)"]
     end
@@ -103,7 +103,7 @@ flowchart TD
 
 ### 1. 安装插件
 
-1. 前往 [Releases 发布页面](https://github.com/sedirk/antigravity-acp-pidesktop/releases) 下载最新版本的 `.piplug` 安装包（如 `local.antigravity-acp-2.3.9.piplug`）。
+1. 前往 [Releases 发布页面](https://github.com/sedirk/antigravity-acp-pidesktop/releases) 下载最新版本的 `.piplug` 安装包（如 `local.antigravity-acp-2.4.0.piplug`）。
 2. 在 **PI-Desktop** 中打开 **设置** → **插件**。
 3. 点击右上角 **从本地安装**，选择刚下载的 `.piplug` 文件。
 4. 安装完成后，插件后台将自动初始化并在默认端口 `41910` 启动网关服务。
@@ -133,37 +133,37 @@ flowchart TD
 
 > [!IMPORTANT]
 > **关键步骤：配置完成后，请务必点击右侧的「获取列表」按钮勾选模型并保存服务！**
-> 点击后客户端将从网关同步全部模型元数据（包括 `gemini-4-hydrogen`、默认上下文规格及 `xhigh` 思考档位；推荐从「获取列表」勾选添加）。
+> 点击后客户端将从网关同步全部模型元数据（包括 `gemini-4-neon`、`gemini-4-hydrogen`、默认上下文规格及 `xhigh` 思考档位；推荐从「获取列表」勾选添加）。
 > - **默认上下文：256K（256000 Token）**，GPT-OSS 为 128K（131072 Token）。上游会自行摘要压缩。
 > - **已有 Gemini / Claude 模型**：在「设置 → 模型」将上下文改为 `256000` 并保存。仅刷新列表不会覆盖已保存的窗口。
 ---
 
 ## 🧠 深度思考与思维链自适应体系
 
-### 支持模型总览（共 8 款模型）
+### 支持模型总览
 
-网关启动后通过虚拟模型引擎自动归一化底层模型，提供精准的上下文与思考档位定义：
+网关启动后通过虚拟模型引擎自动归一化底层模型（含 `models.availableModels` 与 `configOptions`），提供精准的上下文与思考档位定义：
 
 | 虚拟模型 ID | 显示名称 | 默认上下文通告 | 最大输出 | 思考档位支持 | 适用场景 |
-| :--- | :--- | :---: | :---: | :---: | :--- |
-| `gemini-4-hydrogen` | **Gemini 4 Hydrogen** *(最新)* | **256,000** (256K) | **65,536** (64K) | `low`, `medium`, `high`, **`xhigh`** | 极深逻辑推演、重大架构设计、超长链代码编写 |
+| :--- | :--- | :---: | :---: | :--- | :--- |
+| `gemini-4-neon` | **Gemini 4 Neon** *(1.5.2 新增)* | **256,000** (256K) | **65,536** (64K) | `low`, `medium`, `high`, **`xhigh`** | 高阶智能体编排、复杂工程重构、深度思考推理 |
+| `gemini-4-hydrogen` | **Gemini 4 Hydrogen** *(1.5.2 原生)* | **256,000** (256K) | **65,536** (64K) | `low`, `medium`, `high`, **`xhigh`** | 极深逻辑推演、重大架构设计、超长链代码编写 |
 | `gemini-4-carbon` | Gemini 4 Carbon | 256,000 (256K) | 65,536 (64K) | `low`, `medium`, `high` | 强推理旗舰模型、工程级代码落地 |
 | `gemini-4-argon` | Gemini 4 Argon | 256,000 (256K) | 32,768 (32K) | `low`, `medium`, `high` | 通用对话、轻度代码、日常任务平衡之选 |
-| `gemini-3.8-flash` | Gemini 3.8 Flash | 256,000 (256K) | 65,536 (64K) | *不支持思考* | 毫秒级极速响应、文档总结、初级筛选 |
+| `gemini-3.8-flash` | Gemini 3.8 Flash | 256,000 (256K) | 65,536 (64K) | `low`, `medium`, `high` | 毫秒级极速响应、文档总结、日常高频辅助 |
 | `claude-sonnet-4-6` | Claude Sonnet 4.6 (Thinking) | 256,000 (256K) | 131,072 (128K) | `low`, `medium`, `high` | 精致文学撰写、复杂指令跟随、混合思维链 |
 | `claude-opus-4-6-thinking` | Claude Opus 4.6 (Thinking) | 256,000 (256K) | 131,072 (128K) | `low`, `medium`, `high` | 深度复杂推理、高难度综合分析 |
 | `gpt-oss-120b` | GPT-OSS 120B | 131,072 (128K) | 32,768 (32K) | *不支持思考* | 开源大参数基座测试与实验对比 |
 
-> 注：表中为插件默认通告；自定义值不改变上游预算。
+> 注：实际可见模型取决于当前认证方式与订阅等级；表中为插件默认通告，自定义值不改变上游预算。
 ---
 
-### 全新 Gemini 4 Hydrogen 与 xhigh 档位
+### 全新 Gemini 4 Neon / Hydrogen 与 xhigh 档位
 
-Google 最新推出的 **`gemini-4-hydrogen`** 支持超高预算的深度思考（`xhigh` 极限档位）：
+`agy-acp-server 1.5.2` 原生内置 **`gemini-4-neon`** 与 **`gemini-4-hydrogen`** 两大模型家族，均支持超高预算深度思考（底层 wire 后缀 `-extra_high`，网关双向标准映射为 `xhigh`）：
 
-1. **自动聚合**：底层运行时的 `gemini-4-hydrogen` 与 `gemini-4-hydrogen-xhigh` 会被网关自动合并为一个主模型 `gemini-4-hydrogen`，不再冗余显示分裂的裸模型 ID。
-2. **档位完整性**：向客户端完整导出 `low`、`medium`、`high`、`xhigh` 四档思考深度。在 PI-Desktop 的模型高级设置中可直接自由滑动选择。
-
+1. **自动聚合与精确下发**：底层运行时的 `-low` / `-medium` / `-high` / `-extra_high`（以及 `-xhigh`、`-max`、`-effort` 与 CCPA 历史别名）会被网关自动聚合为单一虚拟主模型，并在 `session/set_model` 时精确还原为运行时声明的真实 wire ID，彻底避免发送未声明后缀触发 `-32602`。
+2. **档位完整性**：向客户端完整导出 `low`、`medium`、`high`、`xhigh` 四档思考深度（按低到高有序排列），在 PI-Desktop 的模型思考选择器中可直接自由切换。
 ### 自适应思考工作机制
 
 网关内置的 **Adaptive Thinking Engine** 具备以下核心能力：
@@ -245,6 +245,7 @@ Windows 环境下后台常驻进程（`agy_acp_server.exe` / `localharness_exter
 | `defaultEffort` | `"medium"` | `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"` | 客户端未指定思考深度时的全局默认档位 |
 | `idleTimeoutMs` | `600000` | 毫秒数值（默认 10分钟） | 后台长连接会话空闲回收超时 |
 | `reportedContextWindow` | `0` | `0` 或正整数 Token | 默认 `0` 时通告 `256000`（`gpt-oss-120b` 为 `131072`）；填写非零值按自定义通告保留。自定义通告不改变上游预算 |
+| `reportedMaxTokens` | `0` | `0` 或 `1` - `262144` | 默认 `0` 时通告 `32768`，避免宿主扣减 `64K` 输出预留导致在 ~172.8K 过早自动压缩；ACP 实际输出不受此值截断 |
 | `highContextThrottleTokens` | `160000` | 非负整数 Token | 可选的高上下文微节流触发阈值，**不是**模型上下文容量上限 |
 | `highContextThrottleMs` | `0` | 毫秒数值（`0` - `30000`） | 达到阈值且连续工具回填第 4 步起的每步额外等待（至少 150ms 生效）。v2.3.4 默认 `0`，保留已保存的非零值；升级后仍显示非零时，可手动设为 `0` 并保存。v2.3.3 曾默认 `2500` |
 | `mcpMaxOutputBytes` | `262144` | 字节数（默认 256 KiB） | 单次 MCP/工具输出字节数上限，非模型上下文容量 |
@@ -284,7 +285,7 @@ v2.3.4 新增默认启用、无正文的 `[acp-diag]` JSON 行诊断，仅记录
 > **解答**：这是因为 PI-Desktop 客户端缓存了旧的列表缓存。
 > 1. 打开 **设置** → **模型** → 点击编辑你的 **Antigravity 服务**；
 > 2. 点击左下角的 **「获取列表」** 按钮；
-> 3. 客户端即可拉取到最新的模型上下文大小（如 256K · 64K）和 `xhigh` 思考档位支持！
+> 3. 客户端即可拉取到最新的模型上下文大小（如 256K · 32K）和 `xhigh` 思考档位支持！
 
 ### Q2: 侧边栏一直处于“检测中”，点击刷新才有反应？
 > **解答**：最新版本已全面修复该问题。插件在面板挂载时会自动触发一轮无阻塞健康轮询，若后台初始化较慢，只需保持面板开启即可在就绪后自动跳绿。

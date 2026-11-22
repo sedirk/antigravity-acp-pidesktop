@@ -200,6 +200,7 @@
       <div>
         <span style="color: #60a5fa; font-weight: 600;">步骤 ③</span>：同步列表后即可直接选用，或点击下方快捷复制虚拟模型 ID：
         <div style="margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap;">
+          <button type="button" class="ghost copy-model-btn" data-model="gemini-4-neon" style="padding: 2px 8px; font-size: 11px;">📋 gemini-4-neon</button>
           <button type="button" class="ghost copy-model-btn" data-model="gemini-4-hydrogen" style="padding: 2px 8px; font-size: 11px;">📋 gemini-4-hydrogen</button>
           <button type="button" class="ghost copy-model-btn" data-model="gemini-4-carbon" style="padding: 2px 8px; font-size: 11px;">📋 gemini-4-carbon</button>
           <button type="button" class="ghost copy-model-btn" data-model="gemini-3.8-flash" style="padding: 2px 8px; font-size: 11px;">📋 gemini-3.8-flash</button>
@@ -366,6 +367,11 @@
       <input id="reportedContextWindow" type="number" min="0" max="2000000" step="1" placeholder="0（默认 256K）">
       <span class="hint">0 = 默认通告 256K（GPT-OSS 128K）；其他值为自定义通告，不改变上游预算。</span>
     </div>
+    <div class="field">
+      <label for="reportedMaxTokens">最大输出通告（Token，默认 0 = 32768）</label>
+      <input id="reportedMaxTokens" type="number" min="0" max="262144" step="1" placeholder="0（默认 32768）">
+      <span class="hint">0 = 默认通告 32768，避免宿主按 64K 扣减输出预留导致过早压缩；ACP 实际输出不受此值截断。</span>
+    </div>
   </section>
 
   <!-- 7. 工具与桥接 -->
@@ -428,7 +434,7 @@
     'port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', 'idleSessionMinutes', 'bin', 'defaultModel',
     'modelCacheMinutes', 'defaultEffort', 'virtualModels', 'bridgeTools', 'cwd', 'bridgeGuidance',
     'exposeVariantModels', 'concurrency', 'queueTimeoutMinutes', 'promptTimeoutMinutes', 'promptIdleSeconds', 'clientName',
-    'rateLimitMaxRetries', 'rateLimitRetryBaseSeconds', 'highContextThrottleTokens', 'highContextThrottleMs', 'reportedContextWindow'
+    'rateLimitMaxRetries', 'rateLimitRetryBaseSeconds', 'highContextThrottleTokens', 'highContextThrottleMs', 'reportedContextWindow', 'reportedMaxTokens'
   ];
   const $ = (id) => document.getElementById(id);
   const msg = $('msg');
@@ -583,7 +589,7 @@
       const verTag = rt.installedVersion ? 'v' + rt.installedVersion : (rt.version ? 'v' + rt.version : '');
       label.textContent = rt.binExists
         ? ('已安装' + (verTag ? ' ' + verTag : '') + ' · ' + mb(rt.dirBytes) + (rt.updateAvailable ? ' · 可升级至 v' + rt.version : ' · 卸载插件不会自动删除这些文件'))
-        : '尚未安装运行时（v' + (rt.version || '1.5.0') + '，约 101 MB）';
+        : '尚未安装运行时（v' + (rt.version || '1.5.2') + '，约 101 MB）';
       if (badge) {
         if (rt.updateAvailable) {
           badge.className = 'badge warn';
@@ -607,7 +613,7 @@
           '<span style="color:#8f8f96">(' + mb(rt.dirBytes) + (rt.pid ? ' · 运行中 PID: ' + rt.pid : ' · 空闲待命') + tierLabel + ')' + upgHint + '</span>';
       } else {
         summary.innerHTML = '<span style="color:#ff8a80;font-weight:600">○ 尚未安装官方运行时</span> ' +
-          '<span style="color:#8f8f96">（请点击下方按钮一键下载 v' + (rt.version || '1.5.0') + '，约 101 MB）</span>';
+          '<span style="color:#8f8f96">（请点击下方按钮一键下载 v' + (rt.version || '1.5.2') + '，约 101 MB）</span>';
       }
     }
 
@@ -616,10 +622,10 @@
       $('install').textContent = '一键升级官方运行时至 v' + rt.version + ' (约 101 MB)';
       $('install').className = 'primary primary-full';
     } else if (rt.binExists) {
-      $('install').textContent = '重新下载官方运行时 v' + (rt.version || '1.5.0') + ' (约 101 MB)';
+      $('install').textContent = '重新下载官方运行时 v' + (rt.version || '1.5.2') + ' (约 101 MB)';
       $('install').className = 'primary-full';
     } else {
-      $('install').textContent = '一键下载官方运行时 v' + (rt.version || '1.5.0') + ' (约 101 MB)';
+      $('install').textContent = '一键下载官方运行时 v' + (rt.version || '1.5.2') + ' (约 101 MB)';
       $('install').className = 'primary primary-full';
     }
     $('cleanup').disabled = rt.busy === true || !(rt.dirBytes > 0);

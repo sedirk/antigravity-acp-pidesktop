@@ -1,5 +1,29 @@
 # 变更记录
 
+## 2.4.0
+
+- **升级默认官方 `agy-acp-server` 运行时依赖至 `1.5.2` 与版本热隔离**：
+  - 内置官方运行时包默认升级为 `agy-acp-server-1.5.2-windows-x86_64.zip`（`105,407,645` 字节，SHA-256 `5CBADD4F4DF698572473D8890FC26EC2DC1724501F06E3A963941DAEC2BD21D6`）；
+  - 扩充 `KNOWN_RUNTIME_EXE_BYTES` 精确识别已装 `1.3.0`（`81,437,336` 字节）、`1.5.0`（`58,314,376` 字节）与 `1.5.2`（`58,368,800` 字节），支持面板一键平滑原地升级；
+  - Agent 扩展入口切换至 `agent/budget-status-240.mjs`，确保 `2.3.9 -> 2.4.0` 就地覆盖安装时不命中旧版 ESM 闭包缓存。
+- **适配 `1.5.2` 新模型家族（`gemini-4-neon` / `gemini-4-hydrogen`）、`-extra_high` 与 CCPA 档位对齐及 `configOptions` 目录**：
+  - 完整适配 `1.5.2` `model_selection.py` 新增的 `_HIGH_XHIGH_MEDIUM_LOW` 档位组合与 CCPA `gemini-3.5-flash` 三档映射（`extra-low` -> `low`、无独立 `medium` 时的 `-low` -> `medium`、`-high` -> `high`），将线级 `-extra_high` / `-extra-high` 双向归一化为标准 `xhigh` 思考档位，并在 `resolveModel` 下发 `session/set_model` 时严格保留运行时真实 wire ID（虚拟家族按 `effort` 就近选档，显式具体变体 ID 仅允许同档位线级别名映射、绝不静默降级至其它档位）；
+  - 新增 `ingestSelection` / `ingestConfigOptions` 同步解析 `session/new`、`session/load`、`session/resume` 返回的 `configOptions` 与流中 `config_option_update` 通知，补齐模型家族标准显示名，配置面板新增 `gemini-4-neon` 快捷复制按钮。
+- **会话恢复／桥接轮中切模一致性与 JSON-RPC `-32602` 快速失败**：
+  - 对齐 `1.5.2` sidecar `model_id` 持久化行为：在 `session/load`、`session/resume`、`session/new` 与热重载恢复（含共享辅助会话 `auxSession`）后同步 `models.currentModelId`，消除冗余 `session/set_model` 往返与状态漂移；桥接工具回填请求中途切换模型／思考档位时先校验目标模型，再有序取消挂起旧轮次、切换会话模型并续接工具结果；
+  - `switchModel`、`applyModel`、`sessionFor`、热恢复（本地回环断连与并发冲突 `session/load`）以及 `bridge-turn` 遇到 JSON-RPC `-32602`（当前认证方式下模型不可用）时自动吸收 `error.data.availableModels` 刷新目录并以 `MODEL_SWITCH_FAILED` 立即透传失败（绝不误判为进程异常重启运行时，亦不在旧档位模型上静默降级重试或发送请求）。
+- **`1.5.2` 流式取消合成块抑制、断连终态分级恢复与合成错误块拦截**：
+  - 静默过滤 `1.5.2` 取消/抢占轮次追加的合成 `"\n\nThe request was cancelled by the client."` 消息块，保留取消前已生成正文增量，防止合成提示流入客户端或写入历史上下文；
+  - 识别 `_rebuild_session_agent` 重建失败后输出的 `"Agent connection was lost and could not be re-established:"` 终态消息块（该路径在 `1.5.2` 中已移除底层会话但正常返回 `end_turn`），立即驱逐失效会话映射与 `sessionStore` 足迹并直通退出内层重试：仅当整轮尚未产出任何正文、思考块或工具调用活动时自动触发 `RUNTIME_RELOAD_LOST_SESSION` 同轮无感重建会话续接，一旦当前轮／当前拍已有正文、思考或工具活动则以 `ACP_CONNECTION_LOST` 终止并阻断内层重放，严防重复执行工具副作用或拼接重复输出；
+  - 对齐 `mcp_errors`、`browser_subagent`（`chrome-devtools-mcp` 启动失败精确合成块）、`quota_errors`（`QUOTA_EXHAUSTED` / `Usage Limit Reached` 周期配额耗尽，即使前置思考块也转为终态失败并跳过短周期 429 冷却重试）与 `api_errors` 清洗文本分类。
+- **上下文压缩预算收敛、轮中挂起抢占与输出预留对齐（修复频繁压缩与压缩后高起点循环）**：
+  - 新增 `reportedMaxTokens` 配置项与面板控件（默认 `0` 通告 `32768`，范围 `0..262144`）：由于 ACP `session/prompt` 不受客户端 `max_tokens` 截断，默认通告 `32768` 可消除 PI-Desktop 按 `min(maxTokens, 25% * contextWindow)` 扣减 `64,000` 输出预留的惩罚，使 `256K` 窗口下宿主自动压缩线从 `172,800` 恢复至 `200,908`（刷新模型列表保存后生效）；
+  - 收敛跨压缩代际携带的历史交付预算（`boundCompactedDeliveries`）并统一字符+UTF-8 字节双预算契约：按 `deliveryKey` 时序去重并保持原始完成次序后，压缩检查点之前的历史子代理交付限制为至多 2 项、`32,000` 字符 / `96,000` UTF-8 字节（压缩后出现新交付时合并上限 `48,000` 字符 / `128,000` UTF-8 字节）；未压缩当前代单项与同轮批次总计上限均为 `96,000` 字符 / `216,000` 字节（至多 8 项）；摘要平铺上限 `108,000` 字符 / `324,000` 字节，普通全量重放整包上限 `196,000` 字符 / `232,000` UTF-8 字节；超限时在写足迹、清挂起项、`session/cancel`、`session/load` 或 `session/new` 前预检快速抛出 `CONTEXT_BUDGET_EXCEEDED` 并按端点协议发送合规错误终帧（零未注册会话泄漏、零误杀在途挂起轮次）；
+  - 严格对齐 PI-Desktop `session-context.ts` 分离 `isBranchSummary` 与 `isCompactionSummary`：非截断型分支回归摘要（`BRANCH_SUMMARY_PREFIX`）保留共享祖先前缀与主线会话复用（不触发压缩重建、不误截断历史、不覆盖主线 `compactionSig`），同时排除在人类 `userTimeline` 与 `userAnchors` 之外；补齐 `/v1/responses` `previous_response_id` 持久化检查点、增量工具回填（含无 `tools` 续推回填与 `hydrateToolMessages`）及多轮续话路由；
+  - 提升 `bridge-turn` 中 `hasCompactionChanged` 的抢占优先级至挂起与单通道在途分支，区分 `self` 子代理独立检查点与父通道压缩续推，按 `explicitHostKey` 严格隔离跨会话摘要抢占与通道复用并过滤 `\"continue?\"`/`\"Please continue\"`/`\"继续一下\"` 等通用短句锚点，且将 `bridge.openRounds` 全生命周期纳入 `try/finally` 保护；
+  - 统一 `server.js` 会话持久化入口至 `persistSessionEntry` 与 `invalidateSessionFootprint`（超时/断连/切模重建时保留 `userTimeline`、`recentDeliveries`、`explicitHostKey`、`responseCheckpoints` 并跳过失效 `session/load`），按会话键串行化 `sessionFor`，将 `stagedCompactionSig` / `stagedSystemSig` / `stagedUserTimeline` / `stagedDeliveries` 绑定至单次请求上下文并在 `prompt` 首次派发（`attempt === 0`）核验会话归属后原子提交；`session/new` 与辅助会话异常后立即 `closeSession` 回收未注册会话，Chat/Responses 流式错误统一发送合规终态帧与 `[DONE]`；共享辅助会话 `MAX_AUX_USES` 下调至 `6`；
+  - 新增**单轮用户请求压缩轮次软性态势提示（Per-Turn Compaction Round Accumulator）**：跟踪自当前用户请求轮次首条提问起累计触发的上下文压缩轮数（排除轮中打断/补充指令与无新压缩的系统指令/切模重建，跨会话失效重建与网关重启持久化保持，完整收尾后进入下一轮新提问自动归零），在重放 `=== 历史阶段压缩摘要 (Compaction Summary) ===` 专段内注入非阻断式压缩轮次态势提示，辅助 Agent 自主调节读取粒度与收敛节奏、避免压缩失忆空转而不设硬门限阻断。
+
 ## 2.3.9
 
 - **正式 0.22.0 官方输入框工具栏上下文计量插槽**：不占用内置圆环，不弹常驻浮条，无需输入命令或修改原版 PI；最近 PI 输入预算估算与该步 ACP 原始水位分列，未知不填零；长工具链期间原生圆环按契约停在上一单腿样本，由本控件持续显示实时增长的 PI 输入预算估算与上游水位。见 [使用说明](docs/CONTEXT-METER.md)。

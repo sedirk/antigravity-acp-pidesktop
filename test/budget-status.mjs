@@ -4,8 +4,9 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 import {dirname,join} from 'node:path';
-import register from '../agent/budget-status-239.mjs';
+import register from '../agent/budget-status-240.mjs';
 import {endpoint,receiptURL,observation,readReceipt} from '../agent/receipt.mjs';
+import meterLink from '../lib/meter-link.js';
 const receipt='a'.repeat(32), second='b'.repeat(32), root=dirname(dirname(fileURLToPath(import.meta.url)));
 const sample=(used,size)=>({version:1,state:'observed',observation:{used,...(size===undefined?{}:{size})}});
 let serial=0;
@@ -71,7 +72,7 @@ test('actual plugin grant/index/runner and slash command (no model traffic)',{sk
   const rt=process.env.PI_TRUSTED_RUNTIME, file=(...p)=>pathToFileURL(join(rt,...p)).href;const {createJiti}=await import(file('node_modules','jiti','lib','jiti-static.mjs'));const j=createJiti(file('package.json'),{moduleCache:false,tryNative:false,alias:Object.fromEntries(['plugin-sdk','host-runtime','shared','agent-host'].map(n=>[`@pi-desktop/${n}`,join(rt,'packages',n,'src','index.ts')]))});
   const {PluginRuntime}=await j.import(file('apps/desktop/electron/main/plugin-runtime.ts'));const {TrustedExtensionRunner}=await j.import(file('packages/agent-runtime/src/extensions/runner.ts'));
   const runtime=new PluginRuntime({audit(){},spawnProcess(){let receive;return{onMessage(h){receive=h;},onExit(){},kill(){},postMessage(m){queueMicrotask(()=>receive({t:'res',id:m.id,ok:true}));}};}});const id='local.antigravity-acp';let runner;
-  try{const m=await runtime.loadFromPath(root,['ui.panel','ui.view','background.service']);assert.equal(m.version,'2.3.9');assert.equal(runtime.rendererDescriptor(id),undefined);assert.deepEqual(runtime.getAgentExtensions(),[]);
+  try{const m=await runtime.loadFromPath(root,['ui.panel','ui.view','background.service']);assert.equal(m.version,'2.4.0');assert.equal(runtime.rendererDescriptor(id),undefined);assert.deepEqual(runtime.getAgentExtensions(),[]);
     await runtime.loadFromPath(root,m.permissions);assert.ok(runtime.rendererDescriptor(id));assert.deepEqual(m.rendererActions,['plugin.call']);assert.deepEqual(m.rendererCallMethods,['readContextMeter']);const specs=runtime.getAgentExtensions().map(x=>({id:x.id,entry:x.entry,label:x.pluginName,source:'plugin',root:x.root}));assert.equal(specs.length,1);
     const ui=[],mdl={id:'m',provider:'pi',baseUrl:'http://127.0.0.1:1/v1'};runner=new TrustedExtensionRunner({specs,bridge:{sessionId:'real',cwd:rt,getModel:()=>mdl,isIdle:()=>true,getContextUsage:()=>({tokens:38177,contextWindow:224000}),publishCommands(){},publishDiagnostics(){},getAllTools:()=>[],getActiveTools:()=>[],requestUi:async(_s,r)=>{ui.push(r);return{kind:r.kind};}}});const [r]=await runner.load();assert.equal(r.state,'loaded');assert.ok(r.commandNames.includes('acp-context'));await runner.emit('before_provider_request',{payload:{}});await runner.emit('after_provider_response',{model:mdl,response:{status:200,headers:{'x-antigravity-acp':'1'}}});assert.equal(await runner.runCommand('acp-context',''),true);assert.match(ui.find(e=>e.kind==='notify').message,/38,177 \/ 224,000/);assert.ok(!ui.some(e=>e.kind==='setStatus'));assert.deepEqual(runner.getDiagnostics(),[]);
   }finally{await runner?.dispose();await runtime.unload(id);}assert.deepEqual(runtime.getAgentExtensions(),[]);
@@ -91,4 +92,25 @@ test('stock preheader abort, delayed old receipt, then independent successes: do
   await new Promise(r=>setTimeout(r,8));issued=Date.now();
   for(let i=0;i<3;i++){h.emit('agent_start');h.emit('before_provider_request');await h.emit('after_provider_response',h.headers(receipt));assert.ok(!h.writes.some(v=>v?.used===919));
     const current=h.emit('after_provider_response',h.headers(second));if(i===1)h.emit('agent_end');await current;await h.command();assert.match(h.notices.at(-1),/：222/);h.emit('agent_end');}
+});
+test('setProviderContext-capable hosts suppress fallback meter capsule while preserving stock fallback and /acp-context',async t=>{
+  const received=[];const listener=meterLink.listen(m=>received.push(m));assert.equal(await listener.ready,true);
+  t.after(()=>listener.close());
+  const wait=ms=>new Promise(r=>setTimeout(r,ms));
+  const f=await fixture(t,(_q,r)=>json(r,sample(41895,1048576)));
+  // 1. Patched host (setProviderContext supported): zero meterLink sample traffic, native receives {used,size}, /acp-context works
+  const patched=harness(f.base,'dedup-native',true);t.after(()=>patched.emit('session_shutdown'));
+  await patched.response(receipt);await patched.command();await wait(60);
+  assert.equal(received.filter(m=>m.sessionId==='dedup-native').length,0);
+  assert.deepEqual(patched.writes.at(-1),{used:41895,size:1048576});
+  assert.match(patched.notices.at(-1),/41,895 \/ 1,048,576/);
+  // 2. Stock host (no setProviderContext): publishes fallback meter sample, drops cleanly if setProviderContext becomes available
+  const stock=harness(f.base,'dedup-stock',false);t.after(()=>stock.emit('session_shutdown'));
+  await stock.response(second);
+  for(let i=0;i<40&&!received.some(m=>m.sessionId==='dedup-stock'&&m.phase==='sample');i++)await wait(15);
+  assert.ok(received.some(m=>m.sessionId==='dedup-stock'&&m.phase==='sample'&&m.budget?.tokens===131752));
+  stock.ctx.ui.setProviderContext=x=>stock.writes.push(x);
+  stock.emit('agent_settled');
+  for(let i=0;i<40&&!received.some(m=>m.sessionId==='dedup-stock'&&m.phase==='drop');i++)await wait(15);
+  assert.ok(received.some(m=>m.sessionId==='dedup-stock'&&m.phase==='drop'));
 });

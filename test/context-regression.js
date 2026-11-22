@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { normalizeMessages, flatten, flattenSummarization } = require('../lib/server.js');
+const { normalizeMessages, flatten, flattenSummarization, extractLatestCompaction } = require('../lib/server.js');
 const { createSessionStore } = require('../lib/session-store.js');
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
@@ -382,6 +382,353 @@ test('estimated output and reasoning are independent of streaming chunk boundari
     totals.push(total);
   }
   assert.deepEqual(totals[0], totals[1]);
+});
+
+test('branch summary vs compaction separation, chronological dedup before eviction, multi-Task oversized guard, UTF-8 byte caps, and sessionStore SID isolation', () => {
+  const { isCompactionSummary, isBranchSummary, boundDeliveries, collectDeliveries } = require('../lib/context.js');
+  const branchSummary = 'The following is a summary of a branch that this conversation came back from:\n\n<summary>\nBRANCH_CHECKPOINT_STATE\n</summary>';
+  assert.equal(isCompactionSummary(branchSummary), false, 'branch_summary must not be treated as a mainline truncating compaction');
+  assert.equal(isBranchSummary(branchSummary), true, 'PI-Desktop BRANCH_SUMMARY_PREFIX must be recognized as a branch summary');
+  const flatBranch = flatten([
+    user('ROOT_INTENT'),
+    assistant('SHARED_PREFIX_RESULT'),
+    user(checkpoint('MAINLINE_SUMMARY')),
+    assistant('POST_CHECKPOINT_SHARED'),
+    user(branchSummary),
+    user('continue branch'),
+  ]);
+  assert.ok(flatBranch.includes('=== 历史阶段压缩摘要 (Compaction Summary) ===') && flatBranch.includes('MAINLINE_SUMMARY'), 'mainline compaction summary must remain intact');
+  assert.ok(flatBranch.includes('POST_CHECKPOINT_SHARED'), 'branch_summary must not truncate shared post-checkpoint history');
+  assert.ok(flatBranch.includes('Branch summary:') && flatBranch.includes('BRANCH_CHECKPOINT_STATE'), 'branch summary content must survive in context');
+  const timelineSlice = flatBranch.split('=== 用户历史提问脉络与意图索引')[1]?.split('\n\n===')[0] || '';
+  assert.ok(!timelineSlice.includes('summary of a branch'), 'branch summary must not pollute human user timeline');
+  const flatTrailingBranch = flatten([
+    user('ROOT_INTENT'),
+    user(checkpoint('MAINLINE_SUMMARY')),
+    assistant('POST_CHECKPOINT_SHARED'),
+    user(branchSummary),
+  ]);
+  assert.ok(flatTrailingBranch.includes('MAINLINE_SUMMARY') && flatTrailingBranch.includes('POST_CHECKPOINT_SHARED') && flatTrailingBranch.includes('BRANCH_CHECKPOINT_STATE'));
+
+  // Two active 55KB reports across turns must keep the NEWER report even when bigOld was already persisted
+  const bigOld = callback('OLD_55K_' + 'x'.repeat(54000));
+  const bigNew = callback('NEW_55K_' + 'y'.repeat(54000));
+  const pair = boundDeliveries([bigOld, bigNew]);
+  assert.equal(pair.length, 1);
+  assert.ok(pair[0].includes('NEW_55K_'));
+  const flat55 = flatten([user('GOAL_55'), user(bigNew), user('next')], { persistedDeliveries: [bigOld] });
+  assert.ok(flat55.includes('NEW_55K_') && !flat55.includes('OLD_55K_'), 'HTTP rebuild with persisted 55KB delivery must keep newer 55KB delivery');
+  assert.throws(
+    () => collectDeliveries([user('GOAL_55'), user(bigNew)], [bigOld], { turnDeliveries: [bigOld] }),
+    (err) => err && err.code === 'CONTEXT_BUDGET_EXCEEDED',
+    'sequential 55KB + 55KB deliveries within the same human turn must reject instead of evicting first report',
+  );
+
+  // Pre-checkpoint report A (~14.5KB) + post-checkpoint report B (~14.5KB): duplicate A before checkpoint or B after checkpoint must never flip [A, B] order
+  const repA = callback('PRE_A_' + 'a'.repeat(14500));
+  const repB = callback('POST_B_' + 'b'.repeat(14500));
+  const keptAB = collectDeliveries([user(checkpoint('compacted state')), user(repB), user('continue')], [repA, repB]);
+  assert.equal(keptAB.length, 2, 'both ~14.5KB pre- and post-checkpoint reports fit within 32KB/48KB caps when deduplicated before eviction');
+  assert.ok(keptAB[0].includes('PRE_A_') && keptAB[1].includes('POST_B_'), 'chronological [A, B] order must be preserved');
+  const keptPreReplayA = collectDeliveries([user(repA), user(checkpoint('compacted state')), user('continue')], [repA, repB]);
+  assert.equal(keptPreReplayA.length, 2);
+  assert.ok(keptPreReplayA[0].includes('PRE_A_') && keptPreReplayA[1].includes('POST_B_'), 'replaying already-completed A before checkpoint must not invert [A, B] into [B, A]');
+  // Multiple Task outputs in the same turn where the first exceeds 96KB/112KB must reject with CONTEXT_BUDGET_EXCEEDED instead of silently evicting task 1
+  const multiTaskMsgs = normalizeMessages({
+    input: [
+      user('audit'),
+      { type: 'function_call', call_id: 'tk-1', name: 'Task', arguments: '{"agent":"reviewer-gpt","task":"t1"}' },
+      { type: 'function_call', call_id: 'tk-2', name: 'Task', arguments: '{"agent":"explore","task":"t2"}' },
+      { type: 'function_call_output', call_id: 'tk-1', output: 'OVERSIZED_FIRST_' + 'x'.repeat(125000) },
+      { type: 'function_call_output', call_id: 'tk-2', output: 'TINY_SECOND_OK' },
+      user('continue'),
+    ],
+  }, { responses: true });
+  assert.throws(() => collectDeliveries(multiTaskMsgs), (err) => err && err.code === 'CONTEXT_BUDGET_EXCEEDED');
+  assert.throws(() => flatten(multiTaskMsgs), (err) => err && err.code === 'CONTEXT_BUDGET_EXCEEDED');
+
+  // Post-compaction carry-over must prune 8 stale reports / oversized pre-compaction dumps so rebuilt sessions start lean
+  const staleMany = Array.from({ length: 6 }, (_, i) => `Subagent completion:\nSTALE_${i}_${'z'.repeat(11000)}`);
+  const staleOversized = `Subagent completion:\nHUGE_DUMP_${'w'.repeat(45000)}`;
+  const recentCompactable = `Subagent completion:\nKEEP_LATEST_REVIEW_${'r'.repeat(8000)}`;
+  const compacted = collectDeliveries([user(checkpoint('compacted state')), user('next')], [...staleMany, staleOversized, recentCompactable]);
+  assert.ok(compacted.some(x => x.includes('KEEP_LATEST_REVIEW_')), 'recent compact report must survive');
+  assert.ok(!compacted.some(x => x.includes('HUGE_DUMP_') || x.includes('STALE_0_')), 'oversized/old pre-compaction dumps must not bloat rebuilt session');
+  assert.ok(Buffer.byteLength(compacted.join('\n\n'), 'utf8') <= 38000, 'post-compaction pre-carried deliveries must stay within lean byte cap');
+
+  // Multi-byte UTF-8 CJK context must stay within byte budget in flatten()
+  const cjkMsgs = [user('原始目标：确保多字节中文上下文不会突破字节预算')];
+  for (let i = 0; i < 12; i++) cjkMsgs.push(assistant(`第${i}轮审计输出：` + '中文日志内容审计记录'.repeat(2200)));
+  cjkMsgs.push(user('当前指令：' + '汉'.repeat(28000)));
+  const flatCjk = flatten(cjkMsgs);
+  assert.ok(flatCjk.includes('原始目标：确保多字节中文上下文不会突破字节预算'));
+  assert.ok(Buffer.byteLength(flatCjk, 'utf8') <= 240000, 'multi-byte UTF-8 flatten output must respect byte ceilings');
+  assert.throws(
+    () => flatten([user('汉'.repeat(85000))]),
+    (err) => err && err.code === 'CONTEXT_BUDGET_EXCEEDED',
+    'single 85,000 CJK char message (255KB UTF-8) must be rejected by whole-package flatten byte cap',
+  );
+  // sessionStore.set retains sig/timeline on same SID, but isolates state when switching to a new SID on the same key
+  const dir = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'sig-retain-'));
+  try {
+    const file = path.join(dir, 'sessions.json');
+    const store = createSessionStore({ file });
+    store.set('k1', { sessionId: 'sid-1', model: 'm1', userTimeline: ['GOAL_1'], compactionSig: 'csig-abc', systemSig: 'ssig-def' });
+    store.set('k1', { sessionId: 'sid-1', model: 'm2', compactionSig: '', systemSig: '', userTimeline: [] });
+    store.flush();
+    const reloaded = createSessionStore({ file });
+    reloaded.load();
+    const entry = reloaded.get('k1');
+    assert.equal(entry.model, 'm2');
+    assert.equal(entry.compactionSig, 'csig-abc', 'partial update on same sid must not wipe compactionSig');
+    assert.equal(entry.systemSig, 'ssig-def', 'partial update on same sid must not wipe systemSig');
+    assert.deepEqual(entry.userTimeline, ['GOAL_1'], 'empty userTimeline on partial update must not wipe persisted timeline');
+
+    reloaded.set('k1', { sessionId: 'sid-2', model: 'm3', userTimeline: [] });
+    reloaded.flush();
+    const reloaded2 = createSessionStore({ file });
+    reloaded2.load();
+    const entry2 = reloaded2.get('k1');
+    assert.equal(entry2.sessionId, 'sid-2');
+    assert.deepEqual(entry2.userTimeline || [], [], 'new sessionId on same key must not inherit stale userTimeline when empty array is passed');
+    assert.equal(entry2.compactionSig || '', '', 'new sessionId on same key must not inherit stale compactionSig');
+    assert.equal(entry2.systemSig || '', '', 'new sessionId on same key must not inherit stale systemSig');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v2.4.0 Round 2 P1 context & sessionStore boundaries: CJK UTF-8 caps, completion-order TaskWait deliveries, branch summary separation, invalidated footprints', () => {
+  const ctxLib = require('../lib/context.js');
+  // 1. Multi-byte CJK summarization (~50K-char CJK Task delivery = 150KB <= 192KB + timeline <= 324KB SUMMARY_BYTES) succeeds, while oversized >192KB delivery or >196K replay throws CONTEXT_BUDGET_EXCEEDED
+  const cjkSumInput = normalizeMessages({
+    input: [
+      user('原始任务目标：验证多字节中文在摘要与交付双预算下不误杀'),
+      { type: 'function_call', call_id: 'cjk-sum-tk', name: 'Task', arguments: '{"agent":"reviewer-gpt","task":"cjk"}' },
+      { type: 'function_call_output', call_id: 'cjk-sum-tk', output: '果'.repeat(50000) },
+      user('Summarize the entire conversation above.'),
+    ],
+  }, { responses: true });
+  const cjkSummaryFlat = flattenSummarization(cjkSumInput);
+  assert.ok(cjkSummaryFlat.includes('原始任务目标') && Buffer.byteLength(cjkSummaryFlat, 'utf8') <= 324000, '50K-char CJK delivery (150KB) must fit within 108K char / 324KB SUMMARY_BYTES');
+  assert.throws(
+    () => flatten([user('超'.repeat(165000))]),
+    (err) => err && err.code === 'CONTEXT_BUDGET_EXCEEDED',
+    '165K-char CJK replay (495KB > 480KB REPLAY_MAX_BYTES) must throw CONTEXT_BUDGET_EXCEEDED',
+  );
+  const cjkDeliveryMsgs = normalizeMessages({
+    input: [
+      user('run CJK subagent'),
+      { type: 'function_call', call_id: 'cjk-tk', name: 'pi-bridge_TaskWait', arguments: '{"job":"j1"}' },
+      { type: 'function_call_output', call_id: 'cjk-tk', output: '审'.repeat(50000) },
+      user('proceed'),
+    ],
+  }, { responses: true });
+  const cjkDeliveries = ctxLib.collectDeliveries(cjkDeliveryMsgs);
+  assert.equal(cjkDeliveries.length, 1, 'prefixed pi-bridge_TaskWait 50K-char CJK delivery (150KB) must be captured within 64K/192KB budget');
+
+  // 2. Completion-order sorting & eviction when parallel Task/TaskWait calls complete out of call order
+  const outOfOrderMsgs = normalizeMessages({
+    input: [
+      user('parallel subagents'),
+      { type: 'function_call', call_id: 'call-first', name: 'Task', arguments: '{"agent":"a1","task":"slow"}' },
+      { type: 'function_call', call_id: 'call-second', name: 'Task', arguments: '{"agent":"a2","task":"fast"}' },
+      { type: 'function_call_output', call_id: 'call-second', output: 'COMPLETED_FIRST_FAST' },
+      { type: 'function_call_output', call_id: 'call-first', output: 'COMPLETED_SECOND_SLOW' },
+      user('merge results'),
+    ],
+  }, { responses: true });
+  const orderedDelivs = ctxLib.collectDeliveries(outOfOrderMsgs);
+  assert.equal(orderedDelivs.length, 2);
+  assert.ok(
+    orderedDelivs[0].includes('COMPLETED_FIRST_FAST') && orderedDelivs[1].includes('COMPLETED_SECOND_SLOW'),
+    'deliveries must be ordered by completion position rather than invocation position',
+  );
+
+  // 3. Branch summary must remain distinct from compaction summary and never slice shared pre-branch history
+  const branchMsg = 'The following is a summary of a branch that this conversation came back from:\n<summary>\nExplored option B\n</summary>';
+  assert.equal(ctxLib.isBranchSummary(branchMsg), true);
+  assert.equal(ctxLib.isCompactionSummary(branchMsg), false);
+  assert.equal(extractLatestCompaction([user('PRE_BRANCH_ROOT_FACT'), assistant('ok'), user(branchMsg), user('continue on main')]), '');
+  const branchFlat = flatten([user('PRE_BRANCH_ROOT_FACT'), assistant('ACK_PRE_BRANCH'), user(branchMsg), user('continue on main')]);
+  assert.ok(branchFlat.includes('ACK_PRE_BRANCH') && branchFlat.includes('Explored option B'), 'branch summary must not slice pre-branch history');
+
+  // 4. Invalidated session footprint retains recoverable memory across reload and carryRecoverable set(), while remove() wipes on branch reset
+  const invDir = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'inv-store-'));
+  try {
+    const file = path.join(invDir, 'sessions.json');
+    const s1 = createSessionStore({ file });
+    s1.invalidate('k-inv', {
+      sessionId: '__invalidated__',
+      model: 'gemini-3-flash',
+      explicitHostKey: 'host-explicit-99',
+      userTimeline: ['SURVIVING_TIMELINE_GOAL'],
+      recentDeliveries: ['Subagent completion:\nSURVIVING_DELIVERY_99'],
+    });
+    s1.flush();
+    const s2 = createSessionStore({ file });
+    s2.load();
+    const invRec = s2.get('k-inv');
+    assert.ok(invRec && invRec.invalidated === true, 'invalidated flag must survive disk reload');
+    assert.equal(invRec.explicitHostKey, 'host-explicit-99');
+    assert.deepEqual(invRec.userTimeline, ['SURVIVING_TIMELINE_GOAL']);
+    assert.deepEqual(invRec.recentDeliveries, ['Subagent completion:\nSURVIVING_DELIVERY_99']);
+    s2.set('k-inv', { sessionId: 'fresh-sid-100', model: 'gemini-3-flash' });
+    const carried = s2.get('k-inv');
+    assert.equal(Boolean(carried.invalidated), false);
+    assert.equal(carried.explicitHostKey, 'host-explicit-99', 'carryRecoverable must preserve explicitHostKey across invalidated rebuild');
+    assert.deepEqual(carried.userTimeline, ['SURVIVING_TIMELINE_GOAL'], 'carryRecoverable must preserve userTimeline across invalidated rebuild');
+    assert.deepEqual(carried.recentDeliveries, ['Subagent completion:\nSURVIVING_DELIVERY_99'], 'carryRecoverable must preserve recentDeliveries across invalidated rebuild');
+    s2.remove('k-inv');
+    assert.equal(s2.get('k-inv'), null, 'branch reset remove() must completely wipe entry');
+  } finally {
+    fs.rmSync(invDir, { recursive: true, force: true });
+  }
+});
+
+test('per-turn compaction round accumulator tracks consecutive compactions, survives mid-turn steer and restart, and resets on a new user turn', async () => {
+  const { createGateway } = require('../lib/server.js');
+  const net = require('node:net');
+  const dir = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'turn-compact-acc-'));
+  let serial = 0;
+  let bridgeUrl = '';
+  let mode = 'park';
+  let gateway = null;
+  let port = 0;
+  const prompts = [];
+  const cfg = {
+    bind: '127.0.0.1',
+    port: 0,
+    defaultModel: 'test',
+    toolPolicy: 'all',
+    bridgeTools: true,
+    promptTimeoutMs: 3000,
+    promptIdleTimeoutMs: 3000,
+    maxSessions: 10,
+    source: path.join(dir, 'config.json'),
+  };
+  const acp = {
+    policyBySession: new Map(),
+    start: async () => {},
+    discover: async () => {},
+    cwdFor: async () => dir,
+    resolveModel: (x) => x,
+    status: () => ({ ready: true }),
+    notify: () => {},
+    request: async (method, p) => {
+      if (method === 'session/load' || method === 'session/resume') {
+        throw new Error('force clean replay on reload');
+      }
+      if (method === 'session/new') {
+        bridgeUrl = p.mcpServers && p.mcpServers[0] ? p.mcpServers[0].url : '';
+        return { sessionId: `acc-sid-${++serial}` };
+      }
+      if (method === 'session/prompt') {
+        prompts.push(p.prompt.map((item) => item.text || '').join('\n'));
+        const emit = (update) => acp.onNotification({ method: 'session/update', params: { sessionId: p.sessionId, update } });
+        if (mode === 'park' && bridgeUrl) {
+          await fetch(bridgeUrl, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              jsonrpc: '2.0',
+              id: serial,
+              method: 'tools/call',
+              params: { name: 'Read', arguments: { path: `src/step-${serial}.js` } },
+            }),
+          }).then((r) => r.text());
+        }
+        emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'turn-complete-ack' } });
+        return { stopReason: 'end_turn' };
+      }
+      return {};
+    },
+  };
+  const tools = [{ type: 'function', name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } }];
+  async function start() {
+    gateway = createGateway({ acp, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => cfg, log: () => {} });
+    const probe = net.createServer();
+    await new Promise((r) => probe.listen(0, '127.0.0.1', r));
+    port = probe.address().port;
+    await new Promise((r) => probe.close(r));
+    await gateway.listen([port]);
+  }
+  async function send(input) {
+    const r = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', stream: true, prompt_cache_key: 'acc-topic', input, tools }),
+    });
+    const body = await r.text();
+    assert.equal(r.status, 200, body);
+    const events = body.split('\n\n').map((b) => /^data: (.+)$/m.exec(b)?.[1]).filter(Boolean).map((d) => JSON.parse(d));
+    const completed = events.find((e) => e.type === 'response.completed');
+    assert.ok(completed, body);
+    const fc = (completed.response.output || []).find((item) => item.type === 'function_call');
+    return { callId: fc ? fc.call_id : '', prompt: prompts[prompts.length - 1] || '' };
+  }
+  try {
+    await start();
+    const sys = (s) => ({ role: 'system', content: s });
+    const goal1 = 'TURN_1_ROOT_GOAL: adapt 1.5.2 without reviewer loop';
+    // 1. Start Turn 1 (parks on Read -> turnOpen remains true)
+    mode = 'park';
+    await send([sys('SYS_V1'), user(goal1)]);
+
+    // 2. Mid-turn Compaction #1 -> round 1
+    const c1 = await send([sys('SYS_V1'), user(checkpoint('COMPACT_GEN_1')), user(goal1)]);
+    assert.ok(c1.prompt.includes('当前已累计触发第 1 轮上下文压缩'), 'first compaction in active turn must report round 1');
+    assert.ok(c1.callId, 'turn 1 remains open on parked tool');
+
+    // 3. Mid-turn user steer + system nudge rebuild (not a new compaction, not a new turn) -> stays round 1
+    const steer = await send([
+      sys('SYS_V1_NUDGE'),
+      user(checkpoint('COMPACT_GEN_1')),
+      user(goal1),
+      { type: 'function_call', call_id: c1.callId, name: 'Read', arguments: '{"path":"src/step.js"}' },
+      { type: 'function_call_output', call_id: c1.callId, output: '[tool call was interrupted before a result was recorded]' },
+      user('MID_TURN_STEER: 顺便不要调用 reviewer-gpt'),
+    ]);
+    assert.ok(steer.prompt.includes('当前已累计触发第 1 轮上下文压缩'), 'mid-turn steer + system rebuild must preserve round 1 without resetting or double-counting');
+
+    // 4. Gateway restart + Mid-turn Compaction #2, then let Turn 1 complete cleanly -> round 2
+    await gateway.close();
+    gateway = null;
+    await start();
+    mode = 'finish';
+    const c2 = await send([
+      sys('SYS_V1_NUDGE'),
+      user(checkpoint('COMPACT_GEN_2')),
+      user(goal1),
+      user('MID_TURN_STEER: 顺便不要调用 reviewer-gpt'),
+    ]);
+    assert.ok(c2.prompt.includes('当前已累计触发第 2 轮上下文压缩'), 'second compaction in same turn after gateway restart must increment to round 2');
+    assert.equal(c2.callId, '', 'turn 1 completed cleanly with final assistant message');
+
+    // 5. Fresh Turn 2 after Turn 1 completed (force replay via SYS_V2, historical COMPACT_GEN_2 unchanged) -> round 0 (no active-turn compaction banner)
+    const goal2 = 'TURN_2_FRESH_GOAL: 整理一键最小补丁包';
+    const t2Start = await send([
+      sys('SYS_V2'),
+      user(checkpoint('COMPACT_GEN_2')),
+      user(goal1),
+      user('MID_TURN_STEER: 顺便不要调用 reviewer-gpt'),
+      assistant('turn-complete-ack'),
+      user(goal2),
+    ]);
+    assert.ok(t2Start.prompt.includes('COMPACT_GEN_2'), 'historical summary stays intact on Turn 2');
+    assert.ok(!t2Start.prompt.includes('当前已累计触发第'), 'fresh Turn 2 before any new compaction must reset counter to 0');
+
+    // 6. Compaction inside Turn 2 -> starts fresh at round 1 (not 3)
+    const t2Compact = await send([
+      sys('SYS_V2'),
+      user(checkpoint('COMPACT_GEN_3')),
+      user(goal2),
+    ]);
+    assert.ok(t2Compact.prompt.includes('当前已累计触发第 1 轮上下文压缩'), 'first compaction inside Turn 2 must report round 1');
+  } finally {
+    if (gateway) await gateway.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 (async () => {

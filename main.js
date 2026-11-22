@@ -29,16 +29,17 @@ const COMMANDS = {
 };
 
 const RUNTIME = {
-  version: '1.5.0',
-  url: 'https://dl.google.com/agy-extensions/releases/windows/agy-acp-server-1.5.0-windows-x86_64.zip',
-  sha256: '6163F6B59B381BAE419652DBAE167BC8CDA0EF29D665C0BA8AF3D8C7FDDD8867',
-  archiveBytes: 105513364,
+  version: '1.5.2',
+  url: 'https://dl.google.com/agy-extensions/releases/windows/agy-acp-server-1.5.2-windows-x86_64.zip',
+  sha256: '5CBADD4F4DF698572473D8890FC26EC2DC1724501F06E3A963941DAEC2BD21D6',
+  archiveBytes: 105407645,
   files: ['agy_acp_server.exe', 'localharness_external.exe'],
 };
 
 const KNOWN_RUNTIME_EXE_BYTES = Object.freeze({
   81437336: '1.3.0',
   58314376: '1.5.0',
+  58368800: '1.5.2',
 });
 
 let pi = null;

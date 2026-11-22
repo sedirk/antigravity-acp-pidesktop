@@ -20,6 +20,7 @@ function budget(ctx) {
   } catch {}
 }
 function invalidate(s) {s.ticket++; s.controller?.abort(); s.controller=undefined; s.work=undefined; s.url=undefined; s.nextRead=0;}
+function hasNative(ctx) {try { return typeof ctx?.ui?.setProviderContext==='function'; } catch { return false; } }
 function native(ctx, value) {try { ctx.ui?.setProviderContext?.(value); } catch {} }
 function forget(ctx,s) {meter(s,'drop');invalidate(s); if(s.confirmed)native(ctx,undefined); s.confirmed=undefined; s.sample=undefined; s.before=undefined; s.compacting=false; s.expect=undefined;}
 const invocation=e=>Number.isSafeInteger(e?.contextRequestId)&&e.contextRequestId>0?e.contextRequestId:undefined;
@@ -54,7 +55,7 @@ export default function register(pi) {
   function current(ctx,s) {const k=key(ctx.model); if(s.confirmed&&k!==s.confirmed)forget(ctx,s); return k;}
   function own(ctx,s) {return !!s&&!ctx.signal?.aborted&&current(ctx,s)===s.confirmed&&!!s.confirmed;}
   function active(ctx,s,token) {return !ctx.signal?.aborted&&state(ctx)===s&&s.ticket===token&&own(ctx,s);}
-  const sample=(ctx,s)=>{if(s?.meter&&!s.compacting&&own(ctx,s))meter(s,'sample',budget(ctx));};
+  const sample=(ctx,s)=>{if(!s?.meter)return;if(hasNative(ctx)){meter(s,'drop');return;}if(!s.compacting&&own(ctx,s))meter(s,'sample',budget(ctx));};
   // Share only a network result, never a handler's ctx. 0.22.0 revokes the SDK after each handler settles.
   function fetchOnce(s) {
     if(s.work)return s.work;
@@ -92,7 +93,7 @@ export default function register(pi) {
       if(!takeHeaders(s,k,e)||(!proof&&s.ended)||ctx.signal?.aborted||s.compacting||current(ctx,s)!==k)return;
       if(!marked){forget(ctx,s);return;}
       invalidate(s);s.proving=undefined;s.confirmed=k;s.sample=undefined;s.url=url||undefined;
-      if(url){s.meter={id:sid(ctx),provider:ctx.model.provider,model:ctx.model.id,receipt:url.pathname.split('/').at(-1),turnAt:s.turnAt||Date.now(),revision:0,next:0};sample(ctx,s);}
+      if(hasNative(ctx))meter(s,'drop');else if(url){s.meter={id:sid(ctx),provider:ctx.model.provider,model:ctx.model.id,receipt:url.pathname.split('/').at(-1),turnAt:s.turnAt||Date.now(),revision:0,next:0};sample(ctx,s);}
       native(ctx,{});
       if(!proof)return read(ctx,s);
       s.nextRead=Date.now()+5000;if(proof.sample){s.sample=proof.sample;native(ctx,proof.sample);}

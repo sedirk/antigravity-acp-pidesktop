@@ -772,7 +772,7 @@ async function main() {
         assert.equal(r1.status, 200);
         assert.equal(order[0], 'restart', `proxyDrift 重启必须在 discover/resolveModel 之前: ${order.join('->')}`);
 
-        // 第二轮触发 ACP_TIMEOUT：必须同时从内存和 sessions.json 移除坏会话
+        // 第二轮触发 ACP_TIMEOUT：必须从内存移除坏会话并将 sessions.json 标记为 invalidated（清掉坏 sessionId 避免重启后 load 死会话，同时保留 userTimeline/explicitHostKey）
         const r2 = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
           method: 'POST', headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ model: 'test', stream: false, prompt_cache_key: 'purge-key', input: 'hang' }),
@@ -782,7 +782,11 @@ async function main() {
         gw.close();
       }
       const saved = JSON.parse(fs.readFileSync(path.join(tmpData, 'sessions.json'), 'utf8'));
-      assert.equal(saved.sessions.length, 0, '超时失联的坏会话必须从 sessions.json 一并清除，避免重启后继续 load 死会话');
+      assert.equal(saved.sessions.length, 1, '超时失联后应保留 invalidated 可恢复足迹而非抹除原始目标');
+      assert.equal(saved.sessions[0].invalidated, true, '坏会话足迹必须标记 invalidated=true 以阻止重启后 session/load');
+      assert.equal(saved.sessions[0].sessionId, '__invalidated__', '坏 sessionId 必须从 sessions.json 清除');
+      assert.equal(saved.sessions[0].explicitHostKey, 'purge-key', '超时失联足迹应保留 explicitHostKey');
+      assert.deepEqual(saved.sessions[0].userTimeline, ['hang'], '超时失联足迹应保留当前分支 userTimeline');
     });
 
     // 复现 bf876a46 死锁现场：
@@ -2004,6 +2008,8 @@ async function main() {
       const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'config.html'), 'utf8');
       assert.ok(html.includes('id="reportedContextWindow"'), 'config.html 必须包含 #reportedContextWindow 控件');
       assert.ok(html.includes("'reportedContextWindow'"), 'config.html ids 数组必须包含 reportedContextWindow');
+      assert.ok(html.includes('id="reportedMaxTokens"'), 'config.html 必须包含 #reportedMaxTokens 控件');
+      assert.ok(html.includes("'reportedMaxTokens'"), 'config.html ids 数组必须包含 reportedMaxTokens');
       assert.ok(html.includes('默认通告') && html.includes('256K'), '面板应说明默认通告 256K');
       assert.ok(!html.includes('1,048,576') && !html.includes('1,000,000'), '面板不再宣传默认 1M');
 
@@ -4359,6 +4365,691 @@ async function main() {
         assert.ok((steerResp.usage.context_used || 0) < 500, `旧挂起工具的 1000 tokens 不得污染新打断轮次统计（实际: ${steerResp.usage.context_used}）`);
       } finally {
         if (releaseCwd) releaseCwd();
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    await check('parked tool batch with partial or zero matched outputs cleanly preempts and resets bloated session on mid-turn compaction (including simultaneous model switch)', async () => {
+      const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'ag-parked-compact-'));
+      let sessSeq = 0;
+      const closedSids = [];
+      const createdModels = [];
+      const mcpBySid = new Map();
+      const pendingPrompts = new Map();
+      const acpMid = {
+        policyBySession: new Map(),
+        onNotification: null,
+        start: async () => {},
+        discover: async () => ({ groups: new Map(), raw: [] }),
+        cwdFor: async () => dir,
+        resolveModel: async (m) => m,
+        status: () => ({ running: true, ready: true }),
+        notify: (method, params) => {
+          if (method === 'session/cancel' && params?.sessionId) {
+            const p = pendingPrompts.get(params.sessionId);
+            if (p) {
+              pendingPrompts.delete(params.sessionId);
+              p.resolve({ stopReason: 'cancelled' });
+            }
+          }
+        },
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            sessSeq += 1;
+            const sid = `mid-sess-${sessSeq}`;
+            mcpBySid.set(sid, params.mcpServers?.[0]?.url || '');
+            createdModels.push({ sid, model: 'gemini-4-hydrogen' });
+            return { sessionId: sid, models: { currentModelId: 'gemini-4-hydrogen', availableModels: [] } };
+          }
+          if (method === 'session/set_model') {
+            const hit = createdModels.find((x) => x.sid === params.sessionId);
+            if (hit) hit.model = params.modelId;
+            return { models: { currentModelId: params.modelId } };
+          }
+          if (method === 'session/close') {
+            closedSids.push(params.sessionId);
+            return {};
+          }
+          if (method === 'session/prompt') {
+            const sid = params.sessionId;
+            const mcpUrl = mcpBySid.get(sid);
+            if (sid === 'mid-sess-1') {
+              // Park TWO parallel Read calls simultaneously on mid-sess-1
+              Promise.all([
+                fetch(mcpUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 401, method: 'tools/call', params: { name: 'Read', arguments: { path: 'old-1.js' } } }) }).catch(() => {}),
+                fetch(mcpUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 402, method: 'tools/call', params: { name: 'Read', arguments: { path: 'old-2.js' } } }) }).catch(() => {}),
+              ]);
+              return await new Promise((resolve, reject) => {
+                pendingPrompts.set(sid, { resolve, reject });
+              });
+            }
+            if (sid === 'mid-sess-2') {
+              const promptStr = (params.prompt || []).map((b) => b.text || '').join('\n');
+              assert.ok(promptStr.includes('PARTIAL_COMPACT_SUMMARY'), 'rebuilt session must receive new compaction summary');
+              assert.ok(promptStr.includes('SECOND_TOOL_SURVIVED'), 'rebuilt session must retain trailing matched tool output');
+              // Park one tool call on mid-sess-2 to also test zero-match branch summary compaction next
+              fetch(mcpUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 403, method: 'tools/call', params: { name: 'Read', arguments: { path: 'mid-3.js' } } }) }).catch(() => {});
+              return await new Promise((resolve, reject) => {
+                pendingPrompts.set(sid, { resolve, reject });
+              });
+            }
+            if (sid === 'mid-sess-3') {
+              const promptStr = (params.prompt || []).map((b) => b.text || '').join('\n');
+              if (promptStr.includes('BRANCH_RETURN_SUMMARY')) {
+                acpMid.onNotification({
+                  method: 'session/update',
+                  params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'BRANCH_REUSED_MAINLINE' } } },
+                });
+                return { stopReason: 'end_turn' };
+              }
+              assert.ok(promptStr.includes('ZERO_MATCH_COMPACT_SUMMARY'), 'zero-match compaction summary must trigger fresh compacted session');
+              acpMid.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'CLEAN_AFTER_BOTH_COMPACTIONS' } } },
+              });
+              return { stopReason: 'end_turn' };
+            }
+          }
+          return {};
+        },
+      };
+      const gw = createGateway({
+        acp: acpMid,
+        limiter: { run: (f) => f(), stats: () => ({}) },
+        getConfig: () => ({ ...config, source: path.join(dir, 'config.json') }),
+        log: () => {},
+      });
+      const p = await gw.listen([0]);
+      const tools = [{ type: 'function', name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } }];
+      const parseResp = async (r) => {
+        const raw = await r.text();
+        return raw.split('\n\n').filter(Boolean).map((blk) => {
+          const ev = /^event: (.+)$/m.exec(blk)?.[1];
+          const d = /^data: (.+)$/m.exec(blk)?.[1];
+          return ev && d ? { type: ev, data: JSON.parse(d) } : null;
+        }).filter(Boolean);
+      };
+      try {
+        // 1) Start turn 1 -> parks 2 parallel Read calls on mid-sess-1
+        const t1 = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'gemini-4-hydrogen', stream: true, prompt_cache_key: 'mid-compact-conv', tools, input: [{ role: 'user', content: 'start heavy work' }] }),
+        }));
+        const calls1 = t1.find((e) => e.type === 'response.completed').data.response.output.filter((o) => o.type === 'function_call');
+        assert.equal(calls1.length, 2);
+
+        // 2) Host compacts mid-turn: call 1 was folded into <summary>, only call 2 remains (partial match: matched=1, remaining=1) AND user switched model to gemini-4-neon!
+        const t2 = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-neon', stream: true, prompt_cache_key: 'mid-compact-conv', tools,
+            input: [
+              { role: 'user', content: 'The conversation history before this point was compacted into the following summary:\n\n<summary>\nPARTIAL_COMPACT_SUMMARY\n</summary>' },
+              { type: 'function_call', call_id: calls1[1].call_id, name: 'Read', arguments: calls1[1].arguments },
+              { type: 'function_call_output', call_id: calls1[1].call_id, output: 'SECOND_TOOL_SURVIVED' },
+            ],
+          }),
+        }));
+        const calls2 = t2.find((e) => e.type === 'response.completed').data.response.output.filter((o) => o.type === 'function_call');
+        assert.equal(calls2.length, 1, 'partial-match compaction must rebuild into mid-sess-2 instead of re-parking dead call 1 or throwing MODEL_SWITCH_FAILED');
+        assert.ok(closedSids.includes('mid-sess-1'), 'bloated mid-sess-1 must be closed on compaction');
+        assert.equal(createdModels.find((x) => x.sid === 'mid-sess-2')?.model, 'gemini-4-neon');
+
+        // 3) Host sends a true compaction checkpoint with zero matching tool outputs (matched=0, remaining=1)
+        const t3 = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-neon', stream: true, prompt_cache_key: 'mid-compact-conv', tools,
+            input: [
+              { role: 'user', content: 'The conversation history before this point was compacted into the following summary:\n\n<summary>\nZERO_MATCH_COMPACT_SUMMARY\n</summary>' },
+            ],
+          }),
+        }));
+        const msg3 = t3.find((e) => e.type === 'response.completed').data.response.output.find((o) => o.type === 'message').content[0].text;
+        assert.equal(msg3, 'CLEAN_AFTER_BOTH_COMPACTIONS');
+        assert.ok(closedSids.includes('mid-sess-2'), 'mid-sess-2 must also be closed on zero-match compaction');
+
+        // 4) Host sends a non-truncating BRANCH_SUMMARY_PREFIX on idle mainline -> must reuse mid-sess-3 without resetting session
+        const t4 = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-neon', stream: true, prompt_cache_key: 'mid-compact-conv', tools,
+            input: [
+              { role: 'user', content: 'The conversation history before this point was compacted into the following summary:\n\n<summary>\nZERO_MATCH_COMPACT_SUMMARY\n</summary>' },
+              { role: 'assistant', content: 'CLEAN_AFTER_BOTH_COMPACTIONS' },
+              { role: 'user', content: 'The following is a summary of a branch that this conversation came back from:\n\n<summary>\nBRANCH_RETURN_SUMMARY\n</summary>' },
+            ],
+          }),
+        }));
+        const msg4 = t4.find((e) => e.type === 'response.completed').data.response.output.find((o) => o.type === 'message').content[0].text;
+        assert.equal(msg4, 'BRANCH_REUSED_MAINLINE');
+        assert.equal(sessSeq, 3, 'non-truncating branch summary must reuse mid-sess-3 instead of triggering compaction reset');
+        assert.ok(!closedSids.includes('mid-sess-3'), 'mid-sess-3 must remain open across branch summary continuation');
+      } finally {
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    await check('P1 boundary invariants: budget pre-validation + SSE termination, explicit-key summarize isolation, and Task-parked parent checkpoint routing', async () => {
+      const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'ag-p1-bounds-'));
+      let sessSeq = 0;
+      const createdSids = [];
+      const closedSids = [];
+      const mcpBySid = new Map();
+      const pendingPrompts = new Map();
+      const promptTextsBySid = new Map();
+      const acpP1 = {
+        onExit: null,
+        onNotification: null,
+        policyBySession: new Map(),
+        stats: () => ({}),
+        ensure: async () => {},
+        discover: async () => ['gemini-4-neon', 'gemini-4-hydrogen', 'unsupported-model'],
+        cwdFor: async () => dir,
+        resolveModel: (m) => m,
+        status: () => ({ running: true, ready: true }),
+        notify: (method, params) => {
+          if (method === 'session/cancel' && params?.sessionId) {
+            const p = pendingPrompts.get(params.sessionId);
+            if (p) {
+              pendingPrompts.delete(params.sessionId);
+              p.resolve({ stopReason: 'cancelled' });
+            }
+          }
+        },
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            sessSeq += 1;
+            const sid = `p1-sess-${sessSeq}`;
+            createdSids.push(sid);
+            mcpBySid.set(sid, params.mcpServers?.[0]?.url || '');
+            return { sessionId: sid, models: { currentModelId: 'gemini-4-hydrogen', availableModels: [] } };
+          }
+          if (method === 'session/set_model') {
+            if (params.modelId === 'unsupported-model') {
+              const rpcErr = new Error('Invalid params: model unsupported');
+              rpcErr.acp = { code: -32602, message: 'Invalid params: model unsupported' };
+              throw rpcErr;
+            }
+            return { models: { currentModelId: params.modelId } };
+          }
+          if (method === 'session/close') {
+            closedSids.push(params.sessionId);
+            return {};
+          }
+          if (method === 'session/prompt') {
+            const sid = params.sessionId;
+            const mcpUrl = mcpBySid.get(sid);
+            const pText = (params.prompt || []).map((b) => b.text || '').join('\n');
+            promptTextsBySid.set(sid, [...(promptTextsBySid.get(sid) || []), pText]);
+            // Summarize side-session: reply immediately
+            if (!mcpUrl) {
+              acpP1.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '<summary>SUM_OK</summary>' } } },
+              });
+              return { stopReason: 'end_turn' };
+            }
+            // Explicit-key isolation: park a Read call on conv-A ('continue')
+            if (pText.includes('INIT_CONV_A_GOAL')) {
+              fetch(mcpUrl, {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id: 501, method: 'tools/call', params: { name: 'Read', arguments: { path: 'conv-a.js' } } }),
+              }).catch(() => {});
+              return await new Promise((resolve, reject) => {
+                pendingPrompts.set(sid, { resolve, reject });
+              });
+            }
+            // Task-parked parent checkpoint routing:
+            // Step 1: emit 1st Task call
+            if (pText.includes('PARENT_TASK_ROOT_GOAL') && !pText.includes('PARENT_TASK_COMPACT_SUMMARY') && (promptTextsBySid.get(sid) || []).length === 1) {
+              fetch(mcpUrl, {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id: 601, method: 'tools/call', params: { name: 'Task', arguments: { agent: 'local-free', task: 'audit part 1' } } }),
+              }).then(async (res) => {
+                await res.text();
+                // When Task 1 result is refilled and SSE stream closes, emit 2nd Task call and stay parked!
+                fetch(mcpUrl, {
+                  method: 'POST', headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ jsonrpc: '2.0', id: 602, method: 'tools/call', params: { name: 'Task', arguments: { agent: 'local-free', task: 'audit part 2' } } }),
+                }).catch(() => {});
+              }).catch(() => {});
+              return await new Promise((resolve, reject) => {
+                pendingPrompts.set(sid, { resolve, reject });
+              });
+            }
+            if (pText.includes('PARENT_TASK_COMPACT_SUMMARY')) {
+              acpP1.onNotification({
+                method: 'session/update',
+                params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'PARENT_REBUILT_WITH_DELIVERY' } } },
+              });
+              return { stopReason: 'end_turn' };
+            }
+            acpP1.onNotification({
+              method: 'session/update',
+              params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'OK' } } },
+            });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const gw = createGateway({
+        acp: acpP1,
+        limiter: { run: (f) => f(), stats: () => ({}) },
+        getConfig: () => ({ ...config, source: path.join(dir, 'config.json') }),
+        log: () => {},
+      });
+      const p = await gw.listen([0]);
+      const tools = [
+        { type: 'function', name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } },
+        { type: 'function', name: 'Task', parameters: { type: 'object', properties: { agent: { type: 'string' }, task: { type: 'string' } } } },
+      ];
+      const chatTools = tools.map((t) => ({ type: 'function', function: { name: t.name, parameters: t.parameters } }));
+      const parseResp = async (r) => {
+        const raw = await r.text();
+        return raw.split('\n\n').filter(Boolean).map((blk) => {
+          const ev = /^event: (.+)$/m.exec(blk)?.[1];
+          const d = /^data: (.+)$/m.exec(blk)?.[1];
+          return ev && d ? { type: ev, data: JSON.parse(d) } : null;
+        }).filter(Boolean);
+      };
+      try {
+        // (A1) Oversize 125KB single delivery on /v1/responses stream -> rejects BEFORE session/new and emits response.failed
+        const giantOut = 'X'.repeat(125000);
+        const rOverResp = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-neon', stream: true, prompt_cache_key: 'oversize-resp-conv', tools,
+            input: [
+              { role: 'user', content: 'run giant tool' },
+              { type: 'function_call', call_id: 'call_giant_1', name: 'Task', arguments: '{"agent":"local-free","task":"dump"}' },
+              { type: 'function_call_output', call_id: 'call_giant_1', output: giantOut },
+            ],
+          }),
+        }));
+        assert.equal(createdSids.length, 0, 'CONTEXT_BUDGET_EXCEEDED on /v1/responses must pre-validate before session/new');
+        const failedEv = rOverResp.find((e) => e.type === 'response.failed');
+        assert.ok(failedEv, '/v1/responses SSE must emit response.failed on pre-validation error');
+        assert.equal(failedEv.data.response.error.code, 'CONTEXT_BUDGET_EXCEEDED');
+
+        // (A2) Oversize 125KB single delivery on /v1/chat/completions stream -> rejects BEFORE session/new and emits error + [DONE]
+        const rawChatOver = await (await fetch(`http://127.0.0.1:${p}/v1/chat/completions`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-neon', stream: true, user: 'oversize-chat-conv', tools: chatTools,
+            messages: [
+              { role: 'user', content: 'run giant chat tool' },
+              { role: 'assistant', content: null, tool_calls: [{ id: 'call_giant_c1', type: 'function', function: { name: 'Task', arguments: '{"agent":"local-free","task":"dump"}' } }] },
+              { role: 'tool', tool_call_id: 'call_giant_c1', content: giantOut },
+            ],
+          }),
+        })).text();
+        assert.equal(createdSids.length, 0, 'CONTEXT_BUDGET_EXCEEDED on /v1/chat/completions must pre-validate before session/new');
+        assert.ok(rawChatOver.includes('CONTEXT_BUDGET_EXCEEDED') && rawChatOver.includes('[DONE]'), 'chat SSE must emit error chunk and [DONE]');
+
+        // (A3) Post-session/new MODEL_SWITCH_FAILED (-32602) closes unregistered session immediately
+        const rBadModel = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'unsupported-model', stream: true, prompt_cache_key: 'bad-model-conv', tools,
+            input: [{ role: 'user', content: 'test unsupported model' }],
+          }),
+        }));
+        assert.equal(createdSids.length, 1);
+        assert.ok(closedSids.includes('p1-sess-1'), 'unregistered session created before -32602 set_model failure must be closed immediately');
+        assert.equal(rBadModel.find((e) => e.type === 'response.failed')?.data?.response?.error?.code, 'MODEL_SWITCH_FAILED');
+
+        // (B) Explicit-key summarize preemption isolation: conv-A parked with generic 'continue' must NOT be preempted by conv-B summarize
+        const rConvA1 = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-neon', stream: true, prompt_cache_key: 'conv-A', tools,
+            input: [
+              { role: 'user', content: 'INIT_CONV_A_GOAL' },
+              { role: 'assistant', content: 'ready' },
+              { role: 'user', content: 'continue' },
+            ],
+          }),
+        }));
+        const convACall = rConvA1.find((e) => e.type === 'response.completed').data.response.output.find((o) => o.type === 'function_call');
+        assert.ok(convACall, 'conv-A must park Read tool call');
+        const convASid = createdSids[createdSids.length - 1];
+        assert.ok(pendingPrompts.has(convASid), 'conv-A prompt must remain parked');
+
+        // conv-B sends non-bridged compaction summarize containing 'continue' and even 'INIT_CONV_A_GOAL' text, but with explicit prompt_cache_key: 'conv-B'
+        const rSumB = await (await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-neon', stream: false, prompt_cache_key: 'conv-B',
+            instructions: 'You are a context summarization assistant.',
+            input: [{ role: 'user', content: '<conversation>\n[User]: INIT_CONV_A_GOAL\n[User]: continue\n</conversation>\nSummarize.' }],
+          }),
+        })).json();
+        assert.equal(rSumB.status, 'completed');
+        assert.ok(pendingPrompts.has(convASid), 'conv-B summarize must NEVER preempt parked conv-A across distinct explicit keys');
+
+        // Now conv-A sends its own summarize request -> MUST preempt conv-A's parked bridge
+        const rSumA = await (await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-neon', stream: false, prompt_cache_key: 'conv-A',
+            instructions: 'You are a context summarization assistant.',
+            input: [{ role: 'user', content: '<conversation>\n[User]: INIT_CONV_A_GOAL\n</conversation>\nSummarize.' }],
+          }),
+        })).json();
+        assert.equal(rSumA.status, 'completed');
+        assert.ok(!pendingPrompts.has(convASid), 'same-key summarize must preempt conv-A parked bridge');
+
+        // (C) Task-parked parent lane checkpoint routing (same prompt_cache_key, matching PI-Desktop /v1/responses lane routing)
+        const sysInstructions = 'You are PI-Desktop main parent agent for Task routing test.';
+        const rTask1 = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-neon', stream: true, prompt_cache_key: 'parent-task-conv', instructions: sysInstructions, tools,
+            input: [{ role: 'user', content: 'PARENT_TASK_ROOT_GOAL: run multi-stage subagent audit' }],
+          }),
+        }));
+        const taskCall1 = rTask1.find((e) => e.type === 'response.completed').data.response.output.find((o) => o.type === 'function_call');
+        assert.equal(taskCall1.name, 'Task');
+        const parentSid1 = createdSids[createdSids.length - 1];
+        // Shared-key subagent runs in _sub1 with distinct persona while parentSid1 is parked on Task 1 (laneMap.size becomes 2)
+        const rSub1 = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-neon', stream: true, prompt_cache_key: 'parent-task-conv',
+            instructions: 'You are local-free subagent.', tools,
+            input: [{ role: 'user', content: 'audit part 1' }],
+          }),
+        }));
+        assert.equal(rSub1.find((e) => e.type === 'response.completed').data.response.output.find((o) => o.type === 'message').content[0].text, 'OK');
+        assert.ok(pendingPrompts.has(parentSid1), 'parentSid1 must stay parked while shared-key subagent runs in _sub1');
+
+        // Refill Task 1 with a ~14.5KB subagent report -> emits Task 2 and stays parked on Task 2
+        const subReport1 = 'SUBAGENT_STAGE1_REPORT_MARKER_' + 'R'.repeat(14500);
+        const rTask2 = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-neon', stream: true, prompt_cache_key: 'parent-task-conv', instructions: sysInstructions, tools,
+            input: [
+              { role: 'user', content: 'PARENT_TASK_ROOT_GOAL: run multi-stage subagent audit' },
+              { type: 'function_call', call_id: taskCall1.call_id, name: 'Task', arguments: taskCall1.arguments },
+              { type: 'function_call_output', call_id: taskCall1.call_id, output: subReport1 },
+            ],
+          }),
+        }));
+        const compTask2 = rTask2.find((e) => e.type === 'response.completed');
+        assert.ok(compTask2, `expected response.completed on rTask2, got: ${JSON.stringify(rTask2)}`);
+        const taskCall2 = compTask2.data.response.output.find((o) => o.type === 'function_call');
+        assert.equal(taskCall2.name, 'Task');
+        assert.ok(pendingPrompts.has(parentSid1), 'parentSid1 must now be parked on second Task call');
+
+        // Host auto-compacts while parent lane is parked on Task 2 and sends new parent compaction checkpoint (without old root user message!)
+        const rTaskCompact = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-neon', stream: true, prompt_cache_key: 'parent-task-conv', instructions: sysInstructions, tools,
+            input: [
+              { role: 'user', content: 'The conversation history before this point was compacted into the following summary:\n\n<summary>\nPARENT_TASK_COMPACT_SUMMARY\n</summary>' },
+              { role: 'user', content: 'summarize the completed stage 1 findings now' },
+            ],
+          }),
+        }));
+        const finalParentMsg = rTaskCompact.find((e) => e.type === 'response.completed').data.response.output.find((o) => o.type === 'message').content[0].text;
+        assert.equal(finalParentMsg, 'PARENT_REBUILT_WITH_DELIVERY');
+        assert.ok(closedSids.includes(parentSid1), 'Task-parked parentSid1 must be preempted and closed instead of spawning an orphaned _sub1 lane');
+        const rebuiltParentSid = createdSids[createdSids.length - 1];
+        const rebuiltPrompt = (promptTextsBySid.get(rebuiltParentSid) || [])[0] || '';
+        assert.ok(rebuiltPrompt.includes('PARENT_TASK_ROOT_GOAL'), 'rebuilt parent lane must retain persisted userTimeline goal');
+        assert.ok(rebuiltPrompt.includes('SUBAGENT_STAGE1_REPORT_MARKER_'), 'rebuilt parent lane must retain ~14.5KB completed subagent report from recentDeliveries');
+      } finally {
+        gw.close();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+    await check('v2.4.0 Round 2 P1 gateway boundaries: previous_response_id standalone function_call_output, invalidated footprint recovery, budget precheck, Chat SSE [DONE], conflicting explicitHostKey summarize isolation, and cold-start serialization', async () => {
+      const dir = path.join(process.env.PI_SCRATCH_DIR || process.cwd(), `gw-r2-p1-${Date.now()}`);
+      fs.mkdirSync(dir, { recursive: true });
+      let sidSeq = 0;
+      const createdSids = [];
+      const cancelledSids = [];
+      const closedSids = [];
+      const loadCalls = [];
+      const promptsBySid = new Map();
+      const parkedResolvers = new Map();
+      let dropNextConnectionSid = '';
+      let failNextNonBridgePrompt = false;
+      const emitUpdate = (params) => acpMock.onNotification({ method: 'session/update', params });
+      const acpMock = {
+        policyBySession: new Map(),
+        start: async () => {},
+        discover: async () => {},
+        cwdFor: async () => dir,
+        resolveModel: (m) => m || 'gemini-3-flash',
+        modelsForApi: async () => [{ id: 'gemini-3-flash', object: 'model' }],
+        status: () => ({ running: true }),
+        sessionParams: async (cwd, mcpServers) => ({ cwd, mcpServers }),
+        ingestSelection: (meta) => ({ currentModelId: (meta && meta.models && meta.models.currentModelId) || '' }),
+        notify: (method, params) => {
+          if (method === 'session/cancel' && params && params.sessionId) {
+            cancelledSids.push(params.sessionId);
+            const resFn = parkedResolvers.get(params.sessionId);
+            if (resFn) {
+              parkedResolvers.delete(params.sessionId);
+              resFn({ stopReason: 'cancelled' });
+            }
+          }
+        },
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            await new Promise((r) => setTimeout(r, 25));
+            const sid = `r2-sid-${++sidSeq}`;
+            createdSids.push({ sid, mcpUrl: (params.mcpServers && params.mcpServers[0] && params.mcpServers[0].url) || '' });
+            return { sessionId: sid, models: { currentModelId: 'gemini-3-flash', availableModels: [{ modelId: 'gemini-3-flash' }] } };
+          }
+          if (method === 'session/load') {
+            loadCalls.push(params.sessionId);
+            throw new Error('session/load should not be called on invalidated footprint');
+          }
+          if (method === 'session/close') {
+            if (params && params.sessionId) closedSids.push(params.sessionId);
+            return {};
+          }
+          if (method === 'session/set_model') return {};
+          if (method === 'session/prompt') {
+            const sid = params.sessionId;
+            const txt = (params.prompt || []).map((b) => b.text || '').join('\n');
+            if (!promptsBySid.has(sid)) promptsBySid.set(sid, []);
+            promptsBySid.get(sid).push(txt);
+            if (failNextNonBridgePrompt) {
+              failNextNonBridgePrompt = false;
+              throw new Error('forced non-bridged upstream failure');
+            }
+            if (dropNextConnectionSid === sid) {
+              dropNextConnectionSid = '';
+              emitUpdate({
+                sessionId: sid,
+                update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Agent connection was lost and could not be re-established: worker exited' } },
+              });
+              return { stopReason: 'end_turn' };
+            }
+            const entry = createdSids.find((x) => x.sid === sid);
+            const mcpUrl = entry ? entry.mcpUrl : '';
+            if (txt.includes('Summarize the entire conversation')) {
+              emitUpdate({ sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '<summary>SUM_BETA</summary>' } } });
+              return { stopReason: 'end_turn' };
+            }
+            if (mcpUrl && txt.includes('DELTA_ROOT_GOAL_101') && !txt.includes('DELTA_TASK_REPORT_777')) {
+              setTimeout(async () => {
+                try {
+                  const rawCallRes = await fetch(mcpUrl, {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'Task', arguments: { agent: 'local-free', task: 'check delta' } } }),
+                  }).then((r) => r.text());
+                  const rFn = parkedResolvers.get(sid);
+                  if (rFn && rawCallRes.includes('DELTA_TASK_REPORT_777')) {
+                    parkedResolvers.delete(sid);
+                    emitUpdate({ sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'DELTA_REFILLED_OK' } } });
+                    rFn({ stopReason: 'end_turn' });
+                  }
+                } catch { /* ignore */ }
+              }, 10);
+              return new Promise((resolve) => parkedResolvers.set(sid, resolve));
+            }
+            if (mcpUrl && txt.includes('Refactor authentication middleware cleanly')) {
+              setTimeout(() => {
+                fetch(mcpUrl, {
+                  method: 'POST',
+                  headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'Read', arguments: { path: 'auth.js' } } }),
+                }).catch(() => {});
+              }, 10);
+              return new Promise((resolve) => parkedResolvers.set(sid, resolve));
+            }
+            emitUpdate({ sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'GENERIC_OK' } } });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const gw = createGateway({
+        acp: acpMock,
+        limiter: { run: (f) => f(), stats: () => ({}) },
+        getConfig: () => ({
+          ...config,
+          source: path.join(dir, 'config.json'),
+          defaultModel: 'gemini-3-flash',
+          defaultEffort: '',
+          toolPolicy: 'auto',
+          bridgeTools: true,
+          promptTimeoutMs: 10000,
+          maxSessions: 16,
+          cancelOnDisconnect: false,
+        }),
+        log: () => {},
+      });
+      const p = await gw.listen([0]);
+      const parseRespEvents = async (res) => {
+        const raw = await res.text();
+        return raw.split('\n\n').map((blk) => {
+          const ev = (blk.match(/^event:\s*(.+)$/m) || [])[1];
+          const dt = (blk.match(/^data:\s*(.+)$/m) || [])[1];
+          if (!ev || !dt) return null;
+          try { return { type: ev.trim(), data: JSON.parse(dt) }; } catch { return null; }
+        }).filter(Boolean);
+      };
+      const tools = [
+        { type: 'function', name: 'Task', parameters: { type: 'object', properties: { agent: { type: 'string' }, task: { type: 'string' } } } },
+        { type: 'function', name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } },
+      ];
+      try {
+        // (A) Standalone function_call_output via previous_response_id (no user item, no function_call item) + invalidated footprint recovery
+        const ev1 = await parseRespEvents(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'gemini-3-flash', stream: true, tools, input: [{ role: 'user', content: 'DELTA_ROOT_GOAL_101: audit module' }] }),
+        }));
+        const comp1 = ev1.find((e) => e.type === 'response.completed').data.response;
+        const respId1 = comp1.id;
+        const fnCall1 = comp1.output.find((o) => o.type === 'function_call');
+        assert.ok(respId1 && fnCall1, 'turn 1 must emit response id and parked Task function_call');
+
+        const ev2 = await parseRespEvents(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-3-flash', stream: true, tools,
+            previous_response_id: respId1,
+            input: [{ type: 'function_call_output', call_id: fnCall1.call_id, output: 'DELTA_TASK_REPORT_777' }],
+          }),
+        }));
+        const comp2Ev = ev2.find((e) => e.type === 'response.completed');
+        assert.ok(comp2Ev, `expected response.completed on ev2, got: ${JSON.stringify(ev2)}`);
+        const comp2 = comp2Ev.data.response;
+        const respId2 = comp2.id;
+        assert.equal(comp2.output.find((o) => o.type === 'message').content[0].text, 'DELTA_REFILLED_OK', 'standalone function_call_output with previous_response_id must succeed without 400');
+
+        // Force recoverable connection-lost salvaging on Turn 3 with delta previous_response_id -> invalidates old sid without calling session/load and replays both root goal + Task delivery
+        const firstDeltaSid = createdSids[0].sid;
+        dropNextConnectionSid = firstDeltaSid;
+        const ev3 = await parseRespEvents(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-3-flash', stream: true, tools,
+            previous_response_id: respId2,
+            input: [{ role: 'user', content: 'DELTA_FOLLOWUP_102: finalize' }],
+          }),
+        }));
+        assert.equal(ev3.find((e) => e.type === 'response.completed').data.response.output.find((o) => o.type === 'message').content[0].text, 'GENERIC_OK');
+        assert.equal(loadCalls.length, 0, 'invalidated session footprint must never trigger dead session/load RPC');
+        const salvagedSid = createdSids[createdSids.length - 1].sid;
+        const salvagedPrompt = (promptsBySid.get(salvagedSid) || [])[0] || '';
+        assert.ok(salvagedPrompt.includes('DELTA_ROOT_GOAL_101'), 'rebuilt delta session must preserve original root user goal');
+        assert.ok(salvagedPrompt.includes('DELTA_TASK_REPORT_777'), 'rebuilt delta session must preserve hydrated Task delivery');
+
+        // (B) Park conv-alpha on Read; verify oversized budget request fails BEFORE cancelling conv-alpha, and conflicting conv-beta summarize does NOT preempt conv-alpha
+        const evAlpha = await parseRespEvents(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-3-flash', stream: true, prompt_cache_key: 'conv-alpha', tools,
+            input: [{ role: 'user', content: 'Refactor authentication middleware cleanly' }],
+          }),
+        }));
+        const alphaSid = createdSids[createdSids.length - 1].sid;
+        assert.ok(evAlpha.find((e) => e.type === 'response.completed').data.response.output.some((o) => o.type === 'function_call'));
+
+        const sidsBeforeBudgetErr = createdSids.length;
+        const evOversized = await parseRespEvents(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-3-flash', stream: true, prompt_cache_key: 'conv-alpha', tools,
+            input: [{ role: 'user', content: 'OVERSIZED_REPLAY_' + 'X'.repeat(210000) }],
+          }),
+        }));
+        const failedEv = evOversized.find((e) => e.type === 'response.failed');
+        assert.ok(failedEv && failedEv.data.response.error.code === 'CONTEXT_BUDGET_EXCEEDED', 'oversized turn must fail with CONTEXT_BUDGET_EXCEEDED');
+        assert.ok(!cancelledSids.includes(alphaSid), 'budget precheck must reject BEFORE preempting/cancelling parked session');
+        assert.equal(createdSids.length, sidsBeforeBudgetErr, 'budget precheck must reject BEFORE creating a new ACP session');
+
+        // Conflicting explicitHostKey ('conv-beta') summarize mentioning conv-alpha's exact user anchor must NOT preempt conv-alpha
+        const betaSumRes = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-3-flash', stream: false, prompt_cache_key: 'conv-beta',
+            instructions: 'You are a context summarization assistant.',
+            input: [{ role: 'user', content: 'Summarize the entire conversation:\nUser: Refactor authentication middleware cleanly' }],
+          }),
+        });
+        assert.equal(betaSumRes.status, 200);
+        assert.ok(!cancelledSids.includes(alphaSid), 'summarize from conflicting explicitHostKey conv-beta must never preempt parked conv-alpha');
+
+        // (C) Non-bridged Chat SSE error path must emit data: [DONE]
+        failNextNonBridgePrompt = true;
+        const chatErrRaw = await fetch(`http://127.0.0.1:${p}/v1/chat/completions`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'gemini-3-flash', stream: true, messages: [{ role: 'user', content: 'trigger chat sse error' }] }),
+        }).then((r) => r.text());
+        assert.ok(chatErrRaw.includes('"error"') && chatErrRaw.includes('data: [DONE]'), 'non-bridged Chat SSE error must terminate with data: [DONE]');
+
+        // (D) Concurrent cold-start requests with identical prompt_cache_key must serialize sessionFor and create only 1 session
+        const beforeColdCount = createdSids.length;
+        const [coldA, coldB] = await Promise.all([
+          fetch(`http://127.0.0.1:${p}/v1/chat/completions`, {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ model: 'gemini-3-flash', stream: false, prompt_cache_key: 'cold-race-key', messages: [{ role: 'user', content: 'cold start turn' }] }),
+          }).then((r) => r.json()),
+          fetch(`http://127.0.0.1:${p}/v1/chat/completions`, {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ model: 'gemini-3-flash', stream: false, prompt_cache_key: 'cold-race-key', messages: [{ role: 'user', content: 'cold start turn' }] }),
+          }).then((r) => r.json()),
+        ]);
+        assert.equal(coldA.choices[0].message.content, 'GENERIC_OK');
+        assert.equal(coldB.choices[0].message.content, 'GENERIC_OK');
+        assert.equal(createdSids.length - beforeColdCount, 1, 'concurrent cold-start requests on same key must serialize and allocate only 1 ACP session');
+      } finally {
+        for (const rFn of parkedResolvers.values()) rFn({ stopReason: 'cancelled' });
+        parkedResolvers.clear();
         gw.close();
         try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
       }

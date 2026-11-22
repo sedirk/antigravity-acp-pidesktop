@@ -1,6 +1,7 @@
 'use strict';
+const os = require('node:os');
 const path = require('node:path');
-const { createGateway } = require('D:/tools/antigravity-acp/lib/server.js');
+const { createGateway } = require(path.resolve(__dirname, '../lib/server.js'));
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 let serial = 0;
 const calls = [];
@@ -13,6 +14,7 @@ const acp = {
   notify: (...a) => calls.push(a),
   request: async (method, params) => {
     if (method === 'session/new') { mcpUrl = (params.mcpServers || [])[0]?.url || null; log('session/new mcp=', mcpUrl); return { sessionId: 's' + (++serial) }; }
+    if (method === 'session/load') { mcpUrl = (params.mcpServers || [])[0]?.url || mcpUrl; return {}; }
     if (method === 'session/prompt') {
       acp.onNotification({ method: 'session/update', params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'resp narration' } } } });
       log('prompt -> MCP tools/call');
@@ -25,7 +27,7 @@ const acp = {
     return {};
   },
 };
-const cfg = { bind: '127.0.0.1', port: 0, defaultModel: 'test', toolPolicy: 'all', maxSessions: 20, promptTimeoutMs: 20000, promptIdleTimeoutMs: 20000, bridgeTools: true, source: path.join(process.env.PI_SCRATCH_DIR, 'repro2', 'config.json') };
+const cfg = { bind: '127.0.0.1', port: 0, defaultModel: 'test', toolPolicy: 'all', maxSessions: 20, promptTimeoutMs: 20000, promptIdleTimeoutMs: 20000, bridgeTools: true, source: path.join(os.tmpdir(), `agy-repro2-${Date.now()}`, 'config.json') };
 const gw = createGateway({ acp, limiter: { run: (f) => f(), stats: () => ({}) }, getConfig: () => cfg, log: (m) => log('GW', m) });
 setTimeout(() => { log('WATCHDOG'); process.exit(2); }, 30000).unref();
 

@@ -13,7 +13,8 @@ const path = require('node:path');
 const root = path.resolve(__dirname, '..');
 const configLib = require(path.join(root, 'lib/config.js'));
 const { createLimiter, levelOfEffort, AcpRuntime, permissionOutcome } = require(path.join(root, 'lib/core.js'));
-const { normalizeMessages, flatten, canonicalizeText } = require(path.join(root, 'lib/server.js'));
+const serverLib = require(path.join(root, 'lib/server.js'));
+const { normalizeMessages, flatten, canonicalizeText } = serverLib;
 const bridgeLib = require(path.join(root, 'lib/bridge.js'));
 const { createMcpServer } = require(path.join(root, 'lib/mcp.js'));
 const manifest = require(path.join(root, 'manifest.json'));
@@ -868,29 +869,35 @@ async function main() {
     assert.strictEqual(m.contextWindow, 256000, '未配置覆盖值时默认通告 256K');
   });
 
-  await suite('models: 默认256K通告、128K例外与自定义覆盖在所有字段和变体中一致', async () => {
+  await suite('models: 默认256K通告、128K例外、32K预留对齐输出上限与自定义覆盖在所有字段和变体中一致', async () => {
     for (const reportedContextWindow of [undefined, 0, 200000, 1000000]) {
-      const cfg = { virtualModels: true, exposeVariantModels: true };
-      if (reportedContextWindow !== undefined) cfg.reportedContextWindow = reportedContextWindow;
-      const rt = new AcpRuntime({ getConfig: () => cfg, log: () => {} });
-      rt.ingestModels([
-        { modelId: 'gemini-4-carbon-high', name: 'Gemini 4 Carbon (high)' },
-        { modelId: 'claude-opus-4-6-thinking-high', name: 'Claude Opus 4.6 Thinking (high)' },
-        { modelId: 'gpt-oss-120b', name: 'GPT-OSS 120B' },
-        { modelId: 'custom-model', name: 'Custom Model' },
-      ]);
-      rt.discover = async () => rt.discovery;
-      const models = await rt.modelsForApi();
-      assert.ok(models.length >= 6, '应覆盖基础模型与思考档位变体');
-      for (const model of models) {
-        const expected = reportedContextWindow > 0 ? reportedContextWindow : (model.id.includes('120b') ? 131072 : 256000);
-        for (const key of ['context_window', 'contextWindow', 'context_length']) {
-          assert.strictEqual(model[key], expected, `${model.id}.${key} 通告不一致`);
+      for (const reportedMaxTokens of [undefined, 0, 65536]) {
+        const cfg = { virtualModels: true, exposeVariantModels: true };
+        if (reportedContextWindow !== undefined) cfg.reportedContextWindow = reportedContextWindow;
+        if (reportedMaxTokens !== undefined) cfg.reportedMaxTokens = reportedMaxTokens;
+        const rt = new AcpRuntime({ getConfig: () => cfg, log: () => {} });
+        rt.ingestModels([
+          { modelId: 'gemini-4-carbon-high', name: 'Gemini 4 Carbon (high)' },
+          { modelId: 'claude-opus-4-6-thinking-high', name: 'Claude Opus 4.6 Thinking (high)' },
+          { modelId: 'gpt-oss-120b', name: 'GPT-OSS 120B' },
+          { modelId: 'custom-model', name: 'Custom Model' },
+        ]);
+        rt.discover = async () => rt.discovery;
+        const models = await rt.modelsForApi();
+        assert.ok(models.length >= 6, '应覆盖基础模型与思考档位变体');
+        for (const model of models) {
+          const expected = reportedContextWindow > 0 ? reportedContextWindow : (model.id.includes('120b') ? 131072 : 256000);
+          for (const key of ['context_window', 'contextWindow', 'context_length']) {
+            assert.strictEqual(model[key], expected, `${model.id}.${key} 通告不一致`);
+          }
+          assert.strictEqual(model.limit.context, expected);
+          assert.strictEqual(model.limit.input, expected);
+          const expectedOutput = reportedMaxTokens > 0 ? reportedMaxTokens : 32768;
+          for (const key of ['max_tokens', 'maxTokens', 'max_output_tokens']) {
+            assert.strictEqual(model[key], expectedOutput, `${model.id}.${key} 输出上限通告不一致`);
+          }
+          assert.strictEqual(model.limit.output, expectedOutput);
         }
-        assert.strictEqual(model.limit.context, expected);
-        assert.strictEqual(model.limit.input, expected);
-        const output = model.id.includes('claude') ? 131072 : (model.id.includes('gemini') ? 65536 : 32768);
-        assert.strictEqual(model.maxTokens, output, '上下文通告调整不改变输出上限');
       }
     }
   });
@@ -1256,12 +1263,12 @@ async function main() {
   await suite('acp-1.5.0: 运行时元数据升级检测、能力协商、Turn Usage 明细与 usage_update 零值保护', async () => {
     const http = require('node:http');
     const plugin = require(path.join(root, 'main.js'));
-    assert.strictEqual(plugin._internals.RUNTIME.version, '1.5.0');
-    assert.strictEqual(plugin._internals.RUNTIME.archiveBytes, 105513364);
-    assert.strictEqual(plugin._internals.RUNTIME.sha256, '6163F6B59B381BAE419652DBAE167BC8CDA0EF29D665C0BA8AF3D8C7FDDD8867');
+    assert.strictEqual(plugin._internals.RUNTIME.version, '1.5.2');
+    assert.strictEqual(plugin._internals.RUNTIME.archiveBytes, 105407645);
+    assert.strictEqual(plugin._internals.RUNTIME.sha256, '5CBADD4F4DF698572473D8890FC26EC2DC1724501F06E3A963941DAEC2BD21D6');
 
-    // 1. runtimeStatus 版本检测与 1.3.0 → 1.5.0 升级提示判定
-    const rtDataDir = tempDir('rt-150');
+    // 1. runtimeStatus 版本检测与 1.3.0 / 1.5.0 → 1.5.2 升级提示判定
+    const rtDataDir = tempDir('rt-152');
     plugin._internals.setDataPath(rtDataDir);
     const managedDir = path.join(rtDataDir, 'runtime');
     fs.mkdirSync(managedDir, { recursive: true });
@@ -1272,17 +1279,26 @@ async function main() {
       exeBytes: 1024,
     }), 'utf8');
     plugin._internals.reloadConfig();
-    const stOld = plugin._internals.runtimeStatus();
-    assert.strictEqual(stOld.installedVersion, '1.3.0');
-    assert.strictEqual(stOld.version, '1.5.0');
-    assert.strictEqual(stOld.updateAvailable, true);
+    const stOld130 = plugin._internals.runtimeStatus();
+    assert.strictEqual(stOld130.installedVersion, '1.3.0');
+    assert.strictEqual(stOld130.version, '1.5.2');
+    assert.strictEqual(stOld130.updateAvailable, true);
 
     fs.writeFileSync(path.join(managedDir, 'runtime-meta.json'), JSON.stringify({
       version: '1.5.0',
       exeBytes: 1024,
     }), 'utf8');
+    const stOld150 = plugin._internals.runtimeStatus();
+    assert.strictEqual(stOld150.installedVersion, '1.5.0');
+    assert.strictEqual(stOld150.version, '1.5.2');
+    assert.strictEqual(stOld150.updateAvailable, true);
+
+    fs.writeFileSync(path.join(managedDir, 'runtime-meta.json'), JSON.stringify({
+      version: '1.5.2',
+      exeBytes: 1024,
+    }), 'utf8');
     const stNew = plugin._internals.runtimeStatus();
-    assert.strictEqual(stNew.installedVersion, '1.5.0');
+    assert.strictEqual(stNew.installedVersion, '1.5.2');
     assert.strictEqual(stNew.updateAvailable, false);
 
     // 2. AcpRuntime 1.5.0 能力协商与旧版兼容回退
@@ -1570,10 +1586,10 @@ async function main() {
       });
       assert.strictEqual(transientFailures, 2);
       assert.strictEqual(fs.readFileSync(swapped.bin, 'utf8'), 'NEW_1_5_0_BIN_OK');
-      assert.strictEqual(JSON.parse(fs.readFileSync(path.join(liveDir, 'runtime-meta.json'), 'utf8')).version, '1.5.0');
+      assert.strictEqual(JSON.parse(fs.readFileSync(path.join(liveDir, 'runtime-meta.json'), 'utf8')).version, '1.5.2');
       const leftovers = fs.readdirSync(dataRoot).filter((n) => n.includes('.bak-') || n.startsWith('stage-'));
       assert.deepStrictEqual(leftovers, [], '不应残留 backup 或 stage 目录');
-      assert.strictEqual(_internals.runtimeStatus().installedVersion, '1.5.0');
+      assert.strictEqual(_internals.runtimeStatus().installedVersion, '1.5.2');
       assert.strictEqual(_internals.runtimeStatus().updateAvailable, false);
     } finally {
       _internals.setDataPath('');
@@ -1800,8 +1816,11 @@ async function main() {
     stackedSummaries.push({ role: 'user', content: 'FINAL_STACKED_SUMMARIZE_CMD' });
     const stackedFlat = serverLib.flattenSummarization(stackedSummaries);
     assert.ok(stackedFlat.length <= 108000, `多层摘要平铺字符数不得超限（实际: ${stackedFlat.length}）`);
-    assert.ok(Buffer.byteLength(stackedFlat, 'utf8') <= 116000, `多层摘要 UTF-8 字节数不得超限（实际: ${Buffer.byteLength(stackedFlat, 'utf8')}）`);
+    assert.ok(Buffer.byteLength(stackedFlat, 'utf8') <= 324000, `多层摘要 UTF-8 字节数不得超限（实际: ${Buffer.byteLength(stackedFlat, 'utf8')}）`);
     assert.ok(stackedFlat.includes('FINAL_STACKED_SUMMARIZE_CMD'), '多层摘要末尾指令必须保留');
+    const emptySel = new (require('../lib/core.js').AcpRuntime)({ getConfig: () => ({}), log: () => {} }).ingestSelection({});
+    assert.strictEqual(typeof emptySel, 'object', 'ingestSelection 空载荷应返回对象而非 null');
+    assert.strictEqual(emptySel.currentModelId, '', 'ingestSelection 空载荷应返回空字符串 currentModelId');
 
     // 4. 安全过滤器误判识别与白名单本地图片回填兜底（严格校验 Read 调用溯源与二进制图片魔数）
     assert.strictEqual(serverLib.isFalsePositiveFilterError(new Error('Candidate was blocked due to finish_reason: PROHIBITED_CONTENT')), true);
@@ -1856,6 +1875,1213 @@ async function main() {
     );
     assert.strictEqual(blocksBlocked.filter((b) => b.type === 'image').length, 0, '白名单目录外路径严禁读取内联图片');
   });
+  await suite('acp-1.5.2: gemini-4-neon/-extra_high 变体映射、configOptions、load/resume 模型同步、-32602 快速失败、取消块抑制与断连驱逐', async () => {
+    const http = require('node:http');
+    const coreLib = require(path.join(root, 'lib/core.js'));
+    const serverLib = require(path.join(root, 'lib/server.js'));
+
+    // 1. parseModelVariant / canonicalEffort / ingestSelection：1.5.2 -extra_high、max、-effort 与 CCPA 旧别名
+    assert.strictEqual(coreLib.canonicalEffort('extra_high'), 'xhigh');
+    assert.strictEqual(coreLib.canonicalEffort('extra-high'), 'xhigh');
+    assert.strictEqual(coreLib.canonicalEffort('xhigh'), 'xhigh');
+    assert.strictEqual(coreLib.canonicalEffort('max'), 'max');
+    assert.strictEqual(coreLib.canonicalEffort('extra-low'), 'low');
+
+    const parsedNeon = coreLib.parseModelVariant('gemini-4-neon-extra_high');
+    assert.deepStrictEqual(parsedNeon, { base: 'gemini-4-neon', level: 'xhigh', rawLevel: 'extra_high' });
+    const parsedEffort = coreLib.parseModelVariant('claude-opus-4-7-thinking-max-effort');
+    assert.deepStrictEqual(parsedEffort, { base: 'claude-opus-4-7-thinking', level: 'max', rawLevel: 'max' });
+    const ccpaSet = new Set(['gemini-3.5-flash-extra-low', 'gemini-3.5-flash-low', 'gemini-3-flash-agent']);
+    assert.deepStrictEqual(coreLib.parseModelVariant('gemini-3.5-flash-extra-low', ccpaSet), {
+      base: 'gemini-3.5-flash',
+      level: 'low',
+      rawLevel: 'extra-low',
+    });
+    assert.deepStrictEqual(coreLib.parseModelVariant('gemini-3.5-flash-low', ccpaSet), {
+      base: 'gemini-3.5-flash',
+      level: 'medium',
+      rawLevel: 'low',
+    });
+    assert.deepStrictEqual(coreLib.parseModelVariant('gemini-3-flash-agent', ccpaSet), {
+      base: 'gemini-3.5-flash',
+      level: 'high',
+      rawLevel: 'agent',
+    });
+
+    const rt152 = new AcpRuntime({ getConfig: () => ({ reportedContextWindow: 0, virtualModels: true }), log: () => {} });
+    rt152.ingestSelection({
+      models: {
+        currentModelId: 'gemini-4-neon-high',
+        availableModels: [
+          { modelId: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' },
+          { modelId: 'gemini-4-neon-extra_high', name: 'Gemini 4 Neon (Extra High)' },
+          { modelId: 'gemini-4-neon-medium', name: 'Gemini 4 Neon (Medium)' },
+          { modelId: 'gemini-4-neon-low', name: 'Gemini 4 Neon (Low)' },
+          { modelId: 'gemini-4-hydrogen-high', name: 'Gemini 4 Hydrogen (High)' },
+          { modelId: 'gemini-4-hydrogen-extra_high', name: 'Gemini 4 Hydrogen (Extra High)' },
+          { modelId: 'gemini-4-hydrogen-medium', name: 'Gemini 4 Hydrogen (Medium)' },
+          { modelId: 'gemini-4-hydrogen-low', name: 'Gemini 4 Hydrogen (Low)' },
+        ],
+      },
+      configOptions: [
+        {
+          id: 'model',
+          category: 'model',
+          currentValue: 'gemini-4-neon',
+          options: [
+            { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+            { value: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen' },
+          ],
+        },
+      ],
+    });
+    rt152.discover = async () => rt152.discovery;
+    const apiModels = await rt152.modelsForApi();
+    const neon = apiModels.find((m) => m.id === 'gemini-4-neon');
+    const hydrogen = apiModels.find((m) => m.id === 'gemini-4-hydrogen');
+    assert.ok(neon && hydrogen, '1.5.2 应聚合导出 gemini-4-neon 与 gemini-4-hydrogen 虚拟模型');
+    assert.strictEqual(neon.name, 'Gemini 4 Neon');
+    assert.deepStrictEqual(neon.thinkingLevels, ['low', 'medium', 'high', 'xhigh']);
+    assert.strictEqual(await rt152.resolveModel('gemini-4-neon', 'xhigh'), 'gemini-4-neon-extra_high', 'xhigh 必须精确映射为线级 -extra_high');
+    assert.strictEqual(await rt152.resolveModel('gemini-4-neon', 'max'), 'gemini-4-neon-extra_high', 'max 在仅支持到 xhigh 的模型上降级为 -extra_high');
+    assert.strictEqual(await rt152.resolveModel('gemini-4-neon-xhigh', ''), 'gemini-4-neon-extra_high', '显式传 -xhigh 别名也应修正为真实 wire ID -extra_high');
+    assert.strictEqual(await rt152.resolveModel('gemini-4-hydrogen', 'extra_high'), 'gemini-4-hydrogen-extra_high');
+
+    // 2. 错误与合成块分类器：取消合成块、断连终态块、MCP pi-bridge、QUOTA_EXHAUSTED 与 api_errors 清洗消息
+    assert.strictEqual(serverLib.isSyntheticCancelChunk('\n\nThe request was cancelled by the client.'), true);
+    assert.strictEqual(serverLib.isSyntheticCancelChunk('The request was cancelled by the client.'), true);
+    assert.strictEqual(serverLib.isSyntheticCancelChunk('Normal user answer about cancellation.'), false);
+    assert.strictEqual(serverLib.isConnectionLostChunk('Agent connection was lost and could not be re-established: WebSocket closed'), true);
+    assert.strictEqual(serverLib.isSyntheticExecutionErrorChunk('Agent execution error: MCP server `pi-bridge` failed to start: connection refused'), true);
+    assert.strictEqual(
+      serverLib.isTransientRateLimitError(new Error('Usage Limit Reached\nYou have reached your current quota for this period. Quota will reset in 4h 12m.')),
+      false,
+      '1.5.2 quota_errors 长周期额度耗尽提示不得当成瞬时 429 重试',
+    );
+    assert.strictEqual(
+      serverLib.isTransientRateLimitError(new Error('Error 429, Message: Resource has been exhausted (e.g. check quota), reason:QUOTA_EXHAUSTED')),
+      false,
+    );
+    assert.strictEqual(
+      serverLib.isDeadLocalProxyError(new Error('MCP server "pi-bridge" failed to load: Dial tcp 127.0.0.1:51234: connectex: No connection could be made')),
+      true,
+    );
+    assert.strictEqual(
+      serverLib.isFalsePositiveFilterError(new Error('Agent execution error: The response was blocked due to PROHIBITED_CONTENT')),
+      true,
+    );
+
+    // 3. 网关集成验证：
+    //   a) session/load 返回 currentModelId 恰等于目标 concreteModel 时跳过冗余 session/set_model；
+    //   b) session/set_model 返回 -32602 时吸收 data.availableModels 并快速失败（绝不重启 acp）；
+    //   c) 流中收到 Agent connection was lost... 时驱逐失效会话与 sessionStore 足迹并返回错误，下一轮干净 session/new。
+    const gwDir = tempDir('gw-152');
+    const wsDir = tempDir('ws-152');
+    let setModelCalls = 0;
+    let restartCalls = 0;
+    let newSessionCalls = 0;
+    let promptPhase = 'ok-after-load';
+    const mockAcp152 = new AcpRuntime({
+      getConfig: () => ({ ...configLib.DEFAULTS, source: path.join(gwDir, 'config.json'), bridgeTools: false }),
+      log: () => {},
+    });
+    mockAcp152.ready = true;
+    mockAcp152.child = { pid: 4321, stdin: { write: () => {} } };
+    mockAcp152.start = async () => ({});
+    mockAcp152.cwdFor = async () => wsDir;
+    mockAcp152.restart = () => { restartCalls += 1; return { pid: 4321, stopped: true }; };
+    mockAcp152.ingestSelection({
+      models: {
+        currentModelId: 'gemini-4-neon-extra_high',
+        availableModels: [
+          { modelId: 'gemini-4-neon-extra_high', name: 'Gemini 4 Neon (Extra High)' },
+          { modelId: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' },
+        ],
+      },
+    });
+    mockAcp152.request = async (method, params) => {
+      if (method === 'session/load') {
+        return {
+          sessionId: params.sessionId,
+          models: {
+            currentModelId: 'gemini-4-neon-extra_high',
+            availableModels: [
+              { modelId: 'gemini-4-neon-extra_high', name: 'Gemini 4 Neon (Extra High)' },
+              { modelId: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' },
+            ],
+          },
+        };
+      }
+      if (method === 'session/new') {
+        newSessionCalls += 1;
+        return {
+          sessionId: `sid-fresh-${newSessionCalls}`,
+          models: {
+            currentModelId: 'gemini-4-neon-extra_high',
+            availableModels: [
+              { modelId: 'gemini-4-neon-extra_high', name: 'Gemini 4 Neon (Extra High)' },
+              { modelId: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' },
+            ],
+          },
+        };
+      }
+      if (method === 'session/set_model') {
+        setModelCalls += 1;
+        if (params.modelId === 'forbidden-model-high') {
+          throw Object.assign(
+            new Error("Model 'forbidden-model-high' is not available for the current authentication method."),
+            {
+              acp: {
+                code: -32602,
+                message: "Model 'forbidden-model-high' is not available for the current authentication method.",
+                data: {
+                  modelId: 'forbidden-model-high',
+                  availableModels: ['gemini-4-neon-extra_high', 'gemini-4-neon-high', 'gemini-4-hydrogen-extra_high'],
+                },
+              },
+            },
+          );
+        }
+        return {};
+      }
+      if (method === 'session/close') return {};
+      if (method === 'session/prompt') {
+        if (promptPhase === 'ok-after-load') {
+          mockAcp152.onNotification({
+            method: 'session/update',
+            params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'loaded-ok' } } },
+          });
+          return { stopReason: 'end_turn' };
+        }
+        if (promptPhase === 'conn-lost-after-partial') {
+          mockAcp152.onNotification({
+            method: 'session/update',
+            params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'partial-before-drop' } } },
+          });
+          mockAcp152.onNotification({
+            method: 'session/update',
+            params: {
+              sessionId: params.sessionId,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'Agent connection was lost and could not be re-established: EOF' },
+              },
+            },
+          });
+          return { stopReason: 'end_turn' };
+        }
+        if (promptPhase === 'conn-lost-once') {
+          promptPhase = 'rebuilt-auto';
+          mockAcp152.onNotification({
+            method: 'session/update',
+            params: {
+              sessionId: params.sessionId,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'Agent connection was lost and could not be re-established: handshake timeout' },
+              },
+            },
+          });
+          return { stopReason: 'end_turn' };
+        }
+        if (promptPhase === 'rebuilt-auto') {
+          mockAcp152.onNotification({
+            method: 'session/update',
+            params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'auto-rebuilt-ok' } } },
+          });
+          return { stopReason: 'end_turn' };
+        }
+        if (promptPhase === 'cancelled-chunk') {
+          mockAcp152.onNotification({
+            method: 'session/update',
+            params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'partial-ok' } } },
+          });
+          mockAcp152.onNotification({
+            method: 'session/update',
+            params: {
+              sessionId: params.sessionId,
+              update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '\n\nThe request was cancelled by the client.' } },
+            },
+          });
+          return { stopReason: 'cancelled' };
+        }
+        mockAcp152.onNotification({
+          method: 'session/update',
+          params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'rebuilt-ok' } } },
+        });
+        return { stopReason: 'end_turn' };
+      }
+      return {};
+    };
+
+    // 预置持久化 sessions.json 足迹，验证启动后首次请求通过 session/load 恢复且 currentModelId 一致时不调用 set_model
+    const { createSessionStore } = require(path.join(root, 'lib/session-store.js'));
+    const seedKey = serverLib.keyFor([{ role: 'user', content: 'hello neon' }], { prompt_cache_key: 'k-152' });
+    const seedStore = createSessionStore({ file: path.join(gwDir, 'sessions.json') });
+    seedStore.set(seedKey, { sessionId: 'sid-persisted-152', model: 'gemini-4-neon-high', bridgeUrl: '' });
+    seedStore.flush();
+    const gw152 = serverLib.createGateway({
+      acp: mockAcp152,
+      limiter: createLimiter({ limit: 0, maxQueue: 8, queueTimeoutMs: 5000 }),
+      getConfig: () => ({ ...configLib.DEFAULTS, source: path.join(gwDir, 'config.json'), bridgeTools: false, rateLimitMaxRetries: 0 }),
+      log: () => {},
+    });
+    const port152 = await gw152.listen([0]);
+    try {
+      const postRaw = (body) => new Promise((resolve, reject) => {
+        const payload = JSON.stringify(body);
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port152,
+          path: '/v1/responses',
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) },
+        }, (res) => {
+          let raw = '';
+          res.setEncoding('utf8');
+          res.on('data', (c) => { raw += c; });
+          res.on('end', () => resolve({ status: res.statusCode, raw }));
+        });
+        req.on('error', reject);
+        req.end(payload);
+      });
+      const postResp = async (body) => {
+        const { status, raw } = await postRaw(body);
+        return { status, json: JSON.parse(raw) };
+      };
+
+      // 3a. session/load 返回 currentModelId='gemini-4-neon-extra_high'，请求 xhigh → 零次 set_model
+      const resLoad = await postResp({
+        model: 'gemini-4-neon',
+        reasoning: { effort: 'xhigh' },
+        stream: false,
+        prompt_cache_key: 'k-152',
+        input: [{ role: 'user', content: 'hello neon' }],
+      });
+      assert.strictEqual(resLoad.status, 200);
+      assert.strictEqual(setModelCalls, 0, 'loadSession 同步 currentModelId 匹配后不得重复发 session/set_model');
+      assert.strictEqual(newSessionCalls, 0, 'loadSession 成功时不得新建会话');
+
+      // 3b. 强制让 resolveModel 返回 forbidden-model-high 触发 -32602 → 吸收 availableModels，快速失败且不重启运行时
+      const origResolve = mockAcp152.resolveModel.bind(mockAcp152);
+      mockAcp152.resolveModel = async (m, e) => (m === 'forbidden-model' ? 'forbidden-model-high' : origResolve(m, e));
+      const res32602 = await postResp({
+        model: 'forbidden-model',
+        stream: false,
+        prompt_cache_key: 'k-152',
+        input: [
+          { role: 'user', content: 'hello neon' },
+          { role: 'assistant', content: 'loaded-ok' },
+          { role: 'user', content: 'try invalid model' },
+        ],
+      });
+      assert.ok(res32602.status >= 400, '-32602 应直接向客户端返回错误');
+      assert.strictEqual(restartCalls, 0, '-32602 属于参数/鉴权拒绝，严禁误重启运行时');
+      assert.strictEqual(newSessionCalls, 0, '-32602 严禁误销毁现有热会话或无意义重试 session/new');
+      assert.strictEqual(mockAcp152.hasModel('gemini-4-hydrogen-extra_high'), true, '应从 -32602 error.data.availableModels 刷新目录');
+      mockAcp152.resolveModel = origResolve;
+
+      // 3c. 半途断连（已有部分输出后收到 Agent connection was lost...）→ 报错并驱逐死会话，下一轮自动走 session/new 恢复
+      promptPhase = 'conn-lost-after-partial';
+      const resLost = await postResp({
+        model: 'gemini-4-neon',
+        reasoning: { effort: 'xhigh' },
+        stream: false,
+        prompt_cache_key: 'k-152',
+        input: [
+          { role: 'user', content: 'hello neon' },
+          { role: 'assistant', content: 'loaded-ok' },
+          { role: 'user', content: 'trigger conn lost' },
+        ],
+      });
+      assert.ok(resLost.status >= 400, 'Agent connection was lost 必须作为失败轮次返回，不得当成正常助手回复');
+      assert.strictEqual(newSessionCalls, 0, '半途断连不得在同一轮静默重发以免输出拼接');
+
+      promptPhase = 'rebuilt';
+      const resRebuilt = await postResp({
+        model: 'gemini-4-neon',
+        reasoning: { effort: 'xhigh' },
+        stream: false,
+        prompt_cache_key: 'k-152',
+        input: [
+          { role: 'user', content: 'hello neon' },
+          { role: 'assistant', content: 'loaded-ok' },
+          { role: 'user', content: 'retry after conn lost' },
+        ],
+      });
+      assert.strictEqual(resRebuilt.status, 200);
+      assert.strictEqual(newSessionCalls, 1, '死会话被驱逐后下一轮必须干净执行 session/new');
+      assert.ok(JSON.stringify(resRebuilt.json).includes('rebuilt-ok'));
+
+      // 3d. 首包前断连（零输出时收到 Agent connection was lost...）→ 触发 RUNTIME_RELOAD_LOST_SESSION 同轮无感新建会话自愈
+      promptPhase = 'conn-lost-once';
+      const resAutoHeal = await postResp({
+        model: 'gemini-4-neon',
+        reasoning: { effort: 'xhigh' },
+        stream: false,
+        prompt_cache_key: 'k-152',
+        input: [
+          { role: 'user', content: 'hello neon' },
+          { role: 'assistant', content: 'loaded-ok' },
+          { role: 'user', content: 'retry after conn lost' },
+          { role: 'assistant', content: 'rebuilt-ok' },
+          { role: 'user', content: 'zero-output conn lost auto heal' },
+        ],
+      });
+      assert.strictEqual(resAutoHeal.status, 200, '零输出首包前断连应在同轮自动重建会话成功');
+      assert.strictEqual(newSessionCalls, 2, '同轮自动自愈应新建一次会话');
+      assert.ok(JSON.stringify(resAutoHeal.json).includes('auto-rebuilt-ok'));
+
+      // 3e. stopReason='cancelled' 流式响应：保留已生成 partial-ok，且抑制 "\n\nThe request was cancelled by the client." 合成消息块
+      promptPhase = 'cancelled-chunk';
+      const resCancel = await postRaw({
+        model: 'gemini-4-neon',
+        reasoning: { effort: 'xhigh' },
+        stream: true,
+        prompt_cache_key: 'k-152',
+        input: [
+          { role: 'user', content: 'hello neon' },
+          { role: 'assistant', content: 'loaded-ok' },
+          { role: 'user', content: 'retry after conn lost' },
+          { role: 'assistant', content: 'rebuilt-ok' },
+          { role: 'user', content: 'zero-output conn lost auto heal' },
+          { role: 'assistant', content: 'auto-rebuilt-ok' },
+          { role: 'user', content: 'cancel me' },
+        ],
+      });
+      assert.strictEqual(resCancel.status, 200);
+      assert.strictEqual(newSessionCalls, 2, '续接正常热会话不应触发重建');
+      assert.ok(resCancel.raw.includes('partial-ok'), '取消前已生成的正文增量应保留');
+      assert.ok(!resCancel.raw.includes('The request was cancelled by the client.'), '不得把 1.5.2 合成取消提示块泄漏进响应');
+    } finally {
+      gw152.close();
+    }
+  });
+
+  await suite('v2.4.0 P1 边界回归：副作用/思考后断连禁同轮重放、显式变体禁降级、热恢复 MODEL_SWITCH_FAILED 透传', async () => {
+    // 1. P1 #2 (Unit): 显式传具体档位变体 ID 时，仅允许同档位 wire 别名互转，缺该档位时原样保留（绝不静默降级到 high）
+    const rtNarrow = new AcpRuntime({ getConfig: () => ({ modelCacheMs: 60000, cwd: '.' }), log: () => {} });
+    rtNarrow.ingestSelection({
+      models: {
+        currentModelId: 'gemini-4-neon-high',
+        availableModels: [
+          { modelId: 'gemini-4-neon-low', name: 'Gemini 4 Neon (Low)' },
+          { modelId: 'gemini-4-neon-medium', name: 'Gemini 4 Neon (Medium)' },
+          { modelId: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' },
+        ],
+      },
+    });
+    rtNarrow.discover = async () => rtNarrow.discovery;
+    assert.strictEqual(
+      await rtNarrow.resolveModel('gemini-4-neon-extra_high', ''),
+      'gemini-4-neon-extra_high',
+      '显式请求不可用的 -extra_high 变体时不得静默降级为 -high',
+    );
+    assert.strictEqual(
+      await rtNarrow.resolveModel('gemini-4-neon-xhigh', undefined),
+      'gemini-4-neon-xhigh',
+      '显式请求不可用的 -xhigh 变体时不得静默降级为 -high',
+    );
+    // 同档位别名互转（CCPA 暴露 -xhigh，显式请求 -extra_high → 同属 xhigh 档，允许精确映射）
+    const rtCcpa = new AcpRuntime({ getConfig: () => ({ modelCacheMs: 60000, cwd: '.' }), log: () => {} });
+    rtCcpa.ingestSelection({
+      models: {
+        currentModelId: 'gemini-4-neon-xhigh',
+        availableModels: [
+          { modelId: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' },
+          { modelId: 'gemini-4-neon-xhigh', name: 'Gemini 4 Neon (Extra High)' },
+        ],
+      },
+    });
+    rtCcpa.discover = async () => rtCcpa.discovery;
+    assert.strictEqual(
+      await rtCcpa.resolveModel('gemini-4-neon-extra_high', ''),
+      'gemini-4-neon-xhigh',
+      '同属 xhigh 档的 -extra_high 与 -xhigh 允许线级别名互转',
+    );
+
+    // 2. P1 #2 (Bridged Integration): 桥接轮显式传 gemini-4-neon-extra_high（即使配置有 defaultEffort='medium'）撞 -32602 时，
+    //    必须立即返回 MODEL_SWITCH_FAILED，严禁二次 resolveModel 降级为 high 重建会话或发送 prompt
+    {
+      const dir = tempDir('p1-bridge-32602');
+      const ws = tempDir('p1-bridge-ws');
+      let newCalls = 0;
+      let promptCalls = 0;
+      const acpMock = new AcpRuntime({ getConfig: () => ({ modelCacheMs: 60000, cwd: ws }), log: () => {} });
+      acpMock.ingestSelection({
+        models: {
+          currentModelId: 'gemini-4-neon-high',
+          availableModels: [
+            { modelId: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' },
+            { modelId: 'gemini-4-neon-extra_high', name: 'Gemini 4 Neon (Extra High)' },
+          ],
+        },
+      });
+      acpMock.start = async () => {};
+      acpMock.discover = async () => acpMock.discovery;
+      acpMock.cwdFor = async () => ws;
+      acpMock.status = () => ({ running: true, ready: true });
+      acpMock.notify = () => {};
+      acpMock.request = async (method, params) => {
+        if (method === 'session/new') {
+          newCalls += 1;
+          return {
+            sessionId: `sid-b-${newCalls}`,
+            models: {
+              currentModelId: 'gemini-4-neon-high',
+              availableModels: [{ modelId: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' }],
+            },
+          };
+        }
+        if (method === 'session/set_model') {
+          throw Object.assign(
+            new Error(`Model '${params.modelId}' is not available for the current authentication method.`),
+            {
+              acp: {
+                code: -32602,
+                message: `Model '${params.modelId}' is not available for the current authentication method.`,
+                data: { modelId: params.modelId, availableModels: ['gemini-4-neon-high', 'gemini-4-neon-medium'] },
+              },
+            },
+          );
+        }
+        if (method === 'session/prompt') {
+          promptCalls += 1;
+          return { stopReason: 'end_turn' };
+        }
+        return {};
+      };
+      const gw = serverLib.createGateway({
+        acp: acpMock,
+        limiter: createLimiter({ limit: 0, maxQueue: 8, queueTimeoutMs: 5000 }),
+        getConfig: () => ({ ...configLib.DEFAULTS, source: path.join(dir, 'config.json'), bridgeTools: true, defaultEffort: 'medium' }),
+        log: () => {},
+      });
+      const port = await gw.listen([0]);
+      try {
+        const raw = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-neon-extra_high',
+            stream: true,
+            prompt_cache_key: 'p1-b-key',
+            tools: [{ type: 'function', name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } }],
+            input: [{ role: 'user', content: 'must fail without downgrade' }],
+          }),
+        }).then((r) => r.text());
+        assert.strictEqual(newCalls, 1, '桥接遇到 MODEL_SWITCH_FAILED 不得二次重试 session/new');
+        assert.strictEqual(promptCalls, 0, '严禁降级到 gemini-4-neon-high 发送 prompt');
+        assert.ok(raw.includes('MODEL_SWITCH_FAILED'), `SSE 应返回 MODEL_SWITCH_FAILED，实际: ${raw.slice(0, 240)}`);
+      } finally {
+        gw.close();
+      }
+    }
+
+    // 3. P1 #1 (Non-bridged & Bridged): 原生工具完成（含催答轮）或已输出思考块/已执行桥接工具后收到断连块，
+    //    必须以 ACP_CONNECTION_LOST 终止，严禁同轮重建会话重放副作用或拼接重复思考
+    {
+      const dir = tempDir('p1-conn-lost');
+      const ws = tempDir('p1-conn-ws');
+      let sidSeq = 0;
+      let mode = 'native-tool-then-nudge-lost';
+      let nativeToolRuns = 0;
+      let mcpUrl = '';
+      const acpMock = {
+        policyBySession: new Map(),
+        onNotification: null,
+        start: async () => {},
+        discover: async () => ({ groups: new Map(), raw: [] }),
+        cwdFor: async () => ws,
+        resolveModel: async (m) => m,
+        status: () => ({ running: true, ready: true }),
+        notify: () => {},
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            sidSeq += 1;
+            if (params.mcpServers && params.mcpServers[0]) mcpUrl = params.mcpServers[0].url;
+            return { sessionId: `sid-cl-${sidSeq}`, models: { currentModelId: 'gemini-4-neon-extra_high', availableModels: [] } };
+          }
+          if (method === 'session/close') return {};
+          if (method === 'session/prompt') {
+            const pText = params.prompt.map((b) => b.text || '').join('\n');
+            if (mode === 'native-tool-then-nudge-lost') {
+              if (!pText.includes('上一轮没有输出正文')) {
+                nativeToolRuns += 1;
+                acpMock.onNotification({
+                  method: 'session/update',
+                  params: { sessionId: params.sessionId, update: { sessionUpdate: 'tool_call', toolCallId: 'tc1', kind: 'execute', title: 'run side effect' } },
+                });
+                acpMock.onNotification({
+                  method: 'session/update',
+                  params: { sessionId: params.sessionId, update: { sessionUpdate: 'tool_call_update', toolCallId: 'tc1', status: 'completed' } },
+                });
+                return { stopReason: 'end_turn' };
+              }
+              acpMock.onNotification({
+                method: 'session/update',
+                params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Agent connection was lost and could not be re-established: broken pipe' } } },
+              });
+              return { stopReason: 'end_turn' };
+            }
+            if (mode === 'thought-then-lost') {
+              acpMock.onNotification({
+                method: 'session/update',
+                params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Step 1 thinking...' } } },
+              });
+              acpMock.onNotification({
+                method: 'session/update',
+                params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Agent connection was lost and could not be re-established: reset' } } },
+              });
+              return { stopReason: 'end_turn' };
+            }
+            if (mode === 'bridged-tool-then-lost') {
+              await fetch(mcpUrl, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'Read', arguments: { path: 'a.txt' } } }),
+              }).then((r) => r.text());
+              acpMock.onNotification({
+                method: 'session/update',
+                params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Agent connection was lost and could not be re-established: after tool' } } },
+              });
+              return { stopReason: 'end_turn' };
+            }
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      let useBridge = false;
+      const gw = serverLib.createGateway({
+        acp: acpMock,
+        limiter: createLimiter({ limit: 0, maxQueue: 8, queueTimeoutMs: 5000 }),
+        getConfig: () => ({ ...configLib.DEFAULTS, source: path.join(dir, 'config.json'), bridgeTools: useBridge, rateLimitMaxRetries: 0 }),
+        log: () => {},
+      });
+      const port = await gw.listen([0]);
+      try {
+        // 3a. 原生工具执行完成后在 nudge 轮断连 → 严禁新建会话二次执行原生工具
+        const rTool = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'gemini-4-neon-extra_high', stream: false, prompt_cache_key: 'cl-native', input: [{ role: 'user', content: 'do native tool' }] }),
+        });
+        const jTool = await rTool.json();
+        assert.ok(rTool.status >= 400, '原生工具后催答断连必须报错');
+        assert.strictEqual(jTool.error.code, 'ACP_CONNECTION_LOST');
+        assert.strictEqual(nativeToolRuns, 1, '严禁同轮新建会话重复执行已完成工具');
+        assert.strictEqual(sidSeq, 1, '同轮不得新建挽救会话');
+
+        // 3b. 流式已输出 agent_thought_chunk 后断连 → 严禁同轮新建会话拼接重复思考
+        mode = 'thought-then-lost';
+        const rawThought = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'gemini-4-neon-extra_high', stream: true, prompt_cache_key: 'cl-thought', input: [{ role: 'user', content: 'think then drop' }] }),
+        }).then((r) => r.text());
+        assert.strictEqual(sidSeq, 2, '已输出思考块后断连不得同轮新建会话重放');
+        assert.ok(rawThought.includes('ACP_CONNECTION_LOST'), `应返回 ACP_CONNECTION_LOST，实际: ${rawThought.slice(0, 300)}`);
+
+        // 3c. 桥接工具完成回填后断连（此时 legText===0 且 parked 已清空）→ 严禁同轮新建挽救会话
+        useBridge = true;
+        mode = 'bridged-tool-then-lost';
+        const tools = [{ type: 'function', name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } }];
+        const rawLeg1 = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'gemini-4-neon-extra_high', stream: true, prompt_cache_key: 'cl-bridge', tools, input: [{ role: 'user', content: 'read then drop' }] }),
+        }).then((r) => r.text());
+        const evs1 = rawLeg1.split('\n\n').filter(Boolean).map((blk) => {
+          const ev = /^event: (.+)$/m.exec(blk)?.[1];
+          const d = /^data: (.+)$/m.exec(blk)?.[1];
+          return ev && d ? { type: ev, data: JSON.parse(d) } : null;
+        }).filter(Boolean);
+        const fc = evs1.find((e) => e.type === 'response.completed').data.response.output.find((o) => o.type === 'function_call');
+        assert.ok(fc, '第一拍应挂起返回 function_call');
+        const sidBeforeLeg2 = sidSeq;
+        const rawLeg2 = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-neon-extra_high',
+            stream: true,
+            prompt_cache_key: 'cl-bridge',
+            tools,
+            input: [
+              { role: 'user', content: 'read then drop' },
+              { type: 'function_call', call_id: fc.call_id, name: 'Read', arguments: fc.arguments },
+              { type: 'function_call_output', call_id: fc.call_id, output: 'file-body' },
+            ],
+          }),
+        }).then((r) => r.text());
+        assert.strictEqual(sidSeq, sidBeforeLeg2, '桥接工具回填后断连严禁在同轮新建会话重放');
+        assert.ok(rawLeg2.includes('ACP_CONNECTION_LOST'), `应以 ACP_CONNECTION_LOST 失败收尾，实际: ${rawLeg2.slice(0, 300)}`);
+      } finally {
+        gw.close();
+      }
+    }
+
+    // 4. P1 #3: 本地回环断连热恢复与 Concurrent receive_steps 热重载时，若 loadSession 返回旧模型且 switchModel 报 -32602，
+    //    必须透传 MODEL_SWITCH_FAILED，严禁吞错继续在旧档位模型上发 prompt
+    {
+      const dir = tempDir('p1-hot-recover');
+      const ws = tempDir('p1-hot-ws');
+      let phase = 'warm';
+      let promptCount = 0;
+      const acpHot = {
+        policyBySession: new Map(),
+        onNotification: null,
+        start: async () => {},
+        restart: async () => ({ pid: 1, stopped: true }),
+        discover: async () => ({ groups: new Map(), raw: [] }),
+        cwdFor: async () => ws,
+        resolveModel: async (m) => m,
+        status: () => ({ running: true, ready: true }),
+        notify: () => {},
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            return { sessionId: 'sid-hot-1', models: { currentModelId: 'gemini-4-neon-extra_high', availableModels: [] } };
+          }
+          if (method === 'session/load') {
+            // 热恢复返回的模型停留在 high，与当前请求的 extra_high 不一致
+            return { models: { currentModelId: 'gemini-4-neon-high', availableModels: [] } };
+          }
+          if (method === 'session/set_model') {
+            if (phase !== 'warm') {
+              throw Object.assign(
+                new Error(`Model '${params.modelId}' is not available for the current authentication method.`),
+                { acp: { code: -32602, message: 'not available', data: { modelId: params.modelId, availableModels: ['gemini-4-neon-high'] } } },
+              );
+            }
+            return {};
+          }
+          if (method === 'session/close') return {};
+          if (method === 'session/prompt') {
+            promptCount += 1;
+            if (phase === 'warm') {
+              acpHot.onNotification({
+                method: 'session/update',
+                params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'warm-ok' } } },
+              });
+              return { stopReason: 'end_turn' };
+            }
+            if (phase === 'loopback-drop') {
+              if (promptCount === 1) {
+                throw new Error('Agent execution error: Post "http://127.0.0.1:59999/v1beta": dial tcp 127.0.0.1:59999: connectex: No connection could be made');
+              }
+              throw new Error('UNEXPECTED_PROMPT_AFTER_FAILED_SWITCH_LOOPBACK');
+            }
+            if (phase === 'concurrent-conflict') {
+              if (promptCount <= 2) {
+                throw new Error('Concurrent receive_steps() calls are not supported on this connection');
+              }
+              throw new Error('UNEXPECTED_PROMPT_AFTER_FAILED_SWITCH_CONCURRENT');
+            }
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const gw = serverLib.createGateway({
+        acp: acpHot,
+        limiter: createLimiter({ limit: 0, maxQueue: 8, queueTimeoutMs: 5000 }),
+        getConfig: () => ({ ...configLib.DEFAULTS, source: path.join(dir, 'config.json'), bridgeTools: false, rateLimitMaxRetries: 0 }),
+        log: () => {},
+      });
+      const port = await gw.listen([0]);
+      const postHot = async (input) => {
+        const r = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'gemini-4-neon-extra_high', stream: false, prompt_cache_key: 'hot-key', input }),
+        });
+        return { status: r.status, json: await r.json() };
+      };
+      try {
+        const warm = await postHot([{ role: 'user', content: 'hi' }]);
+        assert.strictEqual(warm.status, 200);
+
+        phase = 'loopback-drop';
+        promptCount = 0;
+        const rLoop = await postHot([
+          { role: 'user', content: 'hi' },
+          { role: 'assistant', content: 'warm-ok' },
+          { role: 'user', content: 'trigger loopback recovery' },
+        ]);
+        assert.ok(rLoop.status >= 400);
+        assert.strictEqual(rLoop.json.error.code, 'MODEL_SWITCH_FAILED', '回环断连热恢复 set_model 失败必须透传 MODEL_SWITCH_FAILED');
+        assert.strictEqual(promptCount, 1, 'set_model 失败后严禁在旧模型上继续发送第二次 session/prompt');
+
+        phase = 'concurrent-conflict';
+        promptCount = 0;
+        const rConc = await postHot([
+          { role: 'user', content: 'hi' },
+          { role: 'assistant', content: 'warm-ok' },
+          { role: 'user', content: 'trigger concurrent conflict recovery' },
+        ]);
+        assert.ok(rConc.status >= 400);
+        assert.strictEqual(rConc.json.error.code, 'MODEL_SWITCH_FAILED', '并发冲突热重载 set_model 失败必须透传 MODEL_SWITCH_FAILED');
+        assert.strictEqual(promptCount, 2, '第 2 次冲突触发 load+set_model 失败后严禁发送第 3 次 session/prompt');
+      } finally {
+        gw.close();
+      }
+    }
+  });
+
+  await suite('v2.4.0 二轮 P1 回归：CCPA 三档映射、桥接回填切模、终态与副作用禁内层重试、auxSession 模型同步、思考后合成错拦截', async () => {
+    // 1. P1 #4: CCPA gemini-3.5-flash 三档映射（extra-low -> low, low -> medium, high -> high），且显式具体变体绝不错档
+    const rtFlash = new AcpRuntime({ getConfig: () => ({ modelCacheMs: 60000, cwd: '.' }), log: () => {} });
+    rtFlash.ingestSelection({
+      models: {
+        currentModelId: 'gemini-3.5-flash-low',
+        availableModels: [
+          { modelId: 'gemini-3.5-flash-extra-low', name: 'Gemini 3.5 Flash (Low)' },
+          { modelId: 'gemini-3.5-flash-low', name: 'Gemini 3.5 Flash (Medium)' },
+          { modelId: 'gemini-3.5-flash-high', name: 'Gemini 3.5 Flash (High)' },
+        ],
+      },
+    });
+    rtFlash.discover = async () => rtFlash.discovery;
+    const flashModels = await rtFlash.modelsForApi();
+    const flashGroup = flashModels.find((m) => m.id === 'gemini-3.5-flash');
+    assert.ok(flashGroup, '应聚合导出 gemini-3.5-flash 虚拟模型');
+    assert.deepStrictEqual(flashGroup.thinkingLevels, ['low', 'medium', 'high'], 'CCPA 三档模型应完整暴露 low/medium/high');
+    assert.strictEqual(await rtFlash.resolveModel('gemini-3.5-flash', 'low'), 'gemini-3.5-flash-extra-low', 'low 档必须命中 -extra-low');
+    assert.strictEqual(await rtFlash.resolveModel('gemini-3.5-flash', 'medium'), 'gemini-3.5-flash-low', 'medium 档必须命中 -low');
+    assert.strictEqual(await rtFlash.resolveModel('gemini-3.5-flash', 'high'), 'gemini-3.5-flash-high', 'high 档必须命中 -high');
+    assert.strictEqual(await rtFlash.resolveModel('gemini-3.5-flash-low', ''), 'gemini-3.5-flash-low', '显式具体变体 ID 不得被改写为 -extra-low');
+    assert.strictEqual(await rtFlash.resolveModel('gemini-3.5-flash-medium', ''), 'gemini-3.5-flash-low', '显式 -medium 别名应精确解析到同属 medium 档的真实 wire ID');
+
+    // 2. P1 #2 Residual: 桥接工具回填请求中途切换模型——非法模型立即报 MODEL_SWITCH_FAILED/MODEL_UNAVAILABLE；合法模型取消旧挂起轮次并 set_model 续接
+    {
+      const dir = tempDir('p1r2-refill-switch');
+      const ws = tempDir('p1r2-refill-ws');
+      let mcpUrl = '';
+      const setModelLog = [];
+      const cancelLog = [];
+      const promptModels = [];
+      let activeModelBySid = new Map();
+      let sidCounter = 0;
+      let pendingParkAbort = null;
+      const acpRefill = new AcpRuntime({ getConfig: () => ({ modelCacheMs: 60000, cwd: ws }), log: () => {} });
+      acpRefill.ingestSelection({
+        models: {
+          currentModelId: 'gemini-4-neon-high',
+          availableModels: [
+            { modelId: 'gemini-4-neon-low', name: 'Gemini 4 Neon (Low)' },
+            { modelId: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' },
+          ],
+        },
+      });
+      acpRefill.start = async () => {};
+      acpRefill.discover = async () => acpRefill.discovery;
+      acpRefill.cwdFor = async () => ws;
+      acpRefill.status = () => ({ running: true, ready: true });
+      acpRefill.notify = (method, params) => {
+        if (method === 'session/cancel') {
+          cancelLog.push(params.sessionId);
+          if (typeof pendingParkAbort === 'function') {
+            const fn = pendingParkAbort;
+            pendingParkAbort = null;
+            fn();
+          }
+        }
+      };
+      acpRefill.request = async (method, params) => {
+        if (method === 'session/new') {
+          sidCounter += 1;
+          const sid = `sid-rf-${sidCounter}`;
+          if (params.mcpServers && params.mcpServers[0]) mcpUrl = params.mcpServers[0].url;
+          activeModelBySid.set(sid, 'gemini-4-neon-high');
+          return {
+            sessionId: sid,
+            models: {
+              currentModelId: 'gemini-4-neon-high',
+              availableModels: [
+                { modelId: 'gemini-4-neon-low', name: 'Gemini 4 Neon (Low)' },
+                { modelId: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' },
+              ],
+            },
+          };
+        }
+        if (method === 'session/set_model') {
+          setModelLog.push(params.modelId);
+          if (params.modelId === 'gemini-4-neon-extra_high') {
+            throw Object.assign(
+              new Error("Model 'gemini-4-neon-extra_high' is not available for the current authentication method."),
+              { acp: { code: -32602, message: 'not available', data: { modelId: params.modelId, availableModels: ['gemini-4-neon-low', 'gemini-4-neon-high'] } } },
+            );
+          }
+          activeModelBySid.set(params.sessionId, params.modelId);
+          return {};
+        }
+        if (method === 'session/close') return {};
+        if (method === 'session/prompt') {
+          const curModel = activeModelBySid.get(params.sessionId);
+          promptModels.push(curModel);
+          const pText = params.prompt.map((b) => b.text || '').join('\n');
+          if (!pText.includes('tool-result-payload')) {
+            let cancelled = false;
+            const abortCtrl = new AbortController();
+            pendingParkAbort = () => { cancelled = true; abortCtrl.abort(); };
+            try {
+              await fetch(mcpUrl, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'Read', arguments: { path: 'x.txt' } } }),
+                signal: abortCtrl.signal,
+              }).then((r) => r.text());
+            } catch { /* cancelled on model switch */ }
+            pendingParkAbort = null;
+            if (cancelled) return { stopReason: 'cancelled' };
+          }
+          acpRefill.onNotification({
+            method: 'session/update',
+            params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `answered-by:${curModel}` } } },
+          });
+          return { stopReason: 'end_turn' };
+        }
+        return {};
+      };
+      const gw = serverLib.createGateway({
+        acp: acpRefill,
+        limiter: createLimiter({ limit: 0, maxQueue: 8, queueTimeoutMs: 5000 }),
+        getConfig: () => ({ ...configLib.DEFAULTS, source: path.join(dir, 'config.json'), bridgeTools: true, rateLimitMaxRetries: 0 }),
+        log: () => {},
+      });
+      const port = await gw.listen([0]);
+      const tools = [{ type: 'function', name: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } } } }];
+      const parseRespSse = (raw) => raw.split('\n\n').filter(Boolean).map((blk) => {
+        const ev = /^event: (.+)$/m.exec(blk)?.[1];
+        const d = /^data: (.+)$/m.exec(blk)?.[1];
+        return ev && d ? { type: ev, data: JSON.parse(d) } : null;
+      }).filter(Boolean);
+      try {
+        // 第一拍在 gemini-4-neon-high 上挂起工具调用
+        const raw1 = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'gemini-4-neon', reasoning: { effort: 'high' }, stream: true, prompt_cache_key: 'rf-sw', tools, input: [{ role: 'user', content: 'read x.txt' }] }),
+        }).then((r) => r.text());
+        const fc1 = parseRespSse(raw1).find((e) => e.type === 'response.completed').data.response.output.find((o) => o.type === 'function_call');
+        assert.ok(fc1, '第一拍应产出挂起的 function_call');
+
+        // 第二拍 a：回填时显式指定不可用的 gemini-4-neon-extra_high → 必须直接报 MODEL_UNAVAILABLE/MODEL_SWITCH_FAILED，严禁沿用旧 high 模型静默回答
+        const rawBad = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-neon-extra_high',
+            stream: true,
+            prompt_cache_key: 'rf-sw',
+            tools,
+            input: [
+              { role: 'user', content: 'read x.txt' },
+              { type: 'function_call', call_id: fc1.call_id, name: 'Read', arguments: fc1.arguments },
+              { type: 'function_call_output', call_id: fc1.call_id, output: 'tool-result-payload' },
+            ],
+          }),
+        }).then((r) => r.text());
+        assert.ok(
+          rawBad.includes('MODEL_UNAVAILABLE') || rawBad.includes('MODEL_SWITCH_FAILED'),
+          `回填切到不可用模型必须报错，实际: ${rawBad.slice(0, 260)}`,
+        );
+        assert.ok(!rawBad.includes('answered-by:'), '严禁在旧挂起模型上静默生成答案');
+
+        // 第二拍 b：回填时切到合法的 gemini-4-neon (effort=low) → 取消旧 high 轮次、执行 set_model('gemini-4-neon-low') 并由新模型回答
+        const rawGood = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-neon',
+            reasoning: { effort: 'low' },
+            stream: true,
+            prompt_cache_key: 'rf-sw',
+            tools,
+            input: [
+              { role: 'user', content: 'read x.txt' },
+              { type: 'function_call', call_id: fc1.call_id, name: 'Read', arguments: fc1.arguments },
+              { type: 'function_call_output', call_id: fc1.call_id, output: 'tool-result-payload' },
+            ],
+          }),
+        }).then((r) => r.text());
+        assert.ok(cancelLog.length >= 1, '中途切模应先向挂起旧轮次发送 session/cancel');
+        assert.ok(setModelLog.includes('gemini-4-neon-low'), '必须显式调用 session/set_model 切换到 gemini-4-neon-low');
+        assert.ok(rawGood.includes('answered-by:gemini-4-neon-low'), `必须由切换后的新模型回答，实际: ${rawGood.slice(0, 300)}`);
+      } finally {
+        gw.close();
+      }
+    }
+
+    // 3. P1 #1 Residual: 已分类断连错误含 429/connectex 字样严禁误入内层重试；当前拍已有原生工具/思考活动后撞 429/回环/过滤器严禁内层重放
+    {
+      const dir = tempDir('p1r2-no-inner-retry');
+      const ws = tempDir('p1r2-no-inner-ws');
+      let scenario = 'conn-lost-with-429-text';
+      let promptsOnClosedSid = 0;
+      let closedSids = new Set();
+      let nativeToolExecs = 0;
+      let sidSeq = 0;
+      const acpGuard = {
+        policyBySession: new Map(),
+        onNotification: null,
+        start: async () => {},
+        restart: async () => ({ pid: 1, stopped: true }),
+        discover: async () => ({ groups: new Map(), raw: [] }),
+        cwdFor: async () => ws,
+        resolveModel: async (m) => m,
+        status: () => ({ running: true, ready: true }),
+        notify: () => {},
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            sidSeq += 1;
+            return { sessionId: `sid-ng-${sidSeq}`, models: { currentModelId: 'gemini-4-neon-high', availableModels: [] } };
+          }
+          if (method === 'session/close') {
+            closedSids.add(params.sessionId);
+            return {};
+          }
+          if (method === 'session/load') {
+            return { models: { currentModelId: 'gemini-4-neon-high', availableModels: [] } };
+          }
+          if (method === 'session/prompt') {
+            if (closedSids.has(params.sessionId)) {
+              promptsOnClosedSid += 1;
+              throw new Error('PROMPT_CALLED_ON_ALREADY_CLOSED_SESSION');
+            }
+            if (scenario === 'conn-lost-with-429-text') {
+              acpGuard.onNotification({
+                method: 'session/update',
+                params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'thinking before drop' } } },
+              });
+              acpGuard.onNotification({
+                method: 'session/update',
+                params: {
+                  sessionId: params.sessionId,
+                  update: {
+                    sessionUpdate: 'agent_message_chunk',
+                    content: { type: 'text', text: 'Agent connection was lost and could not be re-established: Error 429 rateLimitExceeded dial tcp 127.0.0.1:59999: connectex' },
+                  },
+                },
+              });
+              return { stopReason: 'end_turn' };
+            }
+            if (scenario === 'native-tool-then-429') {
+              nativeToolExecs += 1;
+              acpGuard.onNotification({
+                method: 'session/update',
+                params: { sessionId: params.sessionId, update: { sessionUpdate: 'tool_call', toolCallId: `nt-${nativeToolExecs}`, kind: 'execute', title: 'mutate file' } },
+              });
+              throw new Error('Error 429 Too Many Requests: rateLimitExceeded');
+            }
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const gw = serverLib.createGateway({
+        acp: acpGuard,
+        limiter: createLimiter({ limit: 0, maxQueue: 8, queueTimeoutMs: 5000 }),
+        getConfig: () => ({
+          ...configLib.DEFAULTS,
+          source: path.join(dir, 'config.json'),
+          bridgeTools: false,
+          rateLimitMaxRetries: 2,
+          rateLimitRetryBaseMs: 50,
+          contentFilterMaxRetries: 2,
+        }),
+        log: () => {},
+      });
+      const port = await gw.listen([0]);
+      try {
+        const r1 = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'gemini-4-neon-high', stream: false, prompt_cache_key: 'ng-1', input: [{ role: 'user', content: 'drop with 429 text' }] }),
+        });
+        const j1 = await r1.json();
+        assert.ok(r1.status >= 400);
+        assert.strictEqual(j1.error.code, 'ACP_CONNECTION_LOST', '断连终态块不得被 429/connectex 子串劫持进内层重试');
+        assert.strictEqual(promptsOnClosedSid, 0, '严禁在已关闭的失效 sessionId 上重发 session/prompt');
+
+        scenario = 'native-tool-then-429';
+        const r2 = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'gemini-4-neon-high', stream: false, prompt_cache_key: 'ng-2', input: [{ role: 'user', content: 'run tool then 429' }] }),
+        });
+        assert.ok(r2.status >= 400);
+        assert.strictEqual(nativeToolExecs, 1, '当拍已发生原生工具调用（即使正文为 0）后遇 429 严禁内层自动重放副作用');
+      } finally {
+        gw.close();
+      }
+    }
+
+    // 4. P1 #3 Residual: 共享辅助会话 auxSession 在热恢复 loadSession 返回旧模型且 switchModel 失败后，后续辅助请求不得误信旧模型缓存跳过 set_model
+    {
+      const dir = tempDir('p1r2-aux-sync');
+      const ws = tempDir('p1r2-aux-ws');
+      let auxPhase = 'init';
+      let activeAuxModel = 'gemini-4-neon-extra_high';
+      const auxPromptModels = [];
+      let auxSidSeq = 0;
+      const acpAux = {
+        policyBySession: new Map(),
+        onNotification: null,
+        start: async () => {},
+        discover: async () => ({ groups: new Map(), raw: [] }),
+        cwdFor: async () => ws,
+        resolveModel: async (m) => m,
+        status: () => ({ running: true, ready: true }),
+        notify: () => {},
+        request: async (method, params) => {
+          if (method === 'session/new') {
+            auxSidSeq += 1;
+            activeAuxModel = auxPhase === 'init' ? 'gemini-4-neon-extra_high' : 'gemini-4-neon-high';
+            return { sessionId: `sid-aux-${auxSidSeq}`, models: { currentModelId: activeAuxModel, availableModels: [] } };
+          }
+          if (method === 'session/load') {
+            activeAuxModel = 'gemini-4-neon-high';
+            return { models: { currentModelId: 'gemini-4-neon-high', availableModels: [] } };
+          }
+          if (method === 'session/set_model') {
+            if (auxPhase !== 'init' && params.modelId === 'gemini-4-neon-extra_high') {
+              throw Object.assign(
+                new Error("Model 'gemini-4-neon-extra_high' is not available for the current authentication method."),
+                { acp: { code: -32602, message: 'not available', data: { modelId: params.modelId, availableModels: ['gemini-4-neon-high'] } } },
+              );
+            }
+            activeAuxModel = params.modelId;
+            return {};
+          }
+          if (method === 'session/close') return {};
+          if (method === 'session/prompt') {
+            if (auxPhase === 'conflict-reload') {
+              throw new Error('Concurrent receive_steps() calls are not supported on this connection');
+            }
+            auxPromptModels.push(activeAuxModel);
+            acpAux.onNotification({
+              method: 'session/update',
+              params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `title:${activeAuxModel}` } } },
+            });
+            return { stopReason: 'end_turn' };
+          }
+          return {};
+        },
+      };
+      const gw = serverLib.createGateway({
+        acp: acpAux,
+        limiter: createLimiter({ limit: 0, maxQueue: 8, queueTimeoutMs: 5000 }),
+        getConfig: () => ({ ...configLib.DEFAULTS, source: path.join(dir, 'config.json'), bridgeTools: true, rateLimitMaxRetries: 0 }),
+        log: () => {},
+      });
+      const port = await gw.listen([0]);
+      const sendAux = async () => {
+        const r = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'gemini-4-neon-extra_high',
+            stream: false,
+            messages: [
+              { role: 'system', content: 'Generate a concise 4-word conversation title.' },
+              { role: 'user', content: 'Hello world' },
+            ],
+          }),
+        });
+        return { status: r.status, json: await r.json() };
+      };
+      try {
+        const a1 = await sendAux();
+        assert.strictEqual(a1.status, 200, '首次辅助请求初始化 auxSession 成功');
+        assert.deepStrictEqual(auxPromptModels, ['gemini-4-neon-extra_high']);
+
+        auxPhase = 'conflict-reload';
+        const a2 = await sendAux();
+        assert.ok(a2.status >= 400);
+        assert.strictEqual(a2.json.error.code, 'MODEL_SWITCH_FAILED', 'auxSession 热恢复切模失败应返回 MODEL_SWITCH_FAILED');
+
+        auxPhase = 'post-failure';
+        const a3 = await sendAux();
+        assert.ok(a3.status >= 400, '后续同模型辅助请求不得跳过 set_model 冒用旧模型成功');
+        assert.strictEqual(a3.json.error.code, 'MODEL_SWITCH_FAILED');
+        assert.deepStrictEqual(auxPromptModels, ['gemini-4-neon-extra_high'], '严禁在降级的 gemini-4-neon-high 上执行请求');
+      } finally {
+        gw.close();
+      }
+    }
+
+    // 5. P1 #5: browser_subagent 精确合成错误块识别 + 前置 agent_thought_chunk 后的精确合成错误块（含配额耗尽）转为终态失败而非正常回复
+    const browserErrText = 'Browser automation could not start (the chrome-devtools-mcp tool provider failed to launch), so this request could not be completed. Retry after ensuring Node.js/npx is installed and that `npx chrome-devtools-mcp@>=1` can be fetched from your npm registry. Other functionality is unaffected.';
+    const quotaErrText = 'Usage Limit Reached\n\nYou have reached your current quota for this period. Your limit will reset in 3h 45m.';
+    assert.strictEqual(serverLib.isExactSyntheticErrorChunk(browserErrText), true, '应精确识别 1.5.2 browser_subagent 启动失败合成块');
+    assert.strictEqual(serverLib.isSyntheticExecutionErrorChunk(browserErrText, { hasTurnUsage: true }), true);
+    assert.strictEqual(serverLib.isExactSyntheticErrorChunk(quotaErrText), true, '应精确识别 1.5.2 quota_errors 合成块');
+    {
+      const dir = tempDir('p1r2-thought-synth');
+      const ws = tempDir('p1r2-thought-ws');
+      let synthPayload = quotaErrText;
+      let promptCount = 0;
+      const acpSynth = {
+        policyBySession: new Map(),
+        onNotification: null,
+        start: async () => {},
+        discover: async () => ({ groups: new Map(), raw: [] }),
+        cwdFor: async () => ws,
+        resolveModel: async (m) => m,
+        status: () => ({ running: true, ready: true }),
+        notify: () => {},
+        request: async (method, params) => {
+          if (method === 'session/new') return { sessionId: 'sid-synth-1', models: { currentModelId: 'claude-sonnet-4-6', availableModels: [] } };
+          if (method === 'session/close') return {};
+          if (method === 'session/prompt') {
+            promptCount += 1;
+            acpSynth.onNotification({
+              method: 'session/update',
+              params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Planning browser check...' } } },
+            });
+            acpSynth.onNotification({
+              method: 'session/update',
+              params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: synthPayload } } },
+            });
+            return { stopReason: 'end_turn', usage: { inputTokens: 120, outputTokens: 15, thoughtTokens: 15, totalTokens: 135 } };
+          }
+          return {};
+        },
+      };
+      const gw = serverLib.createGateway({
+        acp: acpSynth,
+        limiter: createLimiter({ limit: 0, maxQueue: 8, queueTimeoutMs: 5000 }),
+        getConfig: () => ({ ...configLib.DEFAULTS, source: path.join(dir, 'config.json'), bridgeTools: false, rateLimitMaxRetries: 2, rateLimitRetryBaseMs: 50 }),
+        log: () => {},
+      });
+      const port = await gw.listen([0]);
+      try {
+        const rawQuota = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'claude-sonnet-4-6', stream: true, prompt_cache_key: 'synth-q', input: [{ role: 'user', content: 'test quota after thought' }] }),
+        }).then((r) => r.text());
+        assert.strictEqual(promptCount, 1, 'QUOTA_EXHAUSTED 合成块严禁触发 429 内层重试');
+        assert.ok(rawQuota.includes('event: response.failed'), `前置思考后的配额耗尽合成块必须发出 response.failed，实际: ${rawQuota.slice(0, 320)}`);
+        assert.ok(rawQuota.includes('QUOTA_EXHAUSTED'), '错误码应标为 QUOTA_EXHAUSTED');
+        assert.ok(!rawQuota.includes('event: response.completed'), '严禁当成正常已完成回复');
+
+        synthPayload = browserErrText;
+        const rawBrowser = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'claude-sonnet-4-6', stream: true, prompt_cache_key: 'synth-b', input: [{ role: 'user', content: 'test browser mcp error after thought' }] }),
+        }).then((r) => r.text());
+        assert.ok(rawBrowser.includes('event: response.failed'), `前置思考后的 browser_subagent 合成块必须发出 response.failed，实际: ${rawBrowser.slice(0, 320)}`);
+        assert.ok(!rawBrowser.includes('event: response.completed'), '严禁把 chrome-devtools-mcp 启动失败合成块当成正常答案完成');
+      } finally {
+        gw.close();
+      }
+    }
+  });
+
   const failed = results.filter((r) => !r.ok);
   console.log(`\n结果: ${results.length - failed.length}/${results.length} 通过`);
   if (failed.length > 0) process.exit(1);
