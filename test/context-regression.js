@@ -119,7 +119,9 @@ test('report persistence stays complete, bounded and explicit on overflow', () =
   assert.deepEqual(collectDeliveries([user(report)], deliveries), deliveries, 'repeated requests must not duplicate reports');
   const text = flatten([user(checkpoint('summary without report')), user('continue')], { persistedTimeline: ['ORIGINAL_GOAL'], persistedDeliveries: deliveries });
   assert.ok(text.includes(report)); assert.ok(text.includes('ORIGINAL_GOAL'));
-  assert.throws(() => boundDeliveries(['x'.repeat(120000)]), { code: 'CONTEXT_BUDGET_EXCEEDED' });
+  const clipped120k = boundDeliveries(['HEAD_120K_' + 'x'.repeat(120000) + '_TAIL_120K']);
+  assert.equal(clipped120k.length, 1);
+  assert.ok(clipped120k[0].includes('HEAD_120K_') && clipped120k[0].includes('_TAIL_120K') && clipped120k[0].includes('省略'), 'oversized single delivery must clip head+tail cleanly without throwing CONTEXT_BUDGET_EXCEEDED');
 });
 
 test('file-list filtering is scoped, bounded and does not rewrite user prose', () => {
@@ -292,7 +294,8 @@ test('large tool arguments retain the latest causal group in replay and summariz
     for (const anchor of ['write-large', 'WRITE_SUCCESS_ANCHOR', 'EARLIER_PROGRESS', '省略']) assert.ok(text.includes(anchor), anchor);
   }
   const { recentContext } = require('../lib/context.js');
-  assert.throws(() => recentContext(messages.slice(2, 4), 1, 1), { code: 'CONTEXT_BUDGET_EXCEEDED' });
+  assert.equal(recentContext(messages.slice(2, 4), 1, 1), '', 'tiny recentContext budget must return empty string gracefully instead of throwing');
+  assert.throws(() => recentContext(messages.slice(2, 4), 1, 1, 18, 8000, 17600, false), { code: 'CONTEXT_BUDGET_EXCEEDED' });
 });
 
 test('HTTP replay keeps a large trailing tool call paired with its short result', async () => {
@@ -418,11 +421,9 @@ test('branch summary vs compaction separation, chronological dedup before evicti
   assert.ok(pair[0].includes('NEW_55K_'));
   const flat55 = flatten([user('GOAL_55'), user(bigNew), user('next')], { persistedDeliveries: [bigOld] });
   assert.ok(flat55.includes('NEW_55K_') && !flat55.includes('OLD_55K_'), 'HTTP rebuild with persisted 55KB delivery must keep newer 55KB delivery');
-  assert.throws(
-    () => collectDeliveries([user('GOAL_55'), user(bigNew)], [bigOld], { turnDeliveries: [bigOld] }),
-    (err) => err && err.code === 'CONTEXT_BUDGET_EXCEEDED',
-    'sequential 55KB + 55KB deliveries within the same human turn must reject instead of evicting first report',
-  );
+  const sameTurnPair = collectDeliveries([user('GOAL_55'), user(bigNew)], [bigOld], { turnDeliveries: [bigOld] });
+  assert.equal(sameTurnPair.length, 2, 'sequential 55KB + 55KB deliveries within the same human turn must both survive via proportional head+tail clipping');
+  assert.ok(sameTurnPair[0].includes('OLD_55K_') && sameTurnPair[1].includes('NEW_55K_'));
 
   // Pre-checkpoint report A (~14.5KB) + post-checkpoint report B (~14.5KB): duplicate A before checkpoint or B after checkpoint must never flip [A, B] order
   const repA = callback('PRE_A_' + 'a'.repeat(14500));
@@ -444,9 +445,34 @@ test('branch summary vs compaction separation, chronological dedup before evicti
       user('continue'),
     ],
   }, { responses: true });
-  assert.throws(() => collectDeliveries(multiTaskMsgs), (err) => err && err.code === 'CONTEXT_BUDGET_EXCEEDED');
-  assert.throws(() => flatten(multiTaskMsgs), (err) => err && err.code === 'CONTEXT_BUDGET_EXCEEDED');
+  const multiTaskDelivs = collectDeliveries(multiTaskMsgs);
+  assert.equal(multiTaskDelivs.length, 2, 'oversized first Task + tiny second Task must both survive without throwing CONTEXT_BUDGET_EXCEEDED');
+  assert.ok(multiTaskDelivs[0].includes('OVERSIZED_FIRST_') && multiTaskDelivs[1].includes('TINY_SECOND_OK'));
+  const flatMultiTask = flatten(multiTaskMsgs);
+  assert.ok(flatMultiTask.includes('OVERSIZED_FIRST_') && flatMultiTask.includes('TINY_SECOND_OK'));
 
+  // Repeated Task + Still-running TaskWait polling (>10 polls over 20m) must NOT count as completed subagent deliveries or overflow budget
+  const pollHistory = [
+    user('resume firmware probe'),
+    { type: 'function_call', call_id: 'tk-launch', name: 'Task', arguments: '{"agent":"nuaa-zxh","task":"unicorn probe"}' },
+    { type: 'function_call_output', call_id: 'tk-launch', output: 'Delegation del-1 started: the nuaa-zxh subagent is working in the background (unicorn probe). Continue your own independent work, then call TaskWait with this delegationId to converge, or TaskStop to stop it. Job reference: {"kind":"delegation","id":"del-1"}.' },
+    { type: 'function_call', call_id: 'tk-json', name: 'Task', arguments: '{"agent":"local-free","task":"quick check"}' },
+    { type: 'function_call_output', call_id: 'tk-json', output: '{"delegationId":"del-2","job":"job-2","agent":"local-free","status":"running","startedAt":"2026-11-26T00:00:00Z"}' },
+  ];
+  for (let pIdx = 1; pIdx <= 12; pIdx++) {
+    pollHistory.push(
+      { type: 'function_call', call_id: `tw-poll-${pIdx}`, name: 'TaskWait', arguments: '{"delegationIds":["del-1"],"timeoutSeconds":90}' },
+      { type: 'function_call_output', call_id: `tw-poll-${pIdx}`, output: `Still running after ${pIdx * 90}s: 0/1 finished. This is not a failure — unfinished delegates keep working.\nnuaa-zxh (del-1), ${pIdx * 90}s, ${pIdx * 4} tool calls, last tool Bash\n\n## nuaa-zxh (del-1) — running\nnuaa-zxh (del-1), ${pIdx * 90}s, ${pIdx * 4} tool calls, last tool Bash` },
+    );
+  }
+  pollHistory.push(
+    { type: 'function_call', call_id: 'tw-done', name: 'TaskWait', arguments: '{"delegationIds":["del-1"],"timeoutSeconds":90}' },
+    { type: 'function_call_output', call_id: 'tw-done', output: '## nuaa-zxh (del-1) — completed\nFINAL_FIRMWARE_PROBE_OK' },
+  );
+  const normalizedPolls = normalizeMessages({ input: pollHistory }, { responses: true });
+  const pollDeliveries = collectDeliveries(normalizedPolls);
+  assert.equal(pollDeliveries.length, 1, 'launch receipt and 12 Still-running TaskWait polls must be excluded from completed subagent deliveries');
+  assert.ok(pollDeliveries[0].includes('FINAL_FIRMWARE_PROBE_OK') && !pollDeliveries[0].includes('0/1 finished'));
   // Post-compaction carry-over must prune 8 stale reports / oversized pre-compaction dumps so rebuilt sessions start lean
   const staleMany = Array.from({ length: 6 }, (_, i) => `Subagent completion:\nSTALE_${i}_${'z'.repeat(11000)}`);
   const staleOversized = `Subagent completion:\nHUGE_DUMP_${'w'.repeat(45000)}`;
@@ -462,12 +488,9 @@ test('branch summary vs compaction separation, chronological dedup before evicti
   cjkMsgs.push(user('当前指令：' + '汉'.repeat(28000)));
   const flatCjk = flatten(cjkMsgs);
   assert.ok(flatCjk.includes('原始目标：确保多字节中文上下文不会突破字节预算'));
-  assert.ok(Buffer.byteLength(flatCjk, 'utf8') <= 240000, 'multi-byte UTF-8 flatten output must respect byte ceilings');
-  assert.throws(
-    () => flatten([user('汉'.repeat(85000))]),
-    (err) => err && err.code === 'CONTEXT_BUDGET_EXCEEDED',
-    'single 85,000 CJK char message (255KB UTF-8) must be rejected by whole-package flatten byte cap',
-  );
+  assert.ok(Buffer.byteLength(flatCjk, 'utf8') <= 384000, 'multi-byte UTF-8 flatten output must respect byte ceilings');
+  const clipped85kCjk = flatten([user('首锚_' + '汉'.repeat(140000) + '_尾锚')]);
+  assert.ok(clipped85kCjk.includes('首锚_') && clipped85kCjk.includes('_尾锚') && Buffer.byteLength(clipped85kCjk, 'utf8') <= 384000, 'oversized CJK input must clip head+tail within REPLAY_MAX_BYTES without throwing CONTEXT_BUDGET_EXCEEDED');
   // sessionStore.set retains sig/timeline on same SID, but isolates state when switching to a new SID on the same key
   const dir = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'sig-retain-'));
   try {
@@ -511,11 +534,8 @@ test('v2.4.0 Round 2 P1 context & sessionStore boundaries: CJK UTF-8 caps, compl
   }, { responses: true });
   const cjkSummaryFlat = flattenSummarization(cjkSumInput);
   assert.ok(cjkSummaryFlat.includes('原始任务目标') && Buffer.byteLength(cjkSummaryFlat, 'utf8') <= 324000, '50K-char CJK delivery (150KB) must fit within 108K char / 324KB SUMMARY_BYTES');
-  assert.throws(
-    () => flatten([user('超'.repeat(165000))]),
-    (err) => err && err.code === 'CONTEXT_BUDGET_EXCEEDED',
-    '165K-char CJK replay (495KB > 480KB REPLAY_MAX_BYTES) must throw CONTEXT_BUDGET_EXCEEDED',
-  );
+  const clipped165k = flatten([{ role: 'system', content: 'SYS_KEEP_OK' }, user('头_' + '超'.repeat(165000) + '_尾')]);
+  assert.ok(clipped165k.includes('SYS_KEEP_OK') && clipped165k.includes('头_') && clipped165k.includes('_尾') && Buffer.byteLength(clipped165k, 'utf8') <= 384000, '165K-char CJK replay must adaptively clip current request while keeping system instructions and head/tail');
   const cjkDeliveryMsgs = normalizeMessages({
     input: [
       user('run CJK subagent'),
@@ -675,12 +695,12 @@ test('per-turn compaction round accumulator tracks consecutive compactions, surv
     mode = 'park';
     await send([sys('SYS_V1'), user(goal1)]);
 
-    // 2. Mid-turn Compaction #1 -> round 1
+    // 2. Mid-turn Compaction #1 -> round 1 (silent native continuation, zero workflow/tool lecture)
     const c1 = await send([sys('SYS_V1'), user(checkpoint('COMPACT_GEN_1')), user(goal1)]);
-    assert.ok(c1.prompt.includes('当前已累计触发第 1 轮上下文压缩'), 'first compaction in active turn must report round 1');
+    assert.ok(!c1.prompt.includes('上下文检查点提示') && !c1.prompt.includes('压缩态势') && !c1.prompt.includes('TodoWrite') && !c1.prompt.includes('scratch'), 'round 1 compaction must stay 100% silent without coupled tool/workflow hints');
     assert.ok(c1.callId, 'turn 1 remains open on parked tool');
 
-    // 3. Mid-turn user steer + system nudge rebuild (not a new compaction, not a new turn) -> stays round 1
+    // 3. Mid-turn user steer + system nudge rebuild (not a new compaction, not a new turn) -> stays round 1 (silent)
     const steer = await send([
       sys('SYS_V1_NUDGE'),
       user(checkpoint('COMPACT_GEN_1')),
@@ -689,44 +709,349 @@ test('per-turn compaction round accumulator tracks consecutive compactions, surv
       { type: 'function_call_output', call_id: c1.callId, output: '[tool call was interrupted before a result was recorded]' },
       user('MID_TURN_STEER: 顺便不要调用 reviewer-gpt'),
     ]);
-    assert.ok(steer.prompt.includes('当前已累计触发第 1 轮上下文压缩'), 'mid-turn steer + system rebuild must preserve round 1 without resetting or double-counting');
+    assert.ok(!steer.prompt.includes('上下文检查点提示') && !steer.prompt.includes('压缩态势'), 'mid-turn steer + system rebuild must preserve round 1 silently without double-counting');
 
-    // 4. Gateway restart + Mid-turn Compaction #2, then let Turn 1 complete cleanly -> round 2
+    // 4. Gateway restart + Mid-turn Compaction #2 (keep turn open) -> round 2 (still silent)
     await gateway.close();
     gateway = null;
     await start();
-    mode = 'finish';
+    mode = 'park';
     const c2 = await send([
       sys('SYS_V1_NUDGE'),
       user(checkpoint('COMPACT_GEN_2')),
       user(goal1),
       user('MID_TURN_STEER: 顺便不要调用 reviewer-gpt'),
     ]);
-    assert.ok(c2.prompt.includes('当前已累计触发第 2 轮上下文压缩'), 'second compaction in same turn after gateway restart must increment to round 2');
-    assert.equal(c2.callId, '', 'turn 1 completed cleanly with final assistant message');
+    assert.ok(!c2.prompt.includes('上下文检查点提示') && !c2.prompt.includes('TodoWrite'), 'round 2 compaction after gateway restart must still stay silent');
+    assert.ok(c2.callId, 'turn 1 remains open for round 3 check');
 
-    // 5. Fresh Turn 2 after Turn 1 completed (force replay via SYS_V2, historical COMPACT_GEN_2 unchanged) -> round 0 (no active-turn compaction banner)
+    // 5. Mid-turn Compaction #3 in same open turn -> round 3 emits neutral tool-agnostic checkpoint note, then completes cleanly
+    mode = 'finish';
+    const c3 = await send([
+      sys('SYS_V1_NUDGE'),
+      user(checkpoint('COMPACT_GEN_2B')),
+      user(goal1),
+      user('MID_TURN_STEER: 顺便不要调用 reviewer-gpt'),
+    ]);
+    assert.ok(c3.prompt.includes('同一用户请求轮次内已连续触发第 3 次上下文压缩'), '3rd consecutive compaction in same turn must emit neutral loop safeguard');
+    assert.ok(!c3.prompt.includes('TodoWrite') && !c3.prompt.includes('scratch') && !c3.prompt.includes('子智能体'), 'safeguard note must remain completely decoupled from specific tools or AGENTS.md');
+    assert.equal(c3.callId, '', 'turn 1 completed cleanly with final assistant message');
+
+    // 6. Fresh Turn 2 after Turn 1 completed (force replay via SYS_V2, historical COMPACT_GEN_2B unchanged) -> round 0 (silent)
     const goal2 = 'TURN_2_FRESH_GOAL: 整理一键最小补丁包';
     const t2Start = await send([
       sys('SYS_V2'),
-      user(checkpoint('COMPACT_GEN_2')),
+      user(checkpoint('COMPACT_GEN_2B')),
       user(goal1),
       user('MID_TURN_STEER: 顺便不要调用 reviewer-gpt'),
       assistant('turn-complete-ack'),
       user(goal2),
     ]);
-    assert.ok(t2Start.prompt.includes('COMPACT_GEN_2'), 'historical summary stays intact on Turn 2');
-    assert.ok(!t2Start.prompt.includes('当前已累计触发第'), 'fresh Turn 2 before any new compaction must reset counter to 0');
+    assert.ok(t2Start.prompt.includes('COMPACT_GEN_2B'), 'historical summary stays intact on Turn 2');
+    assert.ok(!t2Start.prompt.includes('上下文检查点提示'), 'fresh Turn 2 before any new compaction must reset counter to 0');
 
-    // 6. Compaction inside Turn 2 -> starts fresh at round 1 (not 3)
+    // 7. Compaction #1 inside Turn 2 -> starts fresh at round 1 (silent, NOT round 4)
     const t2Compact = await send([
       sys('SYS_V2'),
       user(checkpoint('COMPACT_GEN_3')),
       user(goal2),
     ]);
-    assert.ok(t2Compact.prompt.includes('当前已累计触发第 1 轮上下文压缩'), 'first compaction inside Turn 2 must report round 1');
+    assert.ok(!t2Compact.prompt.includes('上下文检查点提示'), 'first compaction inside Turn 2 must reset to round 1 (silent) rather than carrying over round 3+');
   } finally {
     if (gateway) await gateway.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v2.4.1 flattenSummarization survives >8 subagent callbacks, 130K single report, YAML colons, and tight recent budget without throwing CONTEXT_BUDGET_EXCEEDED', () => {
+  const manyReports = Array.from({ length: 11 }, (_, i) =>
+    `[User]: ${callback(`SUBAGENT_BATCH_${i}_HEAD\n${'finding line '.repeat(900)}\nSUBAGENT_BATCH_${i}_TAIL`)}`
+  ).join('\n');
+  const hugeSingle = `[User]: ${callback(`HUGE_SUBAGENT_HEAD_${'Z'.repeat(130000)}_HUGE_SUBAGENT_TAIL`)}`;
+  const yamlCodeBlock = `[Assistant thinking]: checking config\n[Assistant]: \`\`\`yaml\nuser: admin\nsystem: windows\ntool: powershell\n\`\`\`\nYAML_ANCHOR_SURVIVES`;
+  const packed = `<conversation>\n[User]: ORIGINAL_COMPACTION_GOAL_106\n${manyReports}\n${hugeSingle}\n${yamlCodeBlock}\n[Tool result]: ${'T'.repeat(80000)}\n</conversation>\n\n<previous-summary>\n## Goal\nKeep shipping v2.4.1 cleanly.\n${'prior detail '.repeat(1400)}\n</previous-summary>\n\nUpdate the summary based on the new messages.`;
+  const flat = flattenSummarization([
+    { role: 'system', content: 'You are a context summarization assistant. ONLY output the structured summary.' },
+    user(packed),
+  ]);
+  assert.ok(flat.includes('Pure Summarization Mode'), 'anti-tool summarization guardrail must be injected');
+  assert.ok(flat.includes('ORIGINAL_COMPACTION_GOAL_106'), 'original user goal must survive');
+  assert.ok(flat.includes('YAML_ANCHOR_SURVIVES'), 'bracketed transcript unpacking must not mis-split YAML user:/system: lines');
+  assert.ok(flat.includes('HUGE_SUBAGENT_HEAD_') && flat.includes('HUGE_SUBAGENT_TAIL'), '130K report head and tail must survive via non-throwing clip');
+  assert.ok(flat.length <= 108000 && Buffer.byteLength(flat, 'utf8') <= 324000, 'must strictly fit SUMMARY_CHARS and SUMMARY_BYTES');
+});
+
+test('v2.4.1 compactionModel/compactionEffort config validation, routing, fallback, ephemeral salvage, limiter bypass, and post-compaction calibration isolation', async () => {
+  const configLib = require('../lib/config.js');
+  const { createGateway } = require('../lib/server.js');
+  const { createLimiter } = require('../lib/core.js');
+  const net = require('node:net');
+  const dir = fs.mkdtempSync(path.join(process.env.PI_SCRATCH_DIR || os.tmpdir(), 'v241-compaction-'));
+  try {
+    // 1. Config normalization, validation, and panel persistence
+    const ctx = { packageRoot: dir, dataPath: dir };
+    const defNorm = configLib.normalize({}, ctx);
+    assert.equal(defNorm.compactionModel, '');
+    assert.equal(defNorm.compactionEffort, '');
+    for (const eff of ['', 'omit', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']) {
+      assert.deepEqual(configLib.validatePatch({ compactionModel: 'antigravity-acp/gemini-3.8-flash', compactionEffort: eff }, ctx).errors, []);
+    }
+    assert.ok(configLib.validatePatch({ compactionEffort: 'ultra' }, ctx).errors.length > 0);
+    assert.ok(configLib.validatePatch({ compactionModel: 'bad model spaces!' }, ctx).errors.length > 0);
+    const saved = configLib.savePanel(ctx, { compactionModel: 'antigravity-acp/gemini-3.8-flash', compactionEffort: 'omit' });
+    assert.equal(saved.ok, true);
+    const reloadedCfg = configLib.normalize(configLib.readRaw(saved.file), ctx);
+    assert.equal(reloadedCfg.compactionModel, 'gemini-3.8-flash', 'provider prefix must be normalized cleanly');
+    assert.equal(reloadedCfg.compactionEffort, 'omit');
+    const panelView = configLib.readPanel(ctx, reloadedCfg);
+    assert.equal(panelView.compactionModel, 'gemini-3.8-flash');
+    assert.equal(panelView.compactionEffort, 'omit');
+
+    // 2. Gateway routing, stale model fallback, ephemeral salvage, limiter bypass & calibration isolation
+    let sidSeq = 0;
+    const closedSids = [];
+    const resolvedCalls = [];
+    const promptCalls = [];
+    let summarizeFailMode = '';
+    let summarizeFailCount = 0;
+    const liveCfg = {
+      bind: '127.0.0.1',
+      port: 0,
+      defaultModel: 'gemini-4-neon',
+      defaultEffort: 'high',
+      compactionModel: '',
+      compactionEffort: '',
+      toolPolicy: 'all',
+      bridgeTools: false,
+      concurrency: 1,
+      queueTimeoutMs: 600,
+      contentFilterMaxRetries: 0,
+      promptTimeoutMs: 5000,
+      promptIdleTimeoutMs: 5000,
+      maxSessions: 12,
+      source: path.join(dir, 'config.json'),
+    };
+    const limiter = createLimiter({ getLimit: () => liveCfg.concurrency, getTimeoutMs: () => liveCfg.queueTimeoutMs, getMaxQueue: () => 8 });
+    const acp = {
+      agentCapabilities: { _meta: { antigravity: { version: '1.5.2' } } },
+      policyBySession: new Map(),
+      start: async () => {},
+      discover: async () => {},
+      cwdFor: async () => dir,
+      status: () => ({ ready: true }),
+      notify: () => {},
+      resolveModel: async (m, eff) => {
+        resolvedCalls.push({ model: m, effort: eff });
+        if (m === 'stale-retired-model') {
+          throw Object.assign(new Error('model retired'), { code: 'MODEL_UNAVAILABLE' });
+        }
+        return `${m}::${eff === undefined ? 'NONE' : eff}`;
+      },
+      request: async (method, params) => {
+        if (method === 'session/new') {
+          const sessionId = `s241-${++sidSeq}`;
+          return { sessionId, models: { currentModelId: 'default-init', availableModels: [] } };
+        }
+        if (method === 'session/set_model') {
+          return {};
+        }
+        if (method === 'session/close') {
+          closedSids.push(params.sessionId);
+          return {};
+        }
+        if (method === 'session/prompt') {
+          const text = params.prompt.map(p => p.text || '').join('\n');
+          promptCalls.push({ sessionId: params.sessionId, text });
+          if (summarizeFailMode && summarizeFailCount > 0 && (text.includes('Pure Summarization Mode') || text.includes('上一轮未输出摘要正文'))) {
+            summarizeFailCount -= 1;
+            if (summarizeFailMode === 'filter') {
+              throw new Error('Request rejected: Content blocked by safety filters');
+            }
+            if (summarizeFailMode === 'empty') {
+              return { stopReason: 'end_turn' };
+            }
+            if (summarizeFailMode === 'lost') {
+              acp.onNotification({
+                method: 'session/update',
+                params: {
+                  sessionId: params.sessionId,
+                  update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Agent connection was lost and could not be re-established: upstream reset' } },
+                },
+              });
+              return { stopReason: 'end_turn' };
+            }
+          }
+          acp.onNotification({
+            method: 'session/update',
+            params: { sessionId: params.sessionId, update: { sessionUpdate: 'usage_update', used: 42050, size: 256000 } },
+          });
+          acp.onNotification({
+            method: 'session/update',
+            params: { sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '## Goal\nSummary OK' } } },
+          });
+          return {
+            stopReason: 'end_turn',
+            usage: { inputTokens: 12000, cachedReadTokens: 30000, outputTokens: 50, thoughtTokens: 10, totalTokens: 42050 },
+          };
+        }
+        return {};
+      },
+    };
+    const gw = createGateway({ acp, limiter, getConfig: () => liveCfg, log: () => {} });
+    const probe = net.createServer();
+    await new Promise(r => probe.listen(0, '127.0.0.1', r));
+    const port = probe.address().port;
+    await new Promise(r => probe.close(r));
+    await gw.listen([port]);
+
+    const postResp = async (body) => {
+      const r = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const txt = await r.text();
+      assert.equal(r.status, 200, txt);
+      if (body.stream) {
+        const events = txt.split('\n\n').map(b => /^data: (.+)$/m.exec(b)?.[1]).filter(Boolean).map(d => JSON.parse(d));
+        const done = events.find(e => e.type === 'response.completed');
+        assert.ok(done, txt);
+        return done.response;
+      }
+      return JSON.parse(txt);
+    };
+
+    try {
+      // 2a. Default ("", ""): summarization inherits session model & reasoning.effort; bypasses occupied limiter; usage_status stays 'unavailable'
+      let releaseBlocker;
+      const blockerRunning = new Promise(resolve => {
+        limiter.run(() => new Promise(r => { releaseBlocker = r; resolve(); }));
+      });
+      await blockerRunning;
+      resolvedCalls.length = 0;
+      const sumInherit = await postResp({
+        model: 'gemini-4-neon',
+        stream: true,
+        reasoning: { effort: 'xhigh' },
+        instructions: 'You are a context summarization assistant.',
+        input: [user('<conversation>\n[User]: build feature\n[Assistant]: done\n</conversation>\nSummarize the conversation.')],
+      });
+      releaseBlocker();
+      assert.equal(sumInherit.model, 'gemini-4-neon');
+      assert.deepEqual(resolvedCalls[0], { model: 'gemini-4-neon', effort: 'xhigh' }, 'default empty config must inherit session model and effort');
+      assert.equal(sumInherit.usage.usage_status, 'unavailable', 'summarization side-channel must not emit measured calibration tokens');
+
+      // 2b. Custom compactionModel + compactionEffort ('low', 'omit', 'off') & stale model fallback
+      liveCfg.compactionModel = 'gemini-3.8-flash';
+      liveCfg.compactionEffort = 'low';
+      resolvedCalls.length = 0;
+      const sumCustom = await postResp({
+        model: 'claude-opus-4-6-thinking',
+        stream: false,
+        reasoning: { effort: 'xhigh' },
+        instructions: 'You are a context summarization assistant.',
+        input: [user('Summarize the entire conversation.')],
+      });
+      assert.equal(sumCustom.model, 'claude-opus-4-6-thinking', 'response envelope keeps requested model id');
+      assert.deepEqual(resolvedCalls[0], { model: 'gemini-3.8-flash', effort: 'low' });
+
+      liveCfg.compactionEffort = 'omit';
+      resolvedCalls.length = 0;
+      await postResp({
+        model: 'claude-opus-4-6-thinking',
+        stream: false,
+        reasoning: { effort: 'xhigh' },
+        instructions: 'You are a context summarization assistant.',
+        input: [user('Summarize the entire conversation.')],
+      });
+      assert.deepEqual(resolvedCalls[0], { model: 'gemini-3.8-flash', effort: undefined }, 'omit must strip effort');
+
+      liveCfg.compactionEffort = 'off';
+      resolvedCalls.length = 0;
+      await postResp({
+        model: 'claude-opus-4-6-thinking',
+        stream: false,
+        instructions: 'You are a context summarization assistant.',
+        input: [user('Summarize the entire conversation.')],
+      });
+      assert.deepEqual(resolvedCalls[0], { model: 'gemini-3.8-flash', effort: 'minimal' }, 'off maps to minimal tier');
+
+      liveCfg.compactionModel = 'stale-retired-model';
+      liveCfg.compactionEffort = 'low';
+      resolvedCalls.length = 0;
+      const sumFallback = await postResp({
+        model: 'gemini-4-neon',
+        stream: false,
+        reasoning: { effort: 'medium' },
+        instructions: 'You are a context summarization assistant.',
+        input: [user('Summarize the entire conversation.')],
+      });
+      assert.equal(sumFallback.status, 'completed');
+      assert.deepEqual(resolvedCalls, [
+        { model: 'stale-retired-model', effort: 'low' },
+        { model: 'gemini-4-neon', effort: 'medium' },
+      ], 'unavailable compactionModel must fall back cleanly to session model');
+      liveCfg.compactionModel = '';
+      liveCfg.compactionEffort = '';
+
+      // 2c. Summarization ephemeral fresh-session salvage on safety filter false positive, EMPTY_RESPONSE (after nudges), and ACP_CONNECTION_LOST
+      for (const [mode, failTimes] of [['filter', 1], ['empty', 3], ['lost', 1]]) {
+        const createdBefore = sidSeq;
+        const closedBefore = closedSids.length;
+        summarizeFailMode = mode;
+        summarizeFailCount = failTimes;
+        const salvaged = await postResp({
+          model: 'gemini-3.8-flash',
+          stream: true,
+          instructions: 'You are a context summarization assistant.',
+          input: [user('<conversation>\n[User]: debug taskkill /F /PID 1234 crash\n</conversation>\nSummarize the conversation.')],
+        });
+        summarizeFailMode = '';
+        assert.equal(salvaged.status, 'completed', `summarize salvage must succeed for mode=${mode}`);
+        assert.ok(salvaged.output[0].content[0].text.includes('Summary OK'));
+        assert.equal(sidSeq - createdBefore, 2, `salvage must rotate to a single fresh ephemeral session for mode=${mode}`);
+        const uniqueClosed = new Set(closedSids.slice(closedBefore));
+        assert.ok(uniqueClosed.has(`s241-${createdBefore + 1}`) && uniqueClosed.has(`s241-${createdBefore + 2}`), `both failed and salvaged ephemeral sessions must be closed for mode=${mode}`);
+      }
+
+      // 2d. Post-compaction carryover calibration isolation (Turn 1 normal = measured; post-compaction Turn 2 fresh & Turn 3 resumed = unavailable)
+      const t1 = await postResp({
+        model: 'gemini-4-neon',
+        stream: false,
+        prompt_cache_key: 'cal-iso',
+        input: [user('PRE_COMPACT_ROOT_GOAL'), assistant('delegated'), user(callback('SUBAGENT_CARRYOVER_REPORT'))],
+      });
+      assert.equal(t1.usage.usage_status, 'measured', 'normal uncompacted turn still reports measured usage');
+      assert.equal(t1.usage.input_tokens, 42000);
+
+      const t2PostCompact = await postResp({
+        model: 'gemini-4-neon',
+        stream: false,
+        prompt_cache_key: 'cal-iso',
+        input: [user(checkpoint('COMPACTED_CHECKPOINT_V1')), user('post-compact turn 1')],
+      });
+      assert.equal(t2PostCompact.usage.usage_status, 'unavailable', 'post-compaction turn with injected carryover must not skew host calibration');
+      assert.equal(t2PostCompact.usage.input_tokens, undefined);
+      assert.equal(t2PostCompact.usage.acp_context.used, 42050, 'live ACP context observation remains intact');
+
+      const t3PostCompactResumed = await postResp({
+        model: 'gemini-4-neon',
+        stream: false,
+        prompt_cache_key: 'cal-iso',
+        input: [
+          user(checkpoint('COMPACTED_CHECKPOINT_V1')),
+          user('post-compact turn 1'),
+          assistant('## Goal\nSummary OK'),
+          user('post-compact turn 2 resumed'),
+        ],
+      });
+      assert.equal(t3PostCompactResumed.usage.usage_status, 'unavailable', 'subsequent resumed turns on carryover-injected session must also isolate calibration');
+      assert.equal(t3PostCompactResumed.usage.input_tokens, undefined);
+      assert.equal(t3PostCompactResumed.usage.acp_context.used, 42050);
+    } finally {
+      await gw.close();
+    }
+  } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

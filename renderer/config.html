@@ -112,6 +112,216 @@
     .btn-group button { flex: 1 1 calc(50% - 6px); }
     button.primary-full { flex: 1 1 100% !important; }
   }
+  .sub-section-divider {
+    grid-column: 1 / -1;
+    margin-top: 6px;
+    padding-top: 12px;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 6px 12px;
+    flex-wrap: wrap;
+  }
+  .sub-section-title {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: #dcdce4;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+  }
+  .label-with-help {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: #d4d4dc;
+    font-weight: 500;
+  }
+  .help-tip {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 15px;
+    height: 15px;
+    border: 1px solid rgba(255, 255, 255, 0.28);
+    border-radius: 50%;
+    color: #9e9ea8;
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 1;
+    cursor: help;
+    position: relative;
+    user-select: none;
+    flex-shrink: 0;
+  }
+  .help-tip:hover, .help-tip:focus-visible {
+    color: #e6e6ec;
+    border-color: rgba(255, 255, 255, 0.5);
+    outline: none;
+  }
+  .help-tip[data-tip]:hover::after,
+  .help-tip[data-tip]:focus-visible::after {
+    content: attr(data-tip);
+    position: absolute;
+    left: 50%;
+    bottom: calc(100% + 7px);
+    transform: translateX(-50%);
+    background: #111114;
+    border: 1px solid #35353e;
+    color: #e6e6ec;
+    padding: 6px 10px;
+    border-radius: 7px;
+    font-size: 11.5px;
+    font-weight: 400;
+    line-height: 1.45;
+    width: max-content;
+    max-width: 240px;
+    white-space: normal;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    z-index: 70;
+    pointer-events: none;
+  }
+  .sa-picker { position: relative; width: 100%; }
+  .sa-trigger {
+    display: flex;
+    width: 100%;
+    height: 36px;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 0 11px;
+    background: #161618;
+    border: 1px solid #323238;
+    border-radius: 8px;
+    color: #ececf0;
+    font-size: 12.5px;
+    text-align: left;
+    cursor: pointer;
+    transition: border-color .15s, background .15s;
+  }
+  .sa-trigger:hover { background: #1b1b1f; border-color: #464650; }
+  .sa-trigger[aria-expanded="true"], .sa-trigger:focus-visible {
+    border-color: #4c7dff;
+    background: #19191d;
+    outline: none;
+  }
+  .sa-trigger-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1 1 auto;
+  }
+  .sa-trigger-text.mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+  }
+  .sa-chevron {
+    width: 14px;
+    height: 14px;
+    color: #8e8e98;
+    flex-shrink: 0;
+    transition: transform .15s ease;
+  }
+  .sa-trigger[aria-expanded="true"] .sa-chevron { transform: rotate(180deg); }
+  .sa-popover {
+    position: absolute;
+    top: calc(100% + 5px);
+    left: 0;
+    right: 0;
+    min-width: 220px;
+    background: #151518;
+    border: 1px solid #34343d;
+    border-radius: 9px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.58);
+    z-index: 60;
+    overflow: hidden;
+    display: none;
+  }
+  .sa-popover.open { display: block; }
+  .sa-search-bar {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 7px 9px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    background: #121215;
+  }
+  .sa-search-bar input {
+    border: none;
+    background: transparent;
+    padding: 2px 0;
+    font-size: 12px;
+    color: #e6e6e8;
+    flex: 1 1 auto;
+    outline: none;
+  }
+  .sa-sync-btn {
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    background: rgba(255, 255, 255, 0.04);
+    color: #a9a9b4;
+    border-radius: 5px;
+    padding: 2px 7px;
+    font-size: 11px;
+    cursor: pointer;
+    flex-shrink: 0;
+    width: auto;
+  }
+  .sa-sync-btn:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
+  .sa-list { max-height: 232px; overflow-y: auto; padding: 4px; }
+  .sa-group-label {
+    padding: 6px 9px 3px;
+    font-size: 11px;
+    font-weight: 600;
+    color: #7c7c86;
+    letter-spacing: .02em;
+  }
+  .sa-item {
+    display: flex;
+    width: 100%;
+    align-items: center;
+    gap: 8px;
+    border: none;
+    background: transparent;
+    color: #e4e4ea;
+    border-radius: 6px;
+    padding: 6px 9px;
+    font-size: 12.5px;
+    text-align: left;
+    cursor: pointer;
+  }
+  .sa-item:hover, .sa-item.active {
+    background: rgba(76, 125, 255, 0.16);
+    color: #fff;
+  }
+  .sa-check {
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+    color: #60a5fa;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    font-weight: 700;
+  }
+  .sa-item-body {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+  .sa-item-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sa-item-sub {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+    color: #8a8a94;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .sa-empty { padding: 14px 10px; text-align: center; font-size: 12px; color: #7c7c84; }
 </style>
 </head>
 <body>
@@ -284,6 +494,50 @@
         <option value="false">关闭（每个档位单独列出）</option>
       </select>
     </div>
+    <div class="sub-section-divider">
+      <div class="sub-section-title">
+        <span>压缩总结旁路请求</span>
+        <span class="badge info">默认与会话一致</span>
+      </div>
+      <span class="hint">宿主触发上下文压缩生成摘要时使用；默认均保持「与会话一致」</span>
+    </div>
+    <div class="field">
+      <label id="compactionModelLabel" class="label-with-help">
+        <span>模型</span>
+        <span class="help-tip" tabindex="0" role="note" aria-label="可选。从已配置的模型中选择，或留空沿用当前会话的模型。" data-tip="可选。从已配置的模型中选择，或留空沿用当前会话的模型。">?</span>
+      </label>
+      <input id="compactionModel" type="hidden" value="">
+      <div class="sa-picker" id="compactionModelPicker">
+        <button type="button" class="sa-trigger" id="compactionModelTrigger" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="compactionModelLabel">
+          <span class="sa-trigger-text" id="compactionModelTriggerText">与会话一致</span>
+          <svg class="sa-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+        </button>
+        <div class="sa-popover" id="compactionModelPopover" role="listbox" aria-labelledby="compactionModelLabel">
+          <div class="sa-search-bar">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#8a8a94" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+            <input id="compactionModelSearch" type="text" placeholder="搜索模型…" autocomplete="off">
+            <button type="button" class="sa-sync-btn" id="compactionModelSyncBtn" title="从运行时同步最新可用模型列表">同步</button>
+          </div>
+          <div class="sa-list" id="compactionModelList"></div>
+        </div>
+      </div>
+    </div>
+    <div class="field">
+      <label id="compactionEffortLabel" class="label-with-help">
+        <span>推理强度</span>
+        <span class="help-tip" tabindex="0" role="note" aria-label="可选，且受模型支持范围限制。" data-tip="可选，且受模型支持范围限制。">?</span>
+      </label>
+      <input id="compactionEffort" type="hidden" value="">
+      <div class="sa-picker" id="compactionEffortPicker">
+        <button type="button" class="sa-trigger" id="compactionEffortTrigger" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="compactionEffortLabel">
+          <span class="sa-trigger-text" id="compactionEffortTriggerText">与会话一致</span>
+          <svg class="sa-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+        </button>
+        <div class="sa-popover" id="compactionEffortPopover" role="listbox" aria-labelledby="compactionEffortLabel">
+          <div class="sa-list" id="compactionEffortList"></div>
+        </div>
+      </div>
+    </div>
   </section>
 
   <!-- 5. 会话与超时 -->
@@ -432,7 +686,7 @@
 (function () {
   const ids = [
     'port', 'proxyMode', 'proxy', 'toolPolicy', 'cancelOnDisconnect', 'idleSessionMinutes', 'bin', 'defaultModel',
-    'modelCacheMinutes', 'defaultEffort', 'virtualModels', 'bridgeTools', 'cwd', 'bridgeGuidance',
+    'modelCacheMinutes', 'defaultEffort', 'compactionModel', 'compactionEffort', 'virtualModels', 'bridgeTools', 'cwd', 'bridgeGuidance',
     'exposeVariantModels', 'concurrency', 'queueTimeoutMinutes', 'promptTimeoutMinutes', 'promptIdleSeconds', 'clientName',
     'rateLimitMaxRetries', 'rateLimitRetryBaseSeconds', 'highContextThrottleTokens', 'highContextThrottleMs', 'reportedContextWindow', 'reportedMaxTokens'
   ];
@@ -482,8 +736,11 @@
       $('binHint').textContent = cfg.bin ? '当前指定：' + cfg.bin : '（留空＝使用插件数据目录下的官方运行时）';
       if (cfg._defaults && cfg._defaults.bridgeGuidance) {
         $('bridgeGuidanceDefault').value = cfg._defaults.bridgeGuidance;
+      } else if (cfg.bridgeGuidanceDefault) {
+        $('bridgeGuidanceDefault').value = cfg.bridgeGuidanceDefault;
       }
-      $('file').textContent = cfg._file || '未知';
+      $('file').textContent = cfg._file || cfg.file || '未知';
+      syncCompactionPickers();
       updateEndpointPreview();
       show('配置已载入', 'ok');
       await refreshRuntime();
@@ -544,6 +801,7 @@
     try {
       const result = await call('models:list');
       if (!result || result.ok !== true) { show('获取失败：' + ((result && result.error) || '未知错误'), 'err'); return; }
+      ingestCompactionModels(result.models || [], true);
       show('可用模型（' + result.models.length + '）：\r\n' + result.models.map((m) => m.id).join('\r\n'), 'ok');
     } catch (error) { show('获取失败：' + (error && error.message ? error.message : error), 'err'); }
   }
@@ -850,11 +1108,338 @@
     });
   });
 
+  const BUILTIN_COMPACTION_MODELS = [
+    { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' },
+    { id: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+    { id: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen' },
+    { id: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
+    { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
+    { id: 'claude-opus-4-6-thinking', name: 'Claude Opus 4.6 (Thinking)' },
+  ];
+  const COMPACTION_EFFORT_OPTIONS = [
+    { value: '', label: '与会话一致' },
+    { value: 'omit', label: '不传递' },
+    { value: 'off', label: 'off' },
+    { value: 'minimal', label: 'minimal' },
+    { value: 'low', label: 'low' },
+    { value: 'medium', label: 'medium' },
+    { value: 'high', label: 'high' },
+    { value: 'xhigh', label: 'xhigh' },
+    { value: 'max', label: 'max' },
+  ];
+  let compactionCatalog = BUILTIN_COMPACTION_MODELS.slice();
+  let compactionLiveSynced = false;
+  let modelActiveIdx = 0;
+  let effortActiveIdx = 0;
+
+  function ingestCompactionModels(list, isLive) {
+    const seen = new Set();
+    const merged = [];
+    (Array.isArray(list) ? list : []).forEach((m) => {
+      if (!m || !m.id) return;
+      const id = String(m.id).trim();
+      if (!id || seen.has(id)) return;
+      seen.add(id);
+      merged.push({ id, name: String(m.name || id).trim() });
+    });
+    if (merged.length > 0) {
+      compactionCatalog = merged;
+      if (isLive) compactionLiveSynced = true;
+    } else if (!compactionLiveSynced) {
+      compactionCatalog = BUILTIN_COMPACTION_MODELS.slice();
+    }
+    syncCompactionPickers();
+  }
+
+  async function refreshCompactionModels(cachedOnly) {
+    const syncBtn = $('compactionModelSyncBtn');
+    if (!cachedOnly && syncBtn) {
+      syncBtn.disabled = true;
+      syncBtn.textContent = '同步中…';
+    }
+    try {
+      const res = await call('models:list', cachedOnly ? { cachedOnly: true } : undefined);
+      if (res && res.ok && Array.isArray(res.models) && res.models.length > 0) {
+        ingestCompactionModels(res.models, true);
+      }
+    } catch {
+      /* 保持内置虚拟模型兜底列表 */
+    } finally {
+      if (!cachedOnly && syncBtn) {
+        syncBtn.disabled = false;
+        syncBtn.textContent = compactionLiveSynced ? '已同步' : '同步';
+      }
+    }
+  }
+
+  function closeAllSaPopovers() {
+    ['compactionModel', 'compactionEffort'].forEach((prefix) => {
+      const pop = $(prefix + 'Popover');
+      const trig = $(prefix + 'Trigger');
+      if (pop) pop.classList.remove('open');
+      if (trig) trig.setAttribute('aria-expanded', 'false');
+    });
+  }
+
+  function syncCompactionPickers() {
+    const modelVal = String(($('compactionModel') && $('compactionModel').value) || '').trim();
+    const modelText = $('compactionModelTriggerText');
+    if (modelText) {
+      if (!modelVal) {
+        modelText.textContent = '与会话一致';
+        modelText.classList.remove('mono');
+      } else {
+        modelText.textContent = modelVal;
+        modelText.classList.add('mono');
+      }
+    }
+    const effortVal = String(($('compactionEffort') && $('compactionEffort').value) || '').trim().toLowerCase();
+    const effortText = $('compactionEffortTriggerText');
+    if (effortText) {
+      const hit = COMPACTION_EFFORT_OPTIONS.find((o) => o.value === effortVal) || COMPACTION_EFFORT_OPTIONS[0];
+      effortText.textContent = hit.label;
+    }
+    renderCompactionModelList();
+    renderCompactionEffortList();
+  }
+
+  function getFilteredModelEntries() {
+    const q = String(($('compactionModelSearch') && $('compactionModelSearch').value) || '').trim().toLowerCase();
+    const currentVal = String(($('compactionModel') && $('compactionModel').value) || '').trim();
+    const entries = [];
+    if (!q || '与会话一致'.includes(q) || 'inherit'.includes(q)) {
+      entries.push({ value: '', title: '与会话一致', sub: '', group: '' });
+    }
+    const inCatalog = compactionCatalog.some((m) => m.id === currentVal);
+    if (currentVal && !inCatalog && (!q || currentVal.toLowerCase().includes(q))) {
+      entries.push({ value: currentVal, title: currentVal, sub: '当前已保存模型 ID', group: '已保存配置' });
+    }
+    const groupTitle = compactionLiveSynced ? 'Antigravity ACP（实时模型）' : 'Antigravity ACP（预设虚拟模型）';
+    compactionCatalog.forEach((m) => {
+      const hay = (m.id + ' ' + (m.name || '')).toLowerCase();
+      if (q && !hay.includes(q)) return;
+      entries.push({
+        value: m.id,
+        title: m.name || m.id,
+        sub: m.name && m.name !== m.id ? m.id : '',
+        group: groupTitle,
+      });
+    });
+    return entries;
+  }
+
+  function selectCompactionModel(val) {
+    const input = $('compactionModel');
+    if (input) input.value = val;
+    syncCompactionPickers();
+    closeAllSaPopovers();
+    if ($('compactionModelTrigger')) $('compactionModelTrigger').focus();
+  }
+
+  function renderCompactionModelList() {
+    const listEl = $('compactionModelList');
+    if (!listEl) return;
+    const currentVal = String(($('compactionModel') && $('compactionModel').value) || '').trim();
+    const entries = getFilteredModelEntries();
+    listEl.innerHTML = '';
+    if (entries.length === 0) {
+      const qRaw = String(($('compactionModelSearch') && $('compactionModelSearch').value) || '').trim();
+      if (qRaw && /^[A-Za-z0-9._:/-]{1,120}$/.test(qRaw)) {
+        const customBtn = document.createElement('button');
+        customBtn.type = 'button';
+        customBtn.className = 'sa-item active';
+        customBtn.innerHTML = '<span class="sa-check">+</span><span class="sa-item-body"><span class="sa-item-title">使用自定义模型 ID</span><span class="sa-item-sub"></span></span>';
+        customBtn.querySelector('.sa-item-sub').textContent = qRaw;
+        customBtn.addEventListener('click', () => selectCompactionModel(qRaw));
+        listEl.appendChild(customBtn);
+        return;
+      }
+      const empty = document.createElement('div');
+      empty.className = 'sa-empty';
+      empty.textContent = '无匹配模型';
+      listEl.appendChild(empty);
+      return;
+    }
+    if (modelActiveIdx >= entries.length) modelActiveIdx = 0;
+    let lastGroup = '';
+    entries.forEach((entry, idx) => {
+      if (entry.group && entry.group !== lastGroup) {
+        lastGroup = entry.group;
+        const hdr = document.createElement('div');
+        hdr.className = 'sa-group-label';
+        hdr.textContent = entry.group;
+        listEl.appendChild(hdr);
+      }
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'sa-item' + (idx === modelActiveIdx ? ' active' : '');
+      btn.setAttribute('role', 'option');
+      const selected = entry.value === currentVal;
+      btn.setAttribute('aria-selected', selected ? 'true' : 'false');
+      const check = document.createElement('span');
+      check.className = 'sa-check';
+      check.textContent = selected ? '✓' : '';
+      const body = document.createElement('span');
+      body.className = 'sa-item-body';
+      const title = document.createElement('span');
+      title.className = 'sa-item-title';
+      title.textContent = entry.title;
+      body.appendChild(title);
+      if (entry.sub) {
+        const sub = document.createElement('span');
+        sub.className = 'sa-item-sub';
+        sub.textContent = entry.sub;
+        body.appendChild(sub);
+      }
+      btn.appendChild(check);
+      btn.appendChild(body);
+      btn.addEventListener('mouseenter', () => { modelActiveIdx = idx; });
+      btn.addEventListener('click', () => selectCompactionModel(entry.value));
+      listEl.appendChild(btn);
+    });
+  }
+
+  function selectCompactionEffort(val) {
+    const input = $('compactionEffort');
+    if (input) input.value = val;
+    syncCompactionPickers();
+    closeAllSaPopovers();
+    if ($('compactionEffortTrigger')) $('compactionEffortTrigger').focus();
+  }
+
+  function renderCompactionEffortList() {
+    const listEl = $('compactionEffortList');
+    if (!listEl) return;
+    const currentVal = String(($('compactionEffort') && $('compactionEffort').value) || '').trim().toLowerCase();
+    listEl.innerHTML = '';
+    COMPACTION_EFFORT_OPTIONS.forEach((opt, idx) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'sa-item' + (idx === effortActiveIdx ? ' active' : '');
+      btn.setAttribute('role', 'option');
+      const selected = opt.value === currentVal;
+      btn.setAttribute('aria-selected', selected ? 'true' : 'false');
+      const check = document.createElement('span');
+      check.className = 'sa-check';
+      check.textContent = selected ? '✓' : '';
+      const body = document.createElement('span');
+      body.className = 'sa-item-body';
+      const title = document.createElement('span');
+      title.className = 'sa-item-title';
+      title.textContent = opt.label;
+      body.appendChild(title);
+      btn.appendChild(check);
+      btn.appendChild(body);
+      btn.addEventListener('mouseenter', () => { effortActiveIdx = idx; });
+      btn.addEventListener('click', () => selectCompactionEffort(opt.value));
+      listEl.appendChild(btn);
+    });
+  }
+
+  if ($('compactionModelTrigger')) {
+    $('compactionModelTrigger').addEventListener('click', () => {
+      const pop = $('compactionModelPopover');
+      const isOpen = pop && pop.classList.contains('open');
+      closeAllSaPopovers();
+      if (!isOpen && pop) {
+        const s = $('compactionModelSearch');
+        if (s) s.value = '';
+        const currentVal = String(($('compactionModel') && $('compactionModel').value) || '').trim();
+        const entries = getFilteredModelEntries();
+        const found = entries.findIndex((e) => e.value === currentVal);
+        modelActiveIdx = found >= 0 ? found : 0;
+        renderCompactionModelList();
+        pop.classList.add('open');
+        $('compactionModelTrigger').setAttribute('aria-expanded', 'true');
+        if (!compactionLiveSynced) refreshCompactionModels(true);
+        if (s) setTimeout(() => s.focus(), 10);
+      }
+    });
+  }
+  if ($('compactionModelSearch')) {
+    $('compactionModelSearch').addEventListener('input', () => {
+      modelActiveIdx = 0;
+      renderCompactionModelList();
+    });
+    $('compactionModelSearch').addEventListener('keydown', (e) => {
+      const entries = getFilteredModelEntries();
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (entries.length) { modelActiveIdx = (modelActiveIdx + 1) % entries.length; renderCompactionModelList(); }
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (entries.length) { modelActiveIdx = (modelActiveIdx - 1 + entries.length) % entries.length; renderCompactionModelList(); }
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        if (entries[modelActiveIdx]) {
+          selectCompactionModel(entries[modelActiveIdx].value);
+        } else {
+          const qRaw = String($('compactionModelSearch').value || '').trim();
+          if (qRaw && /^[A-Za-z0-9._:/-]{1,120}$/.test(qRaw)) selectCompactionModel(qRaw);
+        }
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        closeAllSaPopovers();
+        $('compactionModelTrigger').focus();
+      }
+    });
+  }
+  if ($('compactionModelSyncBtn')) {
+    $('compactionModelSyncBtn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      refreshCompactionModels(false);
+    });
+  }
+  if ($('compactionEffortTrigger')) {
+    $('compactionEffortTrigger').addEventListener('click', () => {
+      const pop = $('compactionEffortPopover');
+      const isOpen = pop && pop.classList.contains('open');
+      closeAllSaPopovers();
+      if (!isOpen && pop) {
+        const currentVal = String(($('compactionEffort') && $('compactionEffort').value) || '').trim().toLowerCase();
+        const found = COMPACTION_EFFORT_OPTIONS.findIndex((o) => o.value === currentVal);
+        effortActiveIdx = found >= 0 ? found : 0;
+        renderCompactionEffortList();
+        pop.classList.add('open');
+        $('compactionEffortTrigger').setAttribute('aria-expanded', 'true');
+      }
+    });
+    $('compactionEffortTrigger').addEventListener('keydown', (e) => {
+      const pop = $('compactionEffortPopover');
+      if (!pop || !pop.classList.contains('open')) return;
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        effortActiveIdx = (effortActiveIdx + 1) % COMPACTION_EFFORT_OPTIONS.length;
+        renderCompactionEffortList();
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        effortActiveIdx = (effortActiveIdx - 1 + COMPACTION_EFFORT_OPTIONS.length) % COMPACTION_EFFORT_OPTIONS.length;
+        renderCompactionEffortList();
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        if (COMPACTION_EFFORT_OPTIONS[effortActiveIdx]) {
+          selectCompactionEffort(COMPACTION_EFFORT_OPTIONS[effortActiveIdx].value);
+        }
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        closeAllSaPopovers();
+      }
+    });
+  }
+  document.addEventListener('mousedown', (e) => {
+    const mp = $('compactionModelPicker');
+    const ep = $('compactionEffortPicker');
+    if ((mp && mp.contains(e.target)) || (ep && ep.contains(e.target))) return;
+    closeAllSaPopovers();
+  });
+  syncCompactionPickers();
+
   async function init() {
     await Promise.allSettled([
       refreshRuntime(),
       refreshAuth(),
       load(),
+      refreshCompactionModels(true),
       refreshSessions()
     ]);
   }

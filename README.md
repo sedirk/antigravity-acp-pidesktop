@@ -18,7 +18,7 @@
 
 ---
 
-**2.4.0（默认运行时 `agy-acp-server 1.5.2`）：** 默认官方运行时升级至 **`1.5.2`**（支持从 `1.3.0` / `1.5.0` 一键平滑升级），原生适配 **`gemini-4-neon`** 与 **`gemini-4-hydrogen`**（底层 `-extra_high` 双向映射为标准 `xhigh` 档位，兼容 CCPA 三档映射与 `configOptions` 目录），对齐 `1.5.2` 会话恢复 `currentModelId` 同步、`-32602` 非法模型快速失败及取消/断连合成块分级处置；同时重构上下文压缩与续接全链路（默认 `reportedMaxTokens=32768` 恢复 `256K` 模型 `~200.9K` 自动压缩线、统一字符+UTF-8 字节双预算并前置 `CONTEXT_BUDGET_EXCEEDED` 无损预检、分离非截断型分支摘要、补齐 `/v1/responses` `previous_response_id` 增量工具交付续接、加固显式键隔离与按请求原子签名提交及失效足迹记忆保留），并完整保留输入框工具栏上下文计量插槽（`agent/budget-status-240.mjs`）。见[工具栏读数](docs/CONTEXT-METER.md)，`/acp-context` 仍可使用；若在 **PI-Desktop `v0.23.0`** 上希望将实时水位合并进宿主原生底栏单圆环，可使用 Release 附带的[可选一键宿主补丁](#4-可选pi-desktop-v0230-原生单圆环一键补丁)。
+**2.4.1（默认运行时 `agy-acp-server 1.5.2`）：** 彻底消除压缩总结旁路与主对话轮次的 `400 CONTEXT_BUDGET_EXCEEDED` 硬报错（过滤异步 `Task` / `TaskWait` 非终态轮询回执、将全量重放安全上限提升至 `240K` 字符 / `384KB` UTF-8 并支持长报告首尾保留与多级自适应收敛、重构 `flattenSummarization` 与纯文本摘要护栏及临时会话自愈重试）；隔离压缩总结旁路与跨压缩代际携带历史（Carryover）对宿主 `ContextEstimateCalibration` 的校准污染；解耦压缩摘要续接（常规压缩 100% 静默续接，仅单轮连续 `>= 3` 次压缩附纯客观防重复全读提示）；并在配置面板「模型与思考」中新增对齐 PI-Desktop 子智能体面板交互的**压缩总结旁路请求（模型 + 推理强度）**双列可搜索配置器（默认均保持「与会话一致」），Agent 扩展入口切换至 `agent/budget-status-241.mjs`。见[工具栏读数](docs/CONTEXT-METER.md)，`/acp-context` 仍可使用；若在 **PI-Desktop `v0.23.0`** 上希望启用原生底栏单圆环合一及 Sidecar OOM 防卡死增强，可使用 Release 附带的[可选一键宿主补丁](#4-可选pi-desktop-v0230-原生单圆环一键补丁)。
 
 ## 📑 目录
 
@@ -104,7 +104,7 @@ flowchart TD
 
 ### 1. 安装插件
 
-1. 前往 [Releases 发布页面](https://github.com/sedirk/antigravity-acp-pidesktop/releases) 下载最新版本的 `.piplug` 安装包（如 `local.antigravity-acp-2.4.0.piplug`）。
+1. 前往 [Releases 发布页面](https://github.com/sedirk/antigravity-acp-pidesktop/releases) 下载最新版本的 `.piplug` 安装包（如 `local.antigravity-acp-2.4.1.piplug`）。
 2. 在 **PI-Desktop** 中打开 **设置** → **插件**。
 3. 点击右上角 **从本地安装**，选择刚下载的 `.piplug` 文件。
 4. 安装完成后，插件后台将自动初始化并在默认端口 `41910` 启动网关服务。
@@ -140,24 +140,26 @@ flowchart TD
 
 ### 4. （可选）PI-Desktop v0.23.0 原生单圆环一键补丁
 
-插件默认**无需任何宿主补丁即可完整运行**（通过输入框工具栏独立胶囊展示预算与上游水位，详见[工具栏读数](docs/CONTEXT-METER.md)）。由于向 PI-Desktop 上游提交的两项最小扩展能力 PR（`#2451` 进程内 `contextRequestId` 请求配对与 `autoCompactAt` 压缩线只读暴露、`#2452` `ctx.ui.setProviderContext` 分子联动校准）尚未合入官方主线，[v2.4.0 Release](https://github.com/sedirk/antigravity-acp-pidesktop/releases/tag/v2.4.0) 额外提供了面向官方 **Windows 版 PI-Desktop `v0.23.0`** 的一键补丁包 **`local-host-patch-0.23.0.zip`**（同时附带完整源码审阅补丁 `pi-desktop-v0.23.0-native-context-minimal.patch`）：
+插件默认**无需任何宿主补丁即可完整运行**（通过输入框工具栏独立胶囊展示预算与上游水位，详见[工具栏读数](docs/CONTEXT-METER.md)）。由于向 PI-Desktop 上游提交的两项最小扩展能力 PR（`#2451` 进程内 `contextRequestId` 请求配对与 `autoCompactAt` 压缩线只读暴露、`#2452` `ctx.ui.setProviderContext` 分子联动校准）尚未合入官方主线，[v2.4.1 Release](https://github.com/sedirk/antigravity-acp-pidesktop/releases/tag/v2.4.1) 额外提供了面向官方 **Windows 版 PI-Desktop `v0.23.0`** 的一键补丁包 **`local-host-patch-0.23.0.zip`**（同时附带完整源码审阅补丁 `pi-desktop-v0.23.0-native-context-minimal.patch`）：
 
-- **补丁效果**：安装后，`Antigravity ACP v2.4.0` 会自动检测宿主 `ctx.ui.setProviderContext` 接口，将长工具链期间的上游实测水位经分子联动校准直接写入宿主原生底栏圆环，并自动收起右侧重复胶囊，实现**原生单圆环合一**。
-- **安全与最小影响**：仅校准输入框显示的分子 `budget.tokens` 与圆环百分比，**绝不修改**分母 `budget.hardLimit`、外发 HTTP 请求或 Token 计费账本（内置会话/模型隔离、失败回滚、压缩检查点隔离及 85% 原始文本安全下限）；不使用本插件的其他模型服务体验与官方原版 `v0.23.0` 100% 一致。
+- **补丁效果**：
+  - **原生单圆环合一**：`Antigravity ACP v2.4.1` 自动检测宿主 `ctx.ui.setProviderContext` 接口，将长工具链期间的上游实测水位经分子联动校准直接写入宿主原生底栏圆环，并自动收起右侧重复胶囊；
+  - **Sidecar 异常退出收敛与堆上限提升**：移植上游 `cb51c4f66` 异常退出状态收敛（当 `agent-sidecar` 发生 OOM 或崩溃时完整结算流式气泡、工具卡片、RACP 轮次与扩展请求，杜绝计时器无限走字卡死），并将 Sidecar V8 堆内存上限由默认 `2048 MB` 提升至 **`4096 MB`**（对齐 Electron 指针压缩 4GB 上限）。
+- **安全与最小影响**：仅校准输入框显示的分子 `budget.tokens` 与圆环百分比，**绝不修改**分母 `budget.hardLimit`、外发 HTTP 请求或 Token 计费账本（内置会话/模型隔离、失败回滚、压缩检查点隔离及 85% 原始文本安全下限）；不使用本插件的其他模型服务体验与官方原版 `v0.23.0` 一致。
 
 #### 一键安装方法
 
-1. 前往 [v2.4.0 Release 页面](https://github.com/sedirk/antigravity-acp-pidesktop/releases/tag/v2.4.0) 下载 **`local-host-patch-0.23.0.zip`**，完整解压到任意本地文件夹（勿直接在压缩包预览窗口内双击运行）。
+1. 前往 [v2.4.1 Release 页面](https://github.com/sedirk/antigravity-acp-pidesktop/releases/tag/v2.4.1) 下载 **`local-host-patch-0.23.0.zip`**，完整解压到任意本地文件夹（勿直接在压缩包预览窗口内双击运行）。
 2. 先保存或结束 PI-Desktop 中正在执行的对话任务。
 3. 双击运行解压目录中的 **`install-patch.cmd`**：
    - 脚本会自动定位 `C:\Program Files\PI-Desktop`、`%LOCALAPPDATA%\Programs\PI-Desktop` 或注册表记录的安装目录（若安装在系统目录，会自动弹出 UAC 请求管理员权限）；
-   - 安装前会逐一强校验包内全部 335 个载荷文件的 `SHA256SUMS.txt`，并严格核验目标宿主版本必须为官方 **`0.23.0`**（若检测到非 `0.23.0` 版本会立即安全中止，不修改任何文件）；
-   - 自动将原版文件备份为 `*.pre-native-context-0.23.0.bak`，原地合成补丁版 `app.asar` 并同步更新 `PI-Desktop.exe` 的 Electron ASAR Header SHA-256 完整性签名，随后自动重启 PI-Desktop。
+   - 安装前会逐一强校验包内全部 335 个载荷文件的 `SHA256SUMS.txt`，并严格核验目标宿主版本必须为官方 **`0.23.0`**（非 `0.23.0` 版本立即安全中止，不修改任何文件；若本机此前已装过旧版 `0.23.0` 补丁，会自动基于 `.pre-native-context-0.23.0.bak` 原版备份直接覆盖升级）；
+   - 自动备份原版文件为 `*.pre-native-context-0.23.0.bak`，原地合成补丁版 `app.asar` 并同步更新 `PI-Desktop.exe` 的 Electron ASAR Header SHA-256 完整性签名，随后自动重启 PI-Desktop。
    - 若安装在自定义路径且未被自动识别，可在解压目录打开 PowerShell 指定路径执行：
      ```powershell
      powershell -ExecutionPolicy Bypass -File .\install-patch.ps1 -InstallDir "D:\你的路径\PI-Desktop"
      ```
-4. **插件联动**：若当前电脑已安装 `Antigravity ACP v2.4.0+`，重启后自动启用原生单圆环（若仍为 `v2.3.9` 也会自动同步兼容桥接脚本）；若在另一台新电脑上首次部署，补丁包内的 `plugin\local.antigravity-acp-2.4.0.piplug` 可直接在「设置 → 插件 → 从本地安装」导入（记得开启 `agent.extension` 与 `renderer.extension` 权限）。
+4. **插件联动**：若当前电脑已安装 `Antigravity ACP v2.4.0+`，重启后自动启用原生单圆环（强烈建议同步升级至 `v2.4.1`；若仍为 `v2.3.9` 也会自动同步兼容桥接脚本）；若在另一台新电脑上首次部署，补丁包内的 `plugin\local.antigravity-acp-2.4.1.piplug` 可直接在「设置 → 插件 → 从本地安装」导入（开启 `agent.extension` 与 `renderer.extension` 权限）。
 
 #### 环境预检与一键无损回滚
 

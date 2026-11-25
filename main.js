@@ -731,9 +731,21 @@ async function onPanelInvoke(channel, payload) {
   }
   if (channel === 'models:list') {
     if (!acp) return { ok: false, error: '服务未启动' };
+    if (payload && payload.cachedOnly === true && (!acp.discovery || !acp.discovery.groups || acp.discovery.groups.size === 0)) {
+      return { ok: true, cached: false, models: [] };
+    }
     try {
       const models = await acp.modelsForApi();
-      return { ok: true, models: models.map((m) => ({ id: m.id, name: m.name })) };
+      return {
+        ok: true,
+        cached: true,
+        models: models.map((m) => ({
+          id: m.id,
+          name: m.name,
+          supportsReasoning: Boolean(m.supportsReasoning),
+          thinkingLevels: Array.isArray(m.thinkingLevels) ? m.thinkingLevels : [],
+        })),
+      };
     } catch (error) {
       return { ok: false, error: String(error.message).slice(0, 300) };
     }

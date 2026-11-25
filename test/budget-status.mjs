@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 import {dirname,join} from 'node:path';
-import register from '../agent/budget-status-240.mjs';
+import register from '../agent/budget-status-241.mjs';
 import {endpoint,receiptURL,observation,readReceipt} from '../agent/receipt.mjs';
 import meterLink from '../lib/meter-link.js';
 const receipt='a'.repeat(32), second='b'.repeat(32), root=dirname(dirname(fileURLToPath(import.meta.url)));

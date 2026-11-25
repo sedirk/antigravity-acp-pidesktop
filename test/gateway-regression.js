@@ -4658,7 +4658,7 @@ async function main() {
       };
       try {
         // (A1) Oversize 125KB single delivery on /v1/responses stream -> rejects BEFORE session/new and emits response.failed
-        const giantOut = 'X'.repeat(125000);
+        const giantOut = 'GIANT_HEAD_' + 'X'.repeat(125000) + '_GIANT_TAIL';
         const rOverResp = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
           method: 'POST', headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
@@ -4667,15 +4667,14 @@ async function main() {
               { role: 'user', content: 'run giant tool' },
               { type: 'function_call', call_id: 'call_giant_1', name: 'Task', arguments: '{"agent":"local-free","task":"dump"}' },
               { type: 'function_call_output', call_id: 'call_giant_1', output: giantOut },
+              { role: 'user', content: 'summarize giant finding' },
             ],
           }),
         }));
-        assert.equal(createdSids.length, 0, 'CONTEXT_BUDGET_EXCEEDED on /v1/responses must pre-validate before session/new');
-        const failedEv = rOverResp.find((e) => e.type === 'response.failed');
-        assert.ok(failedEv, '/v1/responses SSE must emit response.failed on pre-validation error');
-        assert.equal(failedEv.data.response.error.code, 'CONTEXT_BUDGET_EXCEEDED');
+        assert.equal(createdSids.length, 1, '125KB single Task delivery on /v1/responses must adaptively clip instead of failing with CONTEXT_BUDGET_EXCEEDED');
+        assert.ok(rOverResp.some((e) => e.type === 'response.completed'), '/v1/responses SSE must complete cleanly on clipped 125KB Task delivery');
 
-        // (A2) Oversize 125KB single delivery on /v1/chat/completions stream -> rejects BEFORE session/new and emits error + [DONE]
+        // (A2) Oversize 125KB single delivery on /v1/chat/completions stream -> adaptively clips and completes cleanly
         const rawChatOver = await (await fetch(`http://127.0.0.1:${p}/v1/chat/completions`, {
           method: 'POST', headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
@@ -4684,12 +4683,13 @@ async function main() {
               { role: 'user', content: 'run giant chat tool' },
               { role: 'assistant', content: null, tool_calls: [{ id: 'call_giant_c1', type: 'function', function: { name: 'Task', arguments: '{"agent":"local-free","task":"dump"}' } }] },
               { role: 'tool', tool_call_id: 'call_giant_c1', content: giantOut },
+              { role: 'user', content: 'summarize giant chat finding' },
             ],
           }),
         })).text();
-        assert.equal(createdSids.length, 0, 'CONTEXT_BUDGET_EXCEEDED on /v1/chat/completions must pre-validate before session/new');
-        assert.ok(rawChatOver.includes('CONTEXT_BUDGET_EXCEEDED') && rawChatOver.includes('[DONE]'), 'chat SSE must emit error chunk and [DONE]');
-
+        assert.equal(createdSids.length, 2, '125KB single Task delivery on /v1/chat/completions must adaptively clip and proceed');
+        assert.ok(!rawChatOver.includes('CONTEXT_BUDGET_EXCEEDED') && rawChatOver.includes('[DONE]'), 'chat SSE must complete without CONTEXT_BUDGET_EXCEEDED');
+        createdSids.length = 0;
         // (A3) Post-session/new MODEL_SWITCH_FAILED (-32602) closes unregistered session immediately
         const rBadModel = await parseResp(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
           method: 'POST', headers: { 'content-type': 'application/json' },
@@ -4699,7 +4699,7 @@ async function main() {
           }),
         }));
         assert.equal(createdSids.length, 1);
-        assert.ok(closedSids.includes('p1-sess-1'), 'unregistered session created before -32602 set_model failure must be closed immediately');
+        assert.ok(closedSids.includes(createdSids[0]), 'unregistered session created before -32602 set_model failure must be closed immediately');
         assert.equal(rBadModel.find((e) => e.type === 'response.failed')?.data?.response?.error?.code, 'MODEL_SWITCH_FAILED');
 
         // (B) Explicit-key summarize preemption isolation: conv-A parked with generic 'continue' must NOT be preempted by conv-B summarize
@@ -4999,19 +4999,17 @@ async function main() {
         const alphaSid = createdSids[createdSids.length - 1].sid;
         assert.ok(evAlpha.find((e) => e.type === 'response.completed').data.response.output.some((o) => o.type === 'function_call'));
 
-        const sidsBeforeBudgetErr = createdSids.length;
+        const sidsBeforeGiantReplay = createdSids.length;
         const evOversized = await parseRespEvents(await fetch(`http://127.0.0.1:${p}/v1/responses`, {
           method: 'POST', headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
-            model: 'gemini-3-flash', stream: true, prompt_cache_key: 'conv-alpha', tools,
-            input: [{ role: 'user', content: 'OVERSIZED_REPLAY_' + 'X'.repeat(210000) }],
+            model: 'gemini-3-flash', stream: true, prompt_cache_key: 'conv-oversize-ok', tools,
+            input: [{ role: 'user', content: 'OVERSIZED_REPLAY_HEAD_' + 'X'.repeat(260000) + '_OVERSIZED_REPLAY_TAIL' }],
           }),
         }));
-        const failedEv = evOversized.find((e) => e.type === 'response.failed');
-        assert.ok(failedEv && failedEv.data.response.error.code === 'CONTEXT_BUDGET_EXCEEDED', 'oversized turn must fail with CONTEXT_BUDGET_EXCEEDED');
-        assert.ok(!cancelledSids.includes(alphaSid), 'budget precheck must reject BEFORE preempting/cancelling parked session');
-        assert.equal(createdSids.length, sidsBeforeBudgetErr, 'budget precheck must reject BEFORE creating a new ACP session');
-
+        assert.ok(!evOversized.some((e) => e.type === 'response.failed'), '260KB replay must adaptively clip instead of failing with CONTEXT_BUDGET_EXCEEDED');
+        assert.ok(!cancelledSids.includes(alphaSid), 'independent conv-oversize-ok replay must never cancel parked conv-alpha');
+        assert.equal(createdSids.length, sidsBeforeGiantReplay + 1, 'conv-oversize-ok must create its own session cleanly');
         // Conflicting explicitHostKey ('conv-beta') summarize mentioning conv-alpha's exact user anchor must NOT preempt conv-alpha
         const betaSumRes = await fetch(`http://127.0.0.1:${p}/v1/responses`, {
           method: 'POST', headers: { 'content-type': 'application/json' },

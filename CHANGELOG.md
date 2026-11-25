@@ -1,5 +1,20 @@
 # 变更记录
 
+## 2.4.1
+
+- **彻底消除压缩总结旁路与主对话轮的 `400 CONTEXT_BUDGET_EXCEEDED` 硬门限报错**：
+  - **运行态 `Task` / `TaskWait` 轮询过滤（`isTransientTaskPoll`）**：排除宿主异步 `Task` 后台启动回执（`Delegation <id> started: the <agent> subagent is working in the background...` 及 `status: "running"`）与 `TaskWait` 未完成轮询/中断状态（`Still running after ...: 0/N finished`、`Interrupted by new user input...`、后台任务 `timeout` 空快照），避免长耗时子智能体多次 `TaskWait` 轮询将非终态心跳误计入子代理交付保护区触发预算溢出；
+  - **主对话与重放全链路自适应裁剪（`collectDeliveries` / `boundDeliveries` / `recentContext` / `flatten`）**：将普通全量重放安全上限提升至 `240,000` 字符 / `384,000` UTF-8 字节（兼容宿主 `@session` 大体积跨会话引用与多字节中文输入）；单篇超 `96K` 字符 / `216KB` 子代理长报告自动保留首尾关键结论并附显式省略标记（`64K` 字符 / `144KB`），同轮多份报告合并超限时按比例保留各自首尾结论，总重放超限时按「近期普通交互 -> 子代理交付 -> 当前内联大附件」分级收敛，不再向前端抛 `CONTEXT_BUDGET_EXCEEDED` 中断正在执行的会话；
+  - **压缩总结旁路自适应打包（`flattenSummarization` / `collectSummaryDeliveries`）**：在压缩总结旁路中将超 8 项或超 `96K` 字符的子代理交付报告及紧预算下的近期工具因果组按剩余预算自适应裁剪与时序淘汰，同时优先按 `[User]:` / `[Assistant thinking]:` / `[Assistant tool calls]:` / `[Tool result]:` 方括号行首标记拆包 `<conversation>` 转录、避免代码或配置块中的裸 `user:`/`system:` 误切分；
+  - 注入顶层纯文本摘要模式护栏（`SUMMARY_GUARDRAIL`，严禁调用 `view_file` / `run_command` / `invoke_subagent` 等内置或 MCP 工具）与专用催答提示（`SUMMARIZE_NUDGE_TEXT`），压缩总结请求在 `prompt()` 中旁路全局 `limiter` 排队防死锁，并在 `promptNonBridgedWithRecovery` 中支持尚未输出摘要正文时针对 `EMPTY_RESPONSE`、安全过滤误报（自动脱敏 + 合规工程声明）、`RUNTIME_RELOAD_LOST_SESSION` 与 `ACP_CONNECTION_LOST` 自动轮换全新临时会话重试。
+- **压缩总结旁路与压缩后跨代携带（Carryover）的宿主校准水位隔离**：
+  - 当请求为压缩总结旁路（`isSummarize`）或压缩重置后网关额外注入了宿主消息数组之外的历史目标脉络/子代理交付（`hasInjectedCarryover`，含同会话后续续推轮次）时，响应标准 `usage.usage_status` 保持 `'unavailable'`（不向宿主 `ContextEstimateCalibration` 上报包含跨代携带与 ACP 系统提示开销的膨胀 `input_tokens`），杜绝压缩后校准倍率飙升至 `2.5x` 诱发过早连环压缩；同时保留 `x-antigravity-acp-context-id` 与 `acp_context` 真实上游水位观测；
+  - Agent 扩展入口切换至 `agent/budget-status-241.mjs`，避免 `2.4.0 -> 2.4.1` 覆盖安装时命中旧版 ESM 缓存。
+- **新增子智能体面板风格的「压缩总结旁路请求」模型与推理强度配置（`renderer/config.html`）**：
+  - 在配置面板「模型与思考」分组内新增双列并排的**模型**（可搜索下拉面板、支持实时 `models:list` 同步、离线内置虚拟模型兜底、自定义/已存模型保留）与**推理强度**（`与会话一致`、`不传递`、`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`）选择器，默认均保持**与会话一致**（`""`）；当配置的旁路模型在当前运行时不可用或切换失败时自动回退至当前会话模型继续完成总结。
+- **压缩续接解耦与常规压缩静默化**：
+  - 移除压缩摘要重放时默认注入的 `TodoWrite` / `scratch` 等宿主特定工作流提示：单轮请求前 1~2 次常规压缩保持 100% 原生静默续接（对齐 Claude Code / Codex 自然续接体验，避免未激活按需工具误调或过早草率收尾偏置），仅在同一用户请求轮次内连续触发 `>= 3` 次压缩时附带与具体工具及 `AGENTS.md` 无关的纯客观防重复全读提示。
+
 ## 2.4.0
 
 - **升级默认官方 `agy-acp-server` 运行时依赖至 `1.5.2` 与版本热隔离**：
